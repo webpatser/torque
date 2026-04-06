@@ -6,6 +6,7 @@ namespace Webpatser\Torque;
 
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
+use Webpatser\Torque\Console\TorqueMonitorCommand;
 use Webpatser\Torque\Console\TorquePauseCommand;
 use Webpatser\Torque\Console\TorqueStartCommand;
 use Webpatser\Torque\Console\TorqueStatusCommand;
@@ -79,6 +80,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorqueStatusCommand::class,
                 TorquePauseCommand::class,
                 TorqueSupervisorCommand::class,
+                TorqueMonitorCommand::class,
             ]);
         }
     }
