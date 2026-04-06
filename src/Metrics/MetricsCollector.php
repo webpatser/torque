@@ -23,6 +23,9 @@ final class MetricsCollector
 
     public private(set) int $activeSlots = 0;
 
+    /** Peak active slots since last snapshot — captures true concurrency. */
+    private int $peakActiveSlots = 0;
+
     public private(set) int $totalSlots;
 
     /** Slot usage as a ratio between 0.0 and 1.0. */
@@ -59,6 +62,10 @@ final class MetricsCollector
     public function recordJobStarted(): void
     {
         $this->activeSlots++;
+
+        if ($this->activeSlots > $this->peakActiveSlots) {
+            $this->peakActiveSlots = $this->activeSlots;
+        }
     }
 
     /**
@@ -116,13 +123,18 @@ final class MetricsCollector
     #[\NoDiscard]
     public function snapshot(): WorkerSnapshot
     {
+        $peak = $this->peakActiveSlots;
+        $this->peakActiveSlots = $this->activeSlots; // Reset for next interval.
+
         return new WorkerSnapshot(
             jobsProcessed: $this->jobsProcessed,
             jobsFailed: $this->jobsFailed,
-            activeSlots: $this->activeSlots,
+            activeSlots: max($this->activeSlots, $peak),
             totalSlots: $this->totalSlots,
             averageLatencyMs: $this->getAverageLatencyMs(),
-            slotUsageRatio: $this->slotUsageRatio,
+            slotUsageRatio: $this->totalSlots > 0
+                ? max($this->activeSlots, $peak) / $this->totalSlots
+                : 0.0,
             memoryBytes: memory_get_usage(true),
             timestamp: time(),
         );

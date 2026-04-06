@@ -82,6 +82,21 @@ class StreamQueue extends Queue implements QueueContract
             $payload,
         );
 
+        // Record "queued" event to per-job stream.
+        try {
+            $decoded = json_decode($payload, true);
+
+            if (isset($decoded['uuid'])) {
+                app(\Webpatser\Torque\Stream\JobStreamRecorder::class)->onQueued(
+                    $decoded['uuid'],
+                    $this->getQueue($queue),
+                    $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
+                );
+            }
+        } catch (\Throwable) {
+            // Never break job dispatch for stream recording.
+        }
+
         return (string) $messageId;
     }
 

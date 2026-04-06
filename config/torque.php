@@ -128,6 +128,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Job event streams
+    |--------------------------------------------------------------------------
+    | Every job automatically gets a per-job Redis Stream recording lifecycle
+    | events (queued, started, completed, failed). Jobs using the Streamable
+    | trait can emit custom progress events via $this->emit().
+    |
+    | Streams auto-expire after `ttl` seconds following a terminal event.
+    */
+    'job_streams' => [
+        'enabled' => true,
+        'ttl' => 300,
+        'max_events' => 1000,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Metrics
     |--------------------------------------------------------------------------
     */

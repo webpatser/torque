@@ -4,6 +4,11 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque;
 
+use Illuminate\Queue\Events\JobExceptionOccurred;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessed;
+use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
 use Webpatser\Torque\Console\TorqueMonitorCommand;
@@ -16,6 +21,7 @@ use Webpatser\Torque\Console\TorqueSupervisorCommand;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Queue\StreamConnector;
+use Webpatser\Torque\Stream\JobStreamRecorder;
 
 /**
  * Registers the Torque queue driver and artisan commands with Laravel.
@@ -35,6 +41,19 @@ final class TorqueServiceProvider extends ServiceProvider
             return new \Webpatser\Torque\Metrics\MetricsPublisher(
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
                 prefix: $config['redis']['prefix'] ?? 'torque:',
+            );
+        });
+
+        $this->app->singleton(JobStreamRecorder::class, function ($app) {
+            $config = $app['config']['torque'];
+            $jobStreams = $config['job_streams'] ?? [];
+
+            return new JobStreamRecorder(
+                redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+                prefix: $config['redis']['prefix'] ?? 'torque:',
+                ttl: (int) ($jobStreams['ttl'] ?? 300),
+                maxEvents: (int) ($jobStreams['max_events'] ?? 1000),
+                enabled: (bool) ($jobStreams['enabled'] ?? true),
             );
         });
 
@@ -74,6 +93,13 @@ final class TorqueServiceProvider extends ServiceProvider
             $this->registerLivewireComponents();
         }
 
+        // Record job lifecycle events to per-job Redis Streams.
+        $recorder = $this->app->make(JobStreamRecorder::class);
+        Event::listen(JobProcessing::class, [$recorder, 'onProcessing']);
+        Event::listen(JobProcessed::class, [$recorder, 'onProcessed']);
+        Event::listen(JobFailed::class, [$recorder, 'onFailed']);
+        Event::listen(JobExceptionOccurred::class, [$recorder, 'onExceptionOccurred']);
+
         if ($this->app->runningInConsole()) {
             $this->commands([
                 TorqueStartCommand::class,
@@ -83,6 +109,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorqueSupervisorCommand::class,
                 TorqueMonitorCommand::class,
                 TorqueWorkerCommand::class,
+                Console\TorqueTailCommand::class,
             ]);
         }
     }
