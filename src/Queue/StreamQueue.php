@@ -223,7 +223,7 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Get the number of pending (claimed but unacknowledged) messages.
      */
-    public function pendingSize(?string $queue = null): int
+    public function pendingSize($queue = null): int
     {
         $result = $this->redis->execute(
             'XPENDING',
@@ -238,7 +238,7 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Get the number of delayed jobs.
      */
-    public function delayedSize(?string $queue = null): int
+    public function delayedSize($queue = null): int
     {
         return (int) $this->redis->execute(
             'ZCARD',
@@ -253,7 +253,7 @@ class StreamQueue extends Queue implements QueueContract
      * mechanism — a message is "reserved" from the moment it is read by a
      * consumer until it is ACKed.
      */
-    public function reservedSize(?string $queue = null): int
+    public function reservedSize($queue = null): int
     {
         return $this->pendingSize($queue);
     }
@@ -263,7 +263,7 @@ class StreamQueue extends Queue implements QueueContract
      *
      * Returns null when the PEL is empty.
      */
-    public function creationTimeOfOldestPendingJob(?string $queue = null): ?float
+    public function creationTimeOfOldestPendingJob($queue = null): ?float
     {
         $result = $this->redis->execute(
             'XPENDING',
