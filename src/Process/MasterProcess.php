@@ -129,14 +129,33 @@ final class MasterProcess
             // Child process — bootstrap a fresh Laravel app so each worker
             // has its own service container, database connections, etc.
             // Use the pre-resolved path since cwd may differ after fork.
-            $app = require $this->bootstrapPath;
-            $kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
-            $kernel->bootstrap();
+            try {
+                $app = require $this->bootstrapPath;
+                $kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
+                $kernel->bootstrap();
 
-            $worker = new WorkerProcess($this->config);
-            $worker->run();
+                $worker = new WorkerProcess($this->config);
+                $worker->run();
+            } catch (\Throwable $e) {
+                // Write to stderr so it's visible even if Laravel logging is unavailable.
+                fwrite(STDERR, "[Torque Worker] Fatal: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
 
-            exit(0);
+                try {
+                    // Attempt to log via Laravel if available.
+                    if (function_exists('app') && app()->bound('log')) {
+                        app('log')->error('[Torque Worker] Fatal error during run', [
+                            'exception' => $e->getMessage(),
+                            'file' => $e->getFile(),
+                            'line' => $e->getLine(),
+                            'trace' => $e->getTraceAsString(),
+                        ]);
+                    }
+                } catch (\Throwable) {
+                    // Logging itself failed — stderr output above is our only hope.
+                }
+            }
+
+            exit(1);
         }
 
         // Parent process — record the child PID.
