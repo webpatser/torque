@@ -117,6 +117,62 @@ $tenantId = CoroutineContext::get('tenant_id');
 
 State is automatically cleaned up when the Fiber completes (backed by `WeakMap`).
 
+## Job Event Streams
+
+Every job automatically records lifecycle events to a per-job Redis Stream — no code changes needed.
+
+```bash
+$ php artisan torque:tail --job=088066c1-b045-4fb6-bc32-ca15cfdf7d08
+
+📦 11:08:34 queued App\Jobs\ScrapeKvK → scrpr
+▶ 11:10:28 started worker=web-01-4879 attempt=1
+⚠ 11:10:52 exception attempt=1 No alive nodes. All the 1 nodes seem to be down.
+▶ 11:11:34 started worker=web-01-4882 attempt=2
+✓ 11:11:34 completed memory=58.5MB
+```
+
+### Custom progress events
+
+Add the `Streamable` trait to emit progress from inside your job:
+
+```php
+use Webpatser\Torque\Stream\Streamable;
+
+class ImportCsv implements ShouldQueue
+{
+    use Streamable;
+
+    public function handle(): void
+    {
+        foreach ($this->rows as $i => $row) {
+            // process...
+            $this->emit("Imported row {$i}", progress: $i / count($this->rows));
+        }
+    }
+}
+```
+
+### Reading streams programmatically
+
+```php
+use Webpatser\Torque\Stream\JobStream;
+
+$stream = app(JobStream::class);
+
+// All events so far
+$events = $stream->events($uuid);
+
+// Tail (blocks, yields events as they arrive)
+foreach ($stream->tail($uuid) as $event) {
+    echo $event['type'] . ': ' . ($event['data']['message'] ?? '');
+}
+
+// Check completion
+$stream->isFinished($uuid); // true after completed/failed
+```
+
+Streams auto-expire after 5 minutes (configurable via `job_streams.ttl`).
+
 ## CLI Commands
 
 | Command | Description |
@@ -124,6 +180,8 @@ State is automatically cleaned up when the Fiber completes (backed by `WeakMap`)
 | `torque:start` | Start the master + worker processes |
 | `torque:stop` | Graceful shutdown (SIGTERM). Use `--force` for SIGKILL |
 | `torque:status` | Show worker metrics, throughput, and queue depths |
+| `torque:monitor` | Live htop-style terminal dashboard |
+| `torque:tail` | Tail a job's event stream in real-time |
 | `torque:pause` | Pause job processing (in-flight jobs complete) |
 | `torque:pause continue` | Resume processing |
 | `torque:supervisor` | Generate a Supervisor config file |
@@ -230,18 +288,18 @@ Redis Streams
 ├── torque:default (XREADGROUP consumer groups)
 ├── torque:default:delayed (sorted set)
 ├── torque:stream:dead-letter
-├── torque:metrics (aggregated stats)
-└── torque:worker:* (per-worker stats)
+├── torque:worker:* (per-worker stats with heartbeat TTL)
+└── torque:job:* (per-job event streams, auto-expiring)
 ```
 
 ### How it works
 
-1. **Master** forks N worker processes via `pcntl_fork()`
-2. Each **worker** runs a Revolt event loop with M coroutine slots (gated by `LocalSemaphore`)
-3. Main loop: acquire semaphore slot -> `XREADGROUP COUNT 1 BLOCK 2000` -> spawn Fiber via `Amp\async()`
-4. Fiber executes job. When the job does async I/O (via AMPHP pools), the Fiber suspends and another job runs
+1. **Master** spawns N worker processes via `pcntl_exec()` (`php artisan torque:worker`)
+2. Each **worker** runs a Revolt event loop with M Fiber slots
+3. Each Fiber loops: `XREADGROUP COUNT 1 BLOCK` → process → repeat. When the job does async I/O, the Fiber suspends and another job runs
+4. **Work-stealing**: idle Fibers claim stale messages from dead consumers via `XAUTOCLAIM` (per-queue `retry_after` as idle threshold)
 5. On completion: `XACK` + `XDEL`. On failure: retry with exponential backoff or dead-letter
-6. A dedicated (non-pooled) Redis connection handles blocking reads to avoid tying up pool slots
+6. Each Fiber has its own dedicated Redis connection for blocking reads
 
 ### Queue backend: Redis Streams
 

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-06
+
+### Added
+- Per-job event streams — every job automatically records lifecycle events to `torque:job:{uuid}` Redis Streams (queued, started, completed, failed, exception)
+- `Streamable` trait — jobs can emit custom progress events via `$this->emit('message', progress: 0.5)`
+- `JobStreamRecorder` — event listener that writes to per-job streams with configurable TTL and MAXLEN
+- `JobStream` — reader class with `events()`, `tail()`, and `isFinished()` for consuming job streams
+- `torque:tail` command — live CLI monitoring of individual jobs (`--job={uuid}` or `--latest`)
+- `job_streams` config section (enabled, ttl, max_events)
+
+### Fixed
+- `parseXreadgroupResponse()` now iterates all streams instead of only checking index 0, which made non-default queues invisible to workers
+- Monitor now aggregates metrics from per-worker Redis hashes (the master `publishAggregatedMetrics()` was never called)
+- Peak active slots tracking in `MetricsCollector` — snapshot captures high-water mark between publishes for accurate reporting with async fibers
+
+### Changed
+- Replaced bulk `XAUTOCLAIM` at startup with per-fiber work-stealing using `retry_after` as min-idle-time per queue
+- Reordered fiber loop: read new messages first (`>`), then pending recovery (`0-0`), then steal — eliminates wasted XAUTOCLAIM calls when fresh messages are available
+- Flicker-free monitor: single buffered write with cursor-home instead of screen-clear
+- Rolling 60-second throughput average in monitor instead of per-tick delta
+
+## [0.3.0] - 2026-04-06
+
+### Changed
+- Replaced `pcntl_fork` with `pcntl_exec` for worker spawning — fixes Fiber conflicts in forked processes
+
+## [0.2.0] - 2026-04-06
+
+### Fixed
+- Error catching and stderr logging in worker child processes
+- Bootstrap path resolution in forked workers
+- Laravel 13 Queue contract compatibility
+
 ## [0.1.0] - 2026-04-06
 
 Initial release.
@@ -82,5 +115,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/webpatser/torque/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/webpatser/torque/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/webpatser/torque/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/webpatser/torque/releases/tag/v0.1.0
