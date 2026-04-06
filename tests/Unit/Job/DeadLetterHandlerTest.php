@@ -106,3 +106,106 @@ it('returns empty list when stream is empty', function () {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
+
+it('trim removes old entries based on TTL', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+        $stream = 'torque-test:dead-letter-trim-' . bin2hex(random_bytes(4));
+
+        // Use a TTL of 1 second so entries become "old" quickly.
+        $handler = new DeadLetterHandler(
+            redisUri: $redisUri,
+            deadLetterStream: $stream,
+            ttl: 1,
+        );
+
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"trim-1"}',
+            messageId: '1680000000000-0',
+            exception: new RuntimeException('Trim test'),
+        );
+
+        $entries = $handler->list();
+        expect($entries)->not->toBeEmpty();
+
+        // Wait for the entry to exceed the 1-second TTL.
+        sleep(2);
+
+        $handler->trim();
+
+        $remaining = $handler->list();
+        expect($remaining)->toBe([]);
+
+        // Clean up.
+        $redis = \Amp\Redis\createRedisClient($redisUri);
+        $redis->execute('DEL', $stream);
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+it('retry rejects invalid queue names', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+        $stream = 'torque-test:dead-letter-invalid-q-' . bin2hex(random_bytes(4));
+
+        $handler = new DeadLetterHandler(
+            redisUri: $redisUri,
+            deadLetterStream: $stream,
+        );
+
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"invalid-q-1"}',
+            messageId: '1680000000000-0',
+            exception: new RuntimeException('Invalid queue test'),
+        );
+
+        $entries = $handler->list();
+        $last = end($entries);
+
+        // Attempt to retry to a queue name with illegal characters.
+        $handler->retry($last['id'], targetQueue: 'queue with spaces & symbols!');
+
+        // Should not reach here.
+        expect(false)->toBeTrue();
+    } catch (RuntimeException $e) {
+        expect($e->getMessage())->toContain('Invalid queue name');
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+it('handle truncates exception messages to 1000 chars', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+        $stream = 'torque-test:dead-letter-truncate-' . bin2hex(random_bytes(4));
+
+        $handler = new DeadLetterHandler(
+            redisUri: $redisUri,
+            deadLetterStream: $stream,
+        );
+
+        $longMessage = str_repeat('X', 2000);
+
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"truncate-1"}',
+            messageId: '1680000000000-0',
+            exception: new RuntimeException($longMessage),
+        );
+
+        $entries = $handler->list();
+        $last = end($entries);
+
+        expect(strlen($last['exception_message']))->toBeLessThanOrEqual(1000);
+
+        // Clean up.
+        $handler->purge($last['id']);
+        $redis = \Amp\Redis\createRedisClient($redisUri);
+        $redis->execute('DEL', $stream);
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
