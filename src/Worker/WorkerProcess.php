@@ -115,10 +115,6 @@ final class WorkerProcess
             $streamQueue->ensureConsumerGroup($streamKey, $consumerGroup);
         }
 
-        // Claim stale messages from crashed workers via XAUTOCLAIM.
-        $setupRedis = createRedisClient($redisUri);
-        $this->claimStaleMessages($setupRedis, $queues, $prefix, $consumerGroup, $streams);
-
         // Set error handler so uncaught Fiber exceptions are logged instead of exit(255).
         EventLoop::setErrorHandler(function (\Throwable $e) {
             fwrite(STDERR, "[torque:worker] Uncaught in event loop: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
@@ -137,24 +133,17 @@ final class WorkerProcess
 
         $startTime = time();
 
-        // Main poll loop — spawn N Fibers (one per concurrency slot).
+        // Spawn N reader Fibers (one per concurrency slot).
         // Each Fiber loops: read → process → repeat. When XREADGROUP BLOCK waits,
         // the Fiber suspends and others can run. The number of Fibers IS the
         // concurrency limit — no semaphore needed.
-        // Phase 1: Process pending messages in a single Fiber (recovery from crashes).
-        // Runs as the first async task. Once pending recovery is complete,
-        // it spawns the N reader Fibers for new messages.
-        async(function () use (
-            $redisUri, $queues, $prefix, $consumerGroup, $streamQueue, $events,
-            $connectionName, $streams, $metrics, $deadLetterHandler, $maxJobs,
-            $maxLifetime, $startTime, $blockFor, $concurrency,
-        ) {
-            $recoveryRedis = createRedisClient($redisUri);
-            $this->processPendingMessages($recoveryRedis, $queues, $prefix, $consumerGroup, $streamQueue, $events, $connectionName, $streams, $metrics, $deadLetterHandler, $maxJobs, $maxLifetime, $startTime);
-            fwrite(STDERR, "[torque:worker] Pending recovery complete, starting {$concurrency} reader Fibers\n");
+        //
+        // Each Fiber first drains pending messages (crash recovery via '0-0'),
+        // then switches to reading new messages via '>'. This spreads pending
+        // recovery across all Fibers instead of bottlenecking on one.
+        fwrite(STDERR, "[torque:worker] Starting {$concurrency} reader Fibers\n");
 
-            // Phase 2: Spawn N Fibers for new messages.
-            for ($i = 0; $i < $concurrency; $i++) {
+        for ($i = 0; $i < $concurrency; $i++) {
             async(function () use (
                 $redisUri,
                 $queues,
@@ -171,10 +160,9 @@ final class WorkerProcess
                 $metrics,
                 $deadLetterHandler,
             ) {
-                // Each Fiber gets its own dedicated Redis connection for blocking reads.
                 $fiberRedis = createRedisClient($redisUri);
+                $pendingDrained = false;
 
-                // Read new messages in a loop.
                 while (true) {
                     if ($this->stopRequested || $this->jobsProcessed >= $maxJobs || (time() - $startTime) >= $maxLifetime) {
                         return;
@@ -192,18 +180,29 @@ final class WorkerProcess
                         continue;
                     }
 
-                    // Fire Looping event.
                     $events->dispatch(new Looping($connectionName, $queues[0] ?? 'default'));
 
-                    // Read next message — this blocks the Fiber (not the event loop)
-                    // during the XREADGROUP BLOCK wait.
+                    // Priority: new messages first (instant), then recovery, then steal.
                     $message = $this->readNextMessage($fiberRedis, $queues, $prefix, $consumerGroup, $blockFor);
+
+                    // No new messages — check own PEL (crash recovery).
+                    if ($message === null && ! $pendingDrained) {
+                        $message = $this->readPendingMessage($fiberRedis, $queues, $prefix, $consumerGroup);
+
+                        if ($message === null) {
+                            $pendingDrained = true;
+                        }
+                    }
+
+                    // Still nothing — steal from dead consumers.
+                    if ($message === null) {
+                        $message = $this->stealMessage($fiberRedis, $queues, $prefix, $consumerGroup, $streams);
+                    }
 
                     if ($message === null) {
                         continue;
                     }
 
-                    // Process the job in this Fiber.
                     $metrics->recordJobStarted();
                     $jobStartTime = hrtime(true);
 
@@ -222,7 +221,6 @@ final class WorkerProcess
                 }
             });
         }
-        }); // End of Phase 1+2 async wrapper.
 
         // Delayed job migration timer — checks every second for matured delayed jobs.
         EventLoop::repeat(1.0, function (string $id) use ($redisPool, $queues, $prefix) {
@@ -351,39 +349,145 @@ final class WorkerProcess
             return null;
         }
 
-        $streamData = $result[0] ?? null;
-        if ($streamData === null) {
-            return null;
+        foreach ($result as $streamData) {
+            if ($streamData === null) {
+                continue;
+            }
+
+            $streamKey = (string) $streamData[0];
+            $messages = $streamData[1] ?? [];
+
+            if ($messages === []) {
+                continue;
+            }
+
+            $message = $messages[0];
+            $messageId = (string) $message[0];
+            $fields = $message[1];
+
+            $payload = null;
+            for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
+                if ((string) $fields[$i] === 'payload') {
+                    $payload = (string) $fields[$i + 1];
+                    break;
+                }
+            }
+
+            if ($payload === null) {
+                continue;
+            }
+
+            return [
+                'stream' => $streamKey,
+                'id' => $messageId,
+                'payload' => $payload,
+            ];
         }
 
-        $streamKey = (string) $streamData[0];
-        $messages = $streamData[1] ?? [];
+        return null;
+    }
 
-        if ($messages === []) {
-            return null;
+    /**
+     * Read a pending message (already delivered but not ACKed) from any stream.
+     *
+     * Uses '0-0' as the ID to fetch messages in this consumer's PEL.
+     * Non-blocking — returns null immediately when no pending messages remain.
+     *
+     * @param  string[]  $queues
+     * @return array{stream: string, id: string, payload: string}|null
+     */
+    private function readPendingMessage(
+        RedisClient $readerRedis,
+        array $queues,
+        string $prefix,
+        string $consumerGroup,
+    ): ?array {
+        $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
+
+        foreach ($queues as $queue) {
+            $args[] = $prefix . $queue;
         }
 
-        $message = $messages[0];
-        $messageId = (string) $message[0];
-        $fields = $message[1];
+        foreach ($queues as $queue) {
+            $args[] = '0-0';
+        }
 
-        $payload = null;
-        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-            if ((string) $fields[$i] === 'payload') {
-                $payload = (string) $fields[$i + 1];
-                break;
+        $result = $readerRedis->execute('XREADGROUP', ...$args);
+
+        return $this->parseXreadgroupResponse($result);
+    }
+
+    /**
+     * Steal one stale message from another consumer via XAUTOCLAIM.
+     *
+     * Only claims messages that have been idle longer than the stream's
+     * retry_after setting. Returns the claimed message or null.
+     *
+     * @param  string[]  $queues
+     * @param  array<string, array<string, mixed>>  $streams
+     * @return array{stream: string, id: string, payload: string}|null
+     */
+    private function stealMessage(
+        RedisClient $readerRedis,
+        array $queues,
+        string $prefix,
+        string $consumerGroup,
+        array $streams,
+    ): ?array {
+        foreach ($queues as $queue) {
+            $streamKey = $prefix . $queue;
+            // Use the stream's retry_after as the idle threshold for stealing.
+            // This prevents stealing from consumers that are still alive but
+            // processing slow jobs (e.g. exports, slow scraping).
+            $streamConfig = $streams[$queue] ?? [];
+            $minIdleMs = ((int) ($streamConfig['retry_after'] ?? 60)) * 1000;
+
+            try {
+                $result = $readerRedis->execute(
+                    'XAUTOCLAIM',
+                    $streamKey,
+                    $consumerGroup,
+                    $this->consumerId,
+                    (string) $minIdleMs,
+                    '0-0',
+                    'COUNT',
+                    '1',
+                );
+
+                // XAUTOCLAIM returns [nextCursor, [[id, [fields...]], ...], [deletedIds...]]
+                $messages = is_array($result) && is_array($result[1] ?? null) ? $result[1] : [];
+
+                if ($messages === []) {
+                    continue;
+                }
+
+                $message = $messages[0];
+                $messageId = (string) $message[0];
+                $fields = $message[1];
+
+                $payload = null;
+                for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
+                    if ((string) $fields[$i] === 'payload') {
+                        $payload = (string) $fields[$i + 1];
+                        break;
+                    }
+                }
+
+                if ($payload === null) {
+                    continue;
+                }
+
+                return [
+                    'stream' => $streamKey,
+                    'id' => $messageId,
+                    'payload' => $payload,
+                ];
+            } catch (\Amp\Redis\RedisException) {
+                continue;
             }
         }
 
-        if ($payload === null) {
-            return null;
-        }
-
-        return [
-            'stream' => $streamKey,
-            'id' => $messageId,
-            'payload' => $payload,
-        ];
+        return null;
     }
 
     /**
@@ -559,55 +663,6 @@ final class WorkerProcess
                 }
             }
         });
-    }
-
-    /**
-     * Claim stale messages from crashed workers via XAUTOCLAIM.
-     *
-     * Messages that have been pending longer than retry_after (in ms) are
-     * reassigned to this consumer so they can be reprocessed.
-     *
-     * @param  string[]  $queues
-     * @param  array<string, array<string, mixed>>  $streams
-     */
-    private function claimStaleMessages(
-        RedisClient $readerRedis,
-        array $queues,
-        string $prefix,
-        string $consumerGroup,
-        array $streams,
-    ): void {
-        foreach ($queues as $queue) {
-            $streamKey = $prefix . $queue;
-            $streamConfig = $streams[$queue] ?? [];
-            $retryAfter = (int) ($streamConfig['retry_after'] ?? 60);
-
-            // Loop to claim all stale messages, not just 100.
-            $cursor = '0-0';
-            do {
-                try {
-                    // Use min-idle-time of 0 to claim ALL pending messages
-                    // from dead consumers, not just stale ones.
-                    $result = $readerRedis->execute(
-                        'XAUTOCLAIM',
-                        $streamKey,
-                        $consumerGroup,
-                        $this->consumerId,
-                        '0',
-                        $cursor,
-                        'COUNT',
-                        '100',
-                    );
-
-                    // XAUTOCLAIM returns [nextCursor, [[id, [fields...]], ...], [deletedIds...]]
-                    $cursor = is_array($result) ? (string) ($result[0] ?? '0-0') : '0-0';
-                    $claimed = is_array($result) && is_array($result[1] ?? null) ? count($result[1]) : 0;
-                } catch (\Amp\Redis\RedisException) {
-                    // Stream or group may not exist yet — safe to ignore.
-                    break;
-                }
-            } while ($cursor !== '0-0' && $claimed > 0);
-        }
     }
 
     /**
