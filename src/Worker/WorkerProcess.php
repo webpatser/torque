@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Worker;
 
 use Amp\Redis\RedisClient;
-use Amp\Sync\LocalSemaphore;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
@@ -85,14 +84,12 @@ final class WorkerProcess
         // Pool for job operations (delete, release, etc.)
         $redisPool = new RedisPool($redisUri, size: $poolSize);
 
-        // Dedicated non-pooled connection for XREADGROUP — avoids tying up pool
-        // connections during BLOCK waits.
-        $readerRedis = createRedisClient($redisUri);
+        // Each Fiber gets its own reader Redis connection since XREADGROUP BLOCK
+        // holds the connection for the duration of the wait.
+        // We create them lazily inside the Fiber loop instead of sharing one.
 
         $metrics = new MetricsCollector(totalSlots: $concurrency);
         $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix);
-
-        $semaphore = new LocalSemaphore($concurrency);
 
         $streamQueue = new StreamQueue(
             redisUri: $redisUri,
@@ -119,7 +116,16 @@ final class WorkerProcess
         }
 
         // Claim stale messages from crashed workers via XAUTOCLAIM.
-        $this->claimStaleMessages($readerRedis, $queues, $prefix, $consumerGroup, $streams);
+        $setupRedis = createRedisClient($redisUri);
+        $this->claimStaleMessages($setupRedis, $queues, $prefix, $consumerGroup, $streams);
+
+        // Set error handler so uncaught Fiber exceptions are logged instead of exit(255).
+        EventLoop::setErrorHandler(function (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] Uncaught in event loop: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
+            fwrite(STDERR, $e->getTraceAsString() . "\n");
+        });
+
+        fwrite(STDERR, "[torque:worker] Setup complete, entering event loop\n");
 
         // Install signal handlers for graceful shutdown.
         EventLoop::onSignal(SIGTERM, function () {
@@ -131,68 +137,92 @@ final class WorkerProcess
 
         $startTime = time();
 
-        // Main poll timer — runs as fast as the event loop allows.
-        EventLoop::repeat(0.0, function (string $id) use (
-            $semaphore,
-            $readerRedis,
-            $queues,
-            $prefix,
-            $consumerGroup,
-            $blockFor,
-            $maxJobs,
-            $maxLifetime,
-            $startTime,
-            $streamQueue,
-            $events,
-            $connectionName,
-            $streams,
-            $metrics,
-            $deadLetterHandler,
+        // Main poll loop — spawn N Fibers (one per concurrency slot).
+        // Each Fiber loops: read → process → repeat. When XREADGROUP BLOCK waits,
+        // the Fiber suspends and others can run. The number of Fibers IS the
+        // concurrency limit — no semaphore needed.
+        // Phase 1: Process pending messages in a single Fiber (recovery from crashes).
+        // Runs as the first async task. Once pending recovery is complete,
+        // it spawns the N reader Fibers for new messages.
+        async(function () use (
+            $redisUri, $queues, $prefix, $consumerGroup, $streamQueue, $events,
+            $connectionName, $streams, $metrics, $deadLetterHandler, $maxJobs,
+            $maxLifetime, $startTime, $blockFor, $concurrency,
         ) {
-            if ($this->stopRequested || $this->jobsProcessed >= $maxJobs || (time() - $startTime) >= $maxLifetime) {
-                EventLoop::cancel($id);
-                return;
-            }
+            $recoveryRedis = createRedisClient($redisUri);
+            $this->processPendingMessages($recoveryRedis, $queues, $prefix, $consumerGroup, $streamQueue, $events, $connectionName, $streams, $metrics, $deadLetterHandler, $maxJobs, $maxLifetime, $startTime);
+            fwrite(STDERR, "[torque:worker] Pending recovery complete, starting {$concurrency} reader Fibers\n");
 
-            // Check if paused.
-            $isPaused = $readerRedis->execute('EXISTS', $prefix . 'paused');
-            if ($isPaused) {
-                // Don't read new jobs while paused, but let the event loop continue
-                // so in-flight jobs can complete.
-                return;
-            }
+            // Phase 2: Spawn N Fibers for new messages.
+            for ($i = 0; $i < $concurrency; $i++) {
+            async(function () use (
+                $redisUri,
+                $queues,
+                $prefix,
+                $consumerGroup,
+                $blockFor,
+                $maxJobs,
+                $maxLifetime,
+                $startTime,
+                $streamQueue,
+                $events,
+                $connectionName,
+                $streams,
+                $metrics,
+                $deadLetterHandler,
+            ) {
+                // Each Fiber gets its own dedicated Redis connection for blocking reads.
+                $fiberRedis = createRedisClient($redisUri);
 
-            // Fire Looping event — listeners can set $event->shouldStop to request a stop.
-            $events->dispatch(new Looping($connectionName, $queues[0] ?? 'default'));
+                // Read new messages in a loop.
+                while (true) {
+                    if ($this->stopRequested || $this->jobsProcessed >= $maxJobs || (time() - $startTime) >= $maxLifetime) {
+                        return;
+                    }
 
-            $lock = $semaphore->acquire();
+                    // Check if paused.
+                    try {
+                        $isPaused = $fiberRedis->execute('EXISTS', $prefix . 'paused');
+                        if ($isPaused) {
+                            \Amp\delay(1.0);
+                            continue;
+                        }
+                    } catch (\Throwable) {
+                        \Amp\delay(1.0);
+                        continue;
+                    }
 
-            $message = $this->readNextMessage($readerRedis, $queues, $prefix, $consumerGroup, $blockFor);
+                    // Fire Looping event.
+                    $events->dispatch(new Looping($connectionName, $queues[0] ?? 'default'));
 
-            if ($message === null) {
-                $lock->release();
-                return;
-            }
+                    // Read next message — this blocks the Fiber (not the event loop)
+                    // during the XREADGROUP BLOCK wait.
+                    $message = $this->readNextMessage($fiberRedis, $queues, $prefix, $consumerGroup, $blockFor);
 
-            async(function () use ($message, $lock, $streamQueue, $events, $connectionName, $streams, $prefix, $metrics, $deadLetterHandler) {
-                $metrics->recordJobStarted();
-                $jobStartTime = hrtime(true);
+                    if ($message === null) {
+                        continue;
+                    }
 
-                try {
-                    $this->processMessage($message, $streamQueue, $events, $connectionName, $streams, $prefix);
-                    $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
-                    $metrics->recordJobCompleted($durationMs);
-                } catch (\Throwable $e) {
-                    $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
-                    $metrics->recordJobFailed($durationMs);
-                    $this->handleFailure($message, $e, $streamQueue, $events, $connectionName, $streams, $prefix, $deadLetterHandler);
-                } finally {
-                    CoroutineContext::flush();
-                    $lock->release();
-                    $this->jobsProcessed++;
+                    // Process the job in this Fiber.
+                    $metrics->recordJobStarted();
+                    $jobStartTime = hrtime(true);
+
+                    try {
+                        $this->processMessage($message, $streamQueue, $events, $connectionName, $streams, $prefix);
+                        $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
+                        $metrics->recordJobCompleted($durationMs);
+                    } catch (\Throwable $e) {
+                        $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
+                        $metrics->recordJobFailed($durationMs);
+                        $this->handleFailure($message, $e, $streamQueue, $events, $connectionName, $streams, $prefix, $deadLetterHandler);
+                    } finally {
+                        CoroutineContext::flush();
+                        $this->jobsProcessed++;
+                    }
                 }
             });
-        });
+        }
+        }); // End of Phase 1+2 async wrapper.
 
         // Delayed job migration timer — checks every second for matured delayed jobs.
         EventLoop::repeat(1.0, function (string $id) use ($redisPool, $queues, $prefix) {
@@ -215,9 +245,145 @@ final class WorkerProcess
             $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
         });
 
-        EventLoop::run();
+        try {
+            EventLoop::run();
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] EventLoop crashed: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
+            fwrite(STDERR, $e->getTraceAsString() . "\n");
+        }
 
         $this->isRunning = false;
+    }
+
+    /**
+     * Process pending messages that were delivered but never acknowledged.
+     *
+     * Uses '0-0' as the XREADGROUP ID to fetch messages already in this
+     * consumer's PEL. This handles crash recovery — messages from dead
+     * consumers that were auto-claimed to us.
+     */
+    private function processPendingMessages(
+        RedisClient $redis,
+        array $queues,
+        string $prefix,
+        string $consumerGroup,
+        StreamQueue $streamQueue,
+        Dispatcher $events,
+        string $connectionName,
+        array $streams,
+        MetricsCollector $metrics,
+        DeadLetterHandler $deadLetterHandler,
+        int $maxJobs,
+        int $maxLifetime,
+        int $startTime,
+    ): void {
+        fwrite(STDERR, "[torque:worker] Processing pending messages for " . implode(',', $queues) . "\n");
+
+        while (true) {
+            if ($this->stopRequested || $this->jobsProcessed >= $maxJobs || (time() - $startTime) >= $maxLifetime) {
+                return;
+            }
+
+            // Read pending (already-delivered) messages using '0-0' instead of '>'.
+            $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
+            foreach ($queues as $queue) {
+                $args[] = $prefix . $queue;
+            }
+            foreach ($queues as $queue) {
+                $args[] = '0-0';
+            }
+
+            $result = $redis->execute('XREADGROUP', ...$args);
+
+            if ($result === null) {
+                return; // No more pending messages.
+            }
+
+            // Check if any stream returned messages.
+            $hasMessages = false;
+            foreach ($result as $streamData) {
+                if (is_array($streamData[1] ?? null) && $streamData[1] !== []) {
+                    $hasMessages = true;
+                    break;
+                }
+            }
+
+            if (!$hasMessages) {
+                return; // All pending messages processed.
+            }
+
+            // Parse and process the first available message.
+            $message = $this->parseXreadgroupResponse($result);
+            if ($message === null) {
+                return;
+            }
+
+            fwrite(STDERR, "[torque:worker] Pending job: {$message['id']} from {$message['stream']}\n");
+
+            $metrics->recordJobStarted();
+            $jobStartTime = hrtime(true);
+
+            try {
+                $this->processMessage($message, $streamQueue, $events, $connectionName, $streams, $prefix);
+                $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
+                $metrics->recordJobCompleted($durationMs);
+                fwrite(STDERR, "[torque:worker] Pending job done: {$message['id']} ({$durationMs}ms)\n");
+            } catch (\Throwable $e) {
+                $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
+                $metrics->recordJobFailed($durationMs);
+                fwrite(STDERR, "[torque:worker] Pending job FAILED: {$message['id']}: {$e->getMessage()}\n");
+                $this->handleFailure($message, $e, $streamQueue, $events, $connectionName, $streams, $prefix, $deadLetterHandler);
+            } finally {
+                CoroutineContext::flush();
+                $this->jobsProcessed++;
+            }
+        }
+    }
+
+    /**
+     * Parse the nested XREADGROUP response into a flat message array.
+     *
+     * @return array{stream: string, id: string, payload: string}|null
+     */
+    private function parseXreadgroupResponse(mixed $result): ?array
+    {
+        if ($result === null) {
+            return null;
+        }
+
+        $streamData = $result[0] ?? null;
+        if ($streamData === null) {
+            return null;
+        }
+
+        $streamKey = (string) $streamData[0];
+        $messages = $streamData[1] ?? [];
+
+        if ($messages === []) {
+            return null;
+        }
+
+        $message = $messages[0];
+        $messageId = (string) $message[0];
+        $fields = $message[1];
+
+        $payload = null;
+        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
+            if ((string) $fields[$i] === 'payload') {
+                $payload = (string) $fields[$i + 1];
+                break;
+            }
+        }
+
+        if ($payload === null) {
+            return null;
+        }
+
+        return [
+            'stream' => $streamKey,
+            'id' => $messageId,
+            'payload' => $payload,
+        ];
     }
 
     /**
@@ -248,46 +414,7 @@ final class WorkerProcess
 
         $result = $readerRedis->execute('XREADGROUP', ...$args);
 
-        // XREADGROUP returns null when the block timeout expires with no message.
-        if ($result === null) {
-            return null;
-        }
-
-        // Response shape: [[streamKey, [[messageId, [field, value, ...]]]]]
-        $streamData = $result[0] ?? null;
-        if ($streamData === null) {
-            return null;
-        }
-
-        $streamKey = (string) $streamData[0];
-        $messages = $streamData[1] ?? [];
-
-        if ($messages === []) {
-            return null;
-        }
-
-        $message = $messages[0];
-        $messageId = (string) $message[0];
-        $fields = $message[1];
-
-        // Fields are a flat list: ['payload', '{json}', ...]
-        $payload = null;
-        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-            if ((string) $fields[$i] === 'payload') {
-                $payload = (string) $fields[$i + 1];
-                break;
-            }
-        }
-
-        if ($payload === null) {
-            return null;
-        }
-
-        return [
-            'stream' => $streamKey,
-            'id' => $messageId,
-            'payload' => $payload,
-        ];
+        return $this->parseXreadgroupResponse($result);
     }
 
     /**
@@ -455,20 +582,31 @@ final class WorkerProcess
             $streamConfig = $streams[$queue] ?? [];
             $retryAfter = (int) ($streamConfig['retry_after'] ?? 60);
 
-            try {
-                $readerRedis->execute(
-                    'XAUTOCLAIM',
-                    $streamKey,
-                    $consumerGroup,
-                    $this->consumerId,
-                    (string) ($retryAfter * 1000),
-                    '0-0',
-                    'COUNT',
-                    '10',
-                );
-            } catch (\Amp\Redis\RedisException) {
-                // Stream or group may not exist yet — safe to ignore.
-            }
+            // Loop to claim all stale messages, not just 100.
+            $cursor = '0-0';
+            do {
+                try {
+                    // Use min-idle-time of 0 to claim ALL pending messages
+                    // from dead consumers, not just stale ones.
+                    $result = $readerRedis->execute(
+                        'XAUTOCLAIM',
+                        $streamKey,
+                        $consumerGroup,
+                        $this->consumerId,
+                        '0',
+                        $cursor,
+                        'COUNT',
+                        '100',
+                    );
+
+                    // XAUTOCLAIM returns [nextCursor, [[id, [fields...]], ...], [deletedIds...]]
+                    $cursor = is_array($result) ? (string) ($result[0] ?? '0-0') : '0-0';
+                    $claimed = is_array($result) && is_array($result[1] ?? null) ? count($result[1]) : 0;
+                } catch (\Amp\Redis\RedisException) {
+                    // Stream or group may not exist yet — safe to ignore.
+                    break;
+                }
+            } while ($cursor !== '0-0' && $claimed > 0);
         }
     }
 

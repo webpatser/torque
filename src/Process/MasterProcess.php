@@ -8,7 +8,6 @@ use Closure;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
-use Webpatser\Torque\Worker\WorkerProcess;
 
 /**
  * Forks N worker processes and monitors them.
@@ -40,14 +39,13 @@ final class MasterProcess
      * @param  array<string, mixed>  $config  Merged Torque config.
      * @param  Closure(string): void  $logger  Callback for outputting status messages.
      */
-    private readonly string $bootstrapPath;
+    private readonly string $artisanPath;
 
     public function __construct(
         private readonly array $config,
         private readonly Closure $logger,
     ) {
-        // Resolve bootstrap path before forking — cwd may change after fork.
-        $this->bootstrapPath = base_path('bootstrap/app.php');
+        $this->artisanPath = base_path('artisan');
     }
 
     /**
@@ -112,10 +110,11 @@ final class MasterProcess
     }
 
     /**
-     * Fork a single worker process.
+     * Spawn a single worker as a clean PHP process.
      *
-     * The child bootstraps a fresh Laravel application, creates a WorkerProcess,
-     * and runs the event loop. The parent records the child PID.
+     * Uses pcntl_fork() + pcntl_exec() to replace the process image entirely.
+     * This avoids Fiber/Revolt segfaults that happen when forking a process
+     * with active event loop state — pcntl_exec() replaces the memory image.
      */
     private function spawnWorker(): void
     {
@@ -126,35 +125,20 @@ final class MasterProcess
         }
 
         if ($pid === 0) {
-            // Child process — bootstrap a fresh Laravel app so each worker
-            // has its own service container, database connections, etc.
-            // Use the pre-resolved path since cwd may differ after fork.
-            try {
-                $app = require $this->bootstrapPath;
-                $kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
-                $kernel->bootstrap();
+            // Child: immediately replace process image with a fresh PHP process.
+            // This avoids inheriting any Fiber/Revolt/Redis state from the parent.
+            $queues = implode(',', (array) ($this->config['queues'] ?? ['default']));
+            $concurrency = (string) (int) ($this->config['coroutines_per_worker'] ?? 50);
 
-                $worker = new WorkerProcess($this->config);
-                $worker->run();
-            } catch (\Throwable $e) {
-                // Write to stderr so it's visible even if Laravel logging is unavailable.
-                fwrite(STDERR, "[Torque Worker] Fatal: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
+            pcntl_exec(PHP_BINARY, [
+                $this->artisanPath,
+                'torque:worker',
+                "--queues={$queues}",
+                "--concurrency={$concurrency}",
+            ]);
 
-                try {
-                    // Attempt to log via Laravel if available.
-                    if (function_exists('app') && app()->bound('log')) {
-                        app('log')->error('[Torque Worker] Fatal error during run', [
-                            'exception' => $e->getMessage(),
-                            'file' => $e->getFile(),
-                            'line' => $e->getLine(),
-                            'trace' => $e->getTraceAsString(),
-                        ]);
-                    }
-                } catch (\Throwable) {
-                    // Logging itself failed — stderr output above is our only hope.
-                }
-            }
-
+            // pcntl_exec only returns on failure.
+            fwrite(STDERR, "[Torque] pcntl_exec failed: " . pcntl_get_last_error() . "\n");
             exit(1);
         }
 
@@ -180,8 +164,21 @@ final class MasterProcess
             if ($pid > 0) {
                 unset($this->workerPids[$pid]);
 
-                $exitCode = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : -1;
-                ($this->logger)("Worker PID {$pid} exited (code {$exitCode})");
+                if (pcntl_wifexited($status)) {
+                    $exitCode = pcntl_wexitstatus($status);
+                    ($this->logger)("Worker PID {$pid} exited (code {$exitCode})");
+                } elseif (pcntl_wifsignaled($status)) {
+                    $signal = pcntl_wtermsig($status);
+                    $exitCode = 128 + $signal;
+                    ($this->logger)("Worker PID {$pid} killed by signal {$signal} (" . match($signal) {
+                        1 => 'SIGHUP', 2 => 'SIGINT', 6 => 'SIGABRT', 9 => 'SIGKILL',
+                        11 => 'SIGSEGV', 13 => 'SIGPIPE', 15 => 'SIGTERM',
+                        default => 'SIG' . $signal,
+                    } . ")");
+                } else {
+                    $exitCode = -1;
+                    ($this->logger)("Worker PID {$pid} exited (unknown status)");
+                }
 
                 // Workers being scaled down should not be respawned.
                 if (isset($this->scalingDownPids[$pid])) {

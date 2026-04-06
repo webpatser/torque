@@ -8,6 +8,7 @@ use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
 use Webpatser\Torque\Console\TorqueMonitorCommand;
 use Webpatser\Torque\Console\TorquePauseCommand;
+use Webpatser\Torque\Console\TorqueWorkerCommand;
 use Webpatser\Torque\Console\TorqueStartCommand;
 use Webpatser\Torque\Console\TorqueStatusCommand;
 use Webpatser\Torque\Console\TorqueStopCommand;
@@ -81,6 +82,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorquePauseCommand::class,
                 TorqueSupervisorCommand::class,
                 TorqueMonitorCommand::class,
+                TorqueWorkerCommand::class,
             ]);
         }
     }
