@@ -40,10 +40,15 @@ final class MasterProcess
      * @param  array<string, mixed>  $config  Merged Torque config.
      * @param  Closure(string): void  $logger  Callback for outputting status messages.
      */
+    private readonly string $bootstrapPath;
+
     public function __construct(
         private readonly array $config,
         private readonly Closure $logger,
-    ) {}
+    ) {
+        // Resolve bootstrap path before forking — cwd may change after fork.
+        $this->bootstrapPath = base_path('bootstrap/app.php');
+    }
 
     /**
      * Fork worker processes and enter the monitoring loop.
@@ -123,7 +128,8 @@ final class MasterProcess
         if ($pid === 0) {
             // Child process — bootstrap a fresh Laravel app so each worker
             // has its own service container, database connections, etc.
-            $app = require base_path('bootstrap/app.php');
+            // Use the pre-resolved path since cwd may differ after fork.
+            $app = require $this->bootstrapPath;
             $kernel = $app->make(\Illuminate\Contracts\Console\Kernel::class);
             $kernel->bootstrap();
 
