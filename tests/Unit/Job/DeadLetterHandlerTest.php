@@ -1,0 +1,108 @@
+<?php
+
+declare(strict_types=1);
+
+use Webpatser\Torque\Job\DeadLetterHandler;
+
+it('stores failed jobs in dead letter stream', function () {
+    try {
+        $handler = new DeadLetterHandler(
+            redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
+            deadLetterStream: 'torque-test:dead-letter',
+        );
+
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"dead-1","job":"TestJob"}',
+            messageId: '1680000000000-0',
+            exception: new RuntimeException('Test failure'),
+        );
+
+        $entries = $handler->list(count: 10);
+        expect($entries)->not->toBeEmpty();
+
+        $last = end($entries);
+        expect($last['original_queue'])->toBe('default');
+        expect($last['exception_class'])->toBe('RuntimeException');
+        expect($last['exception_message'])->toBe('Test failure');
+
+        // Clean up.
+        $handler->purge($last['id']);
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+it('retries a dead-lettered job', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+        $handler = new DeadLetterHandler(
+            redisUri: $redisUri,
+            deadLetterStream: 'torque-test:dead-letter',
+        );
+
+        $handler->handle(
+            queue: 'torque-test:retry-queue',
+            payload: '{"uuid":"retry-1","job":"TestJob"}',
+            messageId: '1680000000000-1',
+            exception: new RuntimeException('Retry test'),
+        );
+
+        $entries = $handler->list(count: 10);
+        $last = end($entries);
+
+        $handler->retry($last['id']);
+
+        // Entry should be removed from dead letter.
+        $remaining = $handler->list(count: 100);
+        $ids = array_column($remaining, 'id');
+        expect($ids)->not->toContain($last['id']);
+
+        // Clean up the retried job from the target stream.
+        $redis = \Amp\Redis\createRedisClient($redisUri);
+        $redis->execute('DEL', 'torque-test:retry-queue');
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+it('purges a dead-lettered entry', function () {
+    try {
+        $handler = new DeadLetterHandler(
+            redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
+            deadLetterStream: 'torque-test:dead-letter',
+        );
+
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"purge-1"}',
+            messageId: '1680000000000-2',
+            exception: new RuntimeException('Purge test'),
+        );
+
+        $entries = $handler->list(count: 10);
+        $last = end($entries);
+
+        $handler->purge($last['id']);
+
+        $remaining = $handler->list(count: 100);
+        $ids = array_column($remaining, 'id');
+        expect($ids)->not->toContain($last['id']);
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+it('returns empty list when stream is empty', function () {
+    try {
+        $handler = new DeadLetterHandler(
+            redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
+            deadLetterStream: 'torque-test:dead-letter-empty-' . bin2hex(random_bytes(4)),
+        );
+
+        $entries = $handler->list();
+        expect($entries)->toBe([]);
+    } catch (\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
