@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Pool;
 
-use Amp\Mysql\MysqlConfig;
-use Amp\Mysql\MysqlConnectionPool;
-use Amp\Mysql\MysqlResult;
-use Amp\Mysql\MysqlStatement;
+use Fledge\Async\Database\Mysql\MysqlConfig;
+use Fledge\Async\Database\Mysql\MysqlConnectionPool;
+use Fledge\Async\Database\Mysql\MysqlResult;
+use Fledge\Async\Database\Mysql\MysqlStatement;
 
 /**
  * Thin wrapper around amphp/mysql's built-in connection pool.

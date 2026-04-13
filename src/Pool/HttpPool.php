@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Pool;
 
-use Amp\Http\Client\HttpClient;
-use Amp\Http\Client\HttpClientBuilder;
-use Amp\Http\Client\Request;
-use Amp\Http\Client\Response;
-use Amp\Sync\LocalSemaphore;
-use Amp\Sync\Semaphore;
+use Fledge\Async\Http\Client\HttpClient;
+use Fledge\Async\Http\Client\HttpClientBuilder;
+use Fledge\Async\Http\Client\Request;
+use Fledge\Async\Http\Client\Response;
+use Fledge\Async\Sync\LocalSemaphore;
+use Fledge\Async\Sync\Semaphore;
 
 /**
  * Concurrency-limited wrapper around amphp/http-client.

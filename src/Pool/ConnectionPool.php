@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Pool;
 
-use Amp\Sync\LocalSemaphore;
-use Amp\Sync\Semaphore;
+use Fledge\Async\Sync\LocalSemaphore;
+use Fledge\Async\Sync\Semaphore;
 use SplQueue;
 
 /**

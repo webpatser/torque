@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Job;
 
-use Amp\Redis\RedisClient;
+use Fledge\Async\Redis\RedisClient;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Handles jobs that have exhausted all retries.
@@ -19,11 +19,14 @@ final class DeadLetterHandler
 {
     private readonly RedisClient $redis;
 
+    private readonly string $deadLetterStream;
+
     public function __construct(
         private readonly string $redisUri,
-        private readonly string $deadLetterStream = 'torque:stream:dead-letter',
         private readonly int $ttl = 604800, // 7 days
+        private readonly string $prefix = 'torque:',
     ) {
+        $this->deadLetterStream = $this->prefix . 'dead-letter';
         $this->redis = createRedisClient($this->redisUri);
     }
 
@@ -45,6 +48,7 @@ final class DeadLetterHandler
             'original_queue', $queue,
             'exception_class', $exception::class,
             'exception_message', substr($exception->getMessage(), 0, 1000),
+            'exception_trace', substr($exception->getTraceAsString(), 0, 5000),
             'failed_at', (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c'),
         );
     }
@@ -77,9 +81,11 @@ final class DeadLetterHandler
             throw new \RuntimeException("Invalid queue name: [{$queue}].");
         }
 
+        $streamKey = $this->prefix . $queue;
+
         $this->redis->execute(
             'XADD',
-            $queue,
+            $streamKey,
             '*',
             'payload', $fields['payload'] ?? '',
         );
@@ -98,20 +104,30 @@ final class DeadLetterHandler
     }
 
     /**
-     * List entries in the dead-letter stream.
-     *
-     * @param  int  $count  Maximum number of entries to return.
-     * @param  string|null  $startId  Start reading from this ID (inclusive). Defaults to the beginning.
-     * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, failed_at: string}>
+     * Count the total number of entries in the dead-letter stream.
      */
     #[\NoDiscard]
-    public function list(int $count = 50, ?string $startId = null): array
+    public function count(): int
+    {
+        $result = $this->redis->execute('XLEN', $this->deadLetterStream);
+
+        return is_int($result) ? $result : 0;
+    }
+
+    /**
+     * List entries in the dead-letter stream, newest first.
+     *
+     * @param  int  $count  Maximum number of entries to return.
+     * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
+     */
+    #[\NoDiscard]
+    public function list(int $count = 50): array
     {
         $entries = $this->redis->execute(
-            'XRANGE',
+            'XREVRANGE',
             $this->deadLetterStream,
-            $startId ?? '-',
             '+',
+            '-',
             'COUNT',
             (string) $count,
         );
@@ -132,6 +148,7 @@ final class DeadLetterHandler
                 'original_queue' => $fields['original_queue'] ?? '',
                 'exception_class' => $fields['exception_class'] ?? '',
                 'exception_message' => $fields['exception_message'] ?? '',
+                'exception_trace' => $fields['exception_trace'] ?? '',
                 'failed_at' => $fields['failed_at'] ?? '',
             ];
         }

@@ -4,14 +4,14 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Queue;
 
-use Amp\Redis\RedisClient;
+use Fledge\Async\Redis\RedisClient;
 use DateInterval;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Queue;
 use Illuminate\Support\Str;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Laravel queue driver backed by Redis Streams + AMPHP.
@@ -364,7 +364,7 @@ class StreamQueue extends Queue implements QueueContract
                 '0',
                 'MKSTREAM',
             );
-        } catch (\Amp\Redis\RedisException $e) {
+        } catch (\Fledge\Async\Redis\RedisException $e) {
             // "BUSYGROUP Consumer Group name already exists" is expected.
             if (!str_contains($e->getMessage(), 'BUSYGROUP')) {
                 throw $e;

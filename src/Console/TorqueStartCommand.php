@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
 
 /**
@@ -28,8 +29,38 @@ final class TorqueStartCommand extends Command
 
     public function handle(): int
     {
+        // Refuse to start if a master is already running (PID file or actual process).
+        $existingPid = MasterProcess::readPid();
+
+        if ($existingPid !== null) {
+            $this->components->error("Torque is already running (master PID {$existingPid}). Run torque:stop first.");
+
+            return self::FAILURE;
+        }
+
+        // Also check for orphaned master processes whose PID file was lost.
+        // Scope pgrep to this project's base path to avoid matching other projects.
+        $basePath = base_path();
+        $output = [];
+        exec('pgrep -f ' . escapeshellarg($basePath . '/artisan torque:start'), $output);
+        $otherMasters = array_filter(
+            array_map('intval', $output),
+            fn (int $pid) => $pid > 0 && $pid !== getmypid(),
+        );
+
+        if ($otherMasters !== []) {
+            $this->components->error(
+                'Found running torque:start process(es): ' . implode(', ', $otherMasters) . '. Run torque:stop first or kill them manually.',
+            );
+
+            return self::FAILURE;
+        }
+
         /** @var array<string, mixed> $config */
         $config = config('torque');
+
+        // Kill any orphaned worker processes and clean stale metrics from a previous run.
+        $this->cleanupOrphans();
 
         // Apply CLI overrides.
         if ($this->option('workers') !== null) {
@@ -71,5 +102,17 @@ final class TorqueStartCommand extends Command
         );
 
         return $master->start();
+    }
+
+    /**
+     * Clean stale worker metrics from Redis left by a previous run.
+     */
+    private function cleanupOrphans(): void
+    {
+        try {
+            app(MetricsPublisher::class)->removeAllWorkerMetrics();
+        } catch (\Throwable) {
+            // Best-effort — Redis may be unavailable.
+        }
     }
 }

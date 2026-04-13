@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Pool;
 
-use Amp\Sync\Lock;
+use Fledge\Async\Sync\Lock;
 
 /**
  * Wrapper around a checked-out connection that auto-releases on destruct.

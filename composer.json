@@ -1,7 +1,7 @@
 {
     "name": "webpatser/torque",
     "description": "Coroutine-based queue worker for Laravel — N jobs per process via PHP Fibers and Redis Streams",
-    "keywords": ["laravel", "queue", "fibers", "coroutines", "redis-streams", "async", "amphp"],
+    "keywords": ["laravel", "queue", "fibers", "coroutines", "redis-streams", "async", "fledge"],
     "license": "MIT",
     "type": "library",
     "require": {
@@ -10,17 +10,10 @@
         "illuminate/console": "^12.0|^13.0",
         "illuminate/support": "^12.0|^13.0",
         "revolt/event-loop": "^1.0",
-        "amphp/amp": "^3.1",
-        "amphp/redis": "^2.0",
-        "amphp/sync": "^2.3"
+        "webpatser/fledge-fiber": "^13.4"
     },
-    "suggest": {
-        "amphp/mysql": "Required for async MySQL connection pooling (^3.0)",
-        "amphp/http-client": "Required for async HTTP client pooling (^5.3)"
-    },
+    "suggest": {},
     "require-dev": {
-        "amphp/http-client": "^5.3",
-        "amphp/mysql": "^3.0",
         "orchestra/testbench": "^10.0|^11.0",
         "pestphp/pest": "^4.0"
     },

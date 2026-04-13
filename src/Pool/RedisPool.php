@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Pool;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Pre-configured connection pool for amphp/redis clients.

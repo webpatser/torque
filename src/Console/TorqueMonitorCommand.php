@@ -8,7 +8,7 @@ use Illuminate\Console\Command;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Real-time terminal dashboard for Torque — htop-style monitor.

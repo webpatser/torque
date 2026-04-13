@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Metrics\MetricsPublisher;
 
 /**
  * Stop the running Torque master process.
@@ -55,31 +56,40 @@ final class TorqueStopCommand extends Command
 
         // Verify the process is actually running (signal 0 checks existence).
         if (! posix_kill($pid, 0)) {
-            $this->components->warn("Process {$pid} is not running. Cleaning up stale PID file.");
+            $this->components->warn("Process {$pid} is not running. Cleaning up stale PID file and orphans.");
             $this->removePidFile($pidFile);
+            $this->killOrphanWorkers();
+            $this->cleanupWorkerMetrics();
 
             return self::SUCCESS;
         }
 
-        $signal = $this->option('force') ? SIGKILL : SIGTERM;
-        $signalName = $this->option('force') ? 'SIGKILL' : 'SIGTERM';
-
-        $this->components->info("Sending {$signalName} to Torque master (PID {$pid})...");
-
-        if (! posix_kill($pid, $signal)) {
-            $this->components->error("Failed to send {$signalName} to PID {$pid}: " . posix_strerror(posix_get_last_error()));
-
-            return self::FAILURE;
-        }
-
-        // SIGKILL is instant — no graceful wait needed.
         if ($this->option('force')) {
-            // Brief pause to let the OS reap the process.
+            $this->components->info("Sending SIGKILL to Torque process group (PID {$pid})...");
+
+            // Kill the entire process group in one shot — master + all forked workers.
+            // Must kill the group BEFORE the leader, otherwise -pid may fail.
+            $this->killProcessGroup($pid);
+
             usleep(self::POLL_INTERVAL);
             $this->removePidFile($pidFile);
-            $this->components->info('Torque master killed.');
+            $this->cleanupWorkerMetrics();
+            $this->components->info('Torque master and workers killed.');
 
             return self::SUCCESS;
+        }
+
+        $this->components->info("Sending SIGTERM to Torque process group (PID {$pid})...");
+
+        // Send SIGTERM to the entire process group so both master and workers
+        // begin graceful shutdown simultaneously.
+        if (! posix_kill(-$pid, SIGTERM)) {
+            // Fallback: if process group kill fails, try the master directly.
+            if (! posix_kill($pid, SIGTERM)) {
+                $this->components->error("Failed to send SIGTERM to PID {$pid}: " . posix_strerror(posix_get_last_error()));
+
+                return self::FAILURE;
+            }
         }
 
         // Wait for graceful shutdown after SIGTERM.
@@ -92,6 +102,7 @@ final class TorqueStopCommand extends Command
             // posix_kill with signal 0 returns false when the process no longer exists.
             if (! posix_kill($pid, 0)) {
                 $this->removePidFile($pidFile);
+                $this->cleanupWorkerMetrics();
                 $this->components->info('Torque master stopped gracefully.');
 
                 return self::SUCCESS;
@@ -101,11 +112,18 @@ final class TorqueStopCommand extends Command
             $waited += self::POLL_INTERVAL;
         }
 
-        $this->components->error(
-            "Torque master (PID {$pid}) did not exit within " . self::GRACEFUL_TIMEOUT . ' seconds. Use --force to send SIGKILL.',
+        // Graceful shutdown timed out — escalate to SIGKILL on entire process group.
+        $this->components->warn(
+            'Graceful shutdown timed out after ' . self::GRACEFUL_TIMEOUT . ' seconds. Sending SIGKILL...',
         );
 
-        return self::FAILURE;
+        $this->killProcessGroup($pid);
+        usleep(self::POLL_INTERVAL);
+        $this->removePidFile($pidFile);
+        $this->cleanupWorkerMetrics();
+        $this->components->info('Torque master and workers killed.');
+
+        return self::SUCCESS;
     }
 
     /**
@@ -115,6 +133,50 @@ final class TorqueStopCommand extends Command
     {
         if (file_exists($path)) {
             unlink($path);
+        }
+    }
+
+    /**
+     * Kill any orphaned torque:worker processes belonging to this project.
+     *
+     * Scopes the pgrep pattern to this project's base path to avoid
+     * matching workers from other projects on the same server.
+     */
+    private function killOrphanWorkers(): void
+    {
+        $basePath = base_path();
+        $output = [];
+        exec('pgrep -f ' . escapeshellarg($basePath . '/artisan torque:worker'), $output);
+
+        foreach ($output as $line) {
+            $pid = (int) trim($line);
+            if ($pid > 0 && $pid !== getmypid()) {
+                posix_kill($pid, SIGKILL);
+            }
+        }
+    }
+
+    /**
+     * Kill the process group led by the given PID.
+     *
+     * Workers forked from the master share its PGID, so killing the
+     * group ensures no orphans survive after a force-kill.
+     */
+    private function killProcessGroup(int $pid): void
+    {
+        // Negative PID = send signal to entire process group.
+        posix_kill(-$pid, SIGKILL);
+    }
+
+    /**
+     * Remove all worker metrics keys from Redis so they don't linger as ghosts.
+     */
+    private function cleanupWorkerMetrics(): void
+    {
+        try {
+            app(MetricsPublisher::class)->removeAllWorkerMetrics();
+        } catch (\Throwable) {
+            // Best-effort — Redis may be unavailable.
         }
     }
 }

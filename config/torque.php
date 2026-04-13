@@ -42,7 +42,7 @@ return [
     */
     'redis' => [
         'uri' => env('TORQUE_REDIS_URI', 'redis://127.0.0.1:6379'),
-        'prefix' => env('TORQUE_PREFIX', 'torque:'),
+        'prefix' => env('TORQUE_PREFIX', 'torque:' . \Illuminate\Support\Str::slug(env('APP_NAME', 'laravel'), '_') . ':'),
     ],
 
     /*
@@ -61,7 +61,6 @@ return [
     */
     'streams' => [
         'default' => [
-            'stream' => 'torque:stream:default',
             'priority' => 0,
             'retry_after' => 60,
             'max_retries' => 3,
@@ -122,7 +121,6 @@ return [
     | Jobs that exceed max_retries go to the dead letter stream.
     */
     'dead_letter' => [
-        'stream' => 'torque:stream:dead-letter',
         'ttl' => 604800,
     ],
 

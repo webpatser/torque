@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Stream;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Read a job's event stream.
@@ -14,7 +14,7 @@ use function Amp\Redis\createRedisClient;
  */
 final class JobStream
 {
-    private ?\Amp\Redis\RedisClient $redis = null;
+    private ?\Fledge\Async\Redis\RedisClient $redis = null;
 
     public function __construct(
         private readonly string $redisUri,
@@ -126,7 +126,7 @@ final class JobStream
         return $entries;
     }
 
-    private function getRedis(): \Amp\Redis\RedisClient
+    private function getRedis(): \Fledge\Async\Redis\RedisClient
     {
         return $this->redis ??= createRedisClient($this->redisUri);
     }

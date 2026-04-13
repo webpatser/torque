@@ -105,7 +105,7 @@ final class TorqueTailCommand extends Command
     private function findLatestJob(string $redisUri, string $prefix): ?string
     {
         try {
-            $redis = \Amp\Redis\createRedisClient($redisUri);
+            $redis = \Fledge\Async\Redis\createRedisClient($redisUri);
             $cursor = '0';
             $latest = null;
             $latestTime = 0;
