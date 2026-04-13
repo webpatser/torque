@@ -38,22 +38,36 @@ final class TorqueStartCommand extends Command
             return self::FAILURE;
         }
 
-        // Also check for orphaned master processes whose PID file was lost.
-        // Scope pgrep to this project's base path to avoid matching other projects.
-        $basePath = base_path();
+        // Check for orphaned master processes whose PID file was lost (e.g. after deploy).
+        // Kill them automatically so Torque can start cleanly.
         $output = [];
-        exec('pgrep -f ' . escapeshellarg($basePath . '/artisan torque:start'), $output);
+        exec('pgrep -f ' . escapeshellarg('artisan torque:start'), $output);
         $otherMasters = array_filter(
             array_map('intval', $output),
             fn (int $pid) => $pid > 0 && $pid !== getmypid(),
         );
 
         if ($otherMasters !== []) {
-            $this->components->error(
-                'Found running torque:start process(es): ' . implode(', ', $otherMasters) . '. Run torque:stop first or kill them manually.',
+            $this->components->warn(
+                'Killing orphaned torque:start process(es): ' . implode(', ', $otherMasters),
             );
 
-            return self::FAILURE;
+            foreach ($otherMasters as $orphanPid) {
+                posix_kill(-$orphanPid, SIGKILL);
+                posix_kill($orphanPid, SIGKILL);
+            }
+
+            // Also kill orphaned workers.
+            $workerOutput = [];
+            exec('pgrep -f ' . escapeshellarg('artisan torque:worker'), $workerOutput);
+            foreach ($workerOutput as $line) {
+                $pid = (int) trim($line);
+                if ($pid > 0 && $pid !== getmypid()) {
+                    posix_kill($pid, SIGKILL);
+                }
+            }
+
+            usleep(200_000);
         }
 
         /** @var array<string, mixed> $config */

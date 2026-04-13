@@ -38,28 +38,46 @@ final class TorqueStopCommand extends Command
     public function handle(): int
     {
         $pidFile = storage_path('torque.pid');
+        $pid = null;
 
-        if (! file_exists($pidFile)) {
-            $this->components->error('Torque does not appear to be running (no PID file found).');
+        if (file_exists($pidFile)) {
+            $pid = (int) trim((string) file_get_contents($pidFile));
 
-            return self::FAILURE;
+            if ($pid <= 0) {
+                $this->components->warn('PID file exists but contains an invalid PID. Cleaning up.');
+                $this->removePidFile($pidFile);
+                $pid = null;
+            } elseif (! posix_kill($pid, 0)) {
+                $this->components->warn("Process {$pid} is not running. Cleaning up stale PID file and orphans.");
+                $this->removePidFile($pidFile);
+                $pid = null;
+            }
         }
 
-        $pid = (int) trim((string) file_get_contents($pidFile));
+        // No valid PID from file — try to find orphaned master processes via pgrep.
+        if ($pid === null) {
+            $orphanPids = $this->findOrphanMasters();
 
-        if ($pid <= 0) {
-            $this->components->error('PID file exists but contains an invalid PID.');
-            $this->removePidFile($pidFile);
+            if ($orphanPids === []) {
+                $this->killOrphanWorkers();
+                $this->cleanupWorkerMetrics();
+                $this->components->info('No running Torque processes found.');
 
-            return self::FAILURE;
-        }
+                return self::SUCCESS;
+            }
 
-        // Verify the process is actually running (signal 0 checks existence).
-        if (! posix_kill($pid, 0)) {
-            $this->components->warn("Process {$pid} is not running. Cleaning up stale PID file and orphans.");
-            $this->removePidFile($pidFile);
+            // Kill all orphaned masters and their workers.
+            $this->components->info('Found orphaned Torque process(es): ' . implode(', ', $orphanPids) . '. Killing...');
+
+            foreach ($orphanPids as $orphanPid) {
+                posix_kill(-$orphanPid, SIGKILL);
+                posix_kill($orphanPid, SIGKILL);
+            }
+
             $this->killOrphanWorkers();
+            $this->removePidFile($pidFile);
             $this->cleanupWorkerMetrics();
+            $this->components->info('Orphaned Torque processes killed.');
 
             return self::SUCCESS;
         }
@@ -137,16 +155,33 @@ final class TorqueStopCommand extends Command
     }
 
     /**
-     * Kill any orphaned torque:worker processes belonging to this project.
+     * Find orphaned torque:start master processes via pgrep.
      *
-     * Scopes the pgrep pattern to this project's base path to avoid
-     * matching workers from other projects on the same server.
+     * Uses the deploy base directory (without release-specific path) to match
+     * processes from any release, which is essential for Deployer setups.
+     *
+     * @return list<int>
+     */
+    private function findOrphanMasters(): array
+    {
+        $output = [];
+        exec('pgrep -f ' . escapeshellarg('artisan torque:start'), $output);
+
+        return array_values(array_filter(
+            array_map('intval', $output),
+            fn (int $pid) => $pid > 0 && $pid !== getmypid(),
+        ));
+    }
+
+    /**
+     * Kill any orphaned torque:worker processes.
+     *
+     * Uses a broad pattern to match workers from any release path.
      */
     private function killOrphanWorkers(): void
     {
-        $basePath = base_path();
         $output = [];
-        exec('pgrep -f ' . escapeshellarg($basePath . '/artisan torque:worker'), $output);
+        exec('pgrep -f ' . escapeshellarg('artisan torque:worker'), $output);
 
         foreach ($output as $line) {
             $pid = (int) trim($line);
