@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
-use Amp\Redis\RedisClient;
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Console\Command;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Display the current status of the Torque queue worker.
@@ -144,7 +144,7 @@ final class TorqueStatusCommand extends Command
         try {
             /** @var array|null $result */
             $result = $redis->execute('HGETALL', $key);
-        } catch (\Amp\Redis\RedisException) {
+        } catch (\Fledge\Async\Redis\RedisException) {
             return [];
         }
 

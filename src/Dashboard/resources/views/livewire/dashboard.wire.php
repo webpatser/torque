@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Livewire\Component;
 use Livewire\Attributes\Computed;
 use Livewire\Attributes\On;
+use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 
 new class extends Component {
@@ -18,29 +19,29 @@ new class extends Component {
     }
 
     #[Computed]
-    public function metrics(): array
-    {
-        return app(MetricsPublisher::class)->getAggregatedMetrics();
-    }
-
-    #[Computed]
     public function workers(): array
     {
         return app(MetricsPublisher::class)->getAllWorkerMetrics();
     }
 
     #[Computed]
+    public function metrics(): array
+    {
+        return app(MetricsPublisher::class)->aggregateFromWorkers($this->workers);
+    }
+
+    #[Computed]
+    public function deadLetterCount(): int
+    {
+        return app(DeadLetterHandler::class)->count();
+    }
+
+    #[Computed]
     public function isRunning(): bool
     {
-        $metrics = $this->metrics;
+        $updatedAt = (int) ($this->metrics['updated_at'] ?? 0);
 
-        if ($metrics === []) {
-            return false;
-        }
-
-        $updatedAt = (int) ($metrics['updated_at'] ?? 0);
-
-        return (time() - $updatedAt) < 30;
+        return $updatedAt > 0 && (time() - $updatedAt) < 30;
     }
 
     public function setTab(string $tab): void
@@ -97,11 +98,8 @@ new class extends Component {
                         ])
                     >
                         {{ $label }}
-                        @if($key === 'failed')
-                            @php $failedCount = (int) ($this->metrics['jobs_failed'] ?? 0); @endphp
-                            @if($failedCount > 0)
-                                <flux:badge color="red" size="sm" class="ml-1.5">{{ $failedCount }}</flux:badge>
-                            @endif
+                        @if($key === 'failed' && $this->deadLetterCount > 0)
+                            <flux:badge color="red" size="sm" class="ml-1.5">{{ number_format($this->deadLetterCount) }}</flux:badge>
                         @endif
                     </button>
                 @endforeach

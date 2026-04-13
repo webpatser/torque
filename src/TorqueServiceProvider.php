@@ -62,8 +62,8 @@ final class TorqueServiceProvider extends ServiceProvider
 
             return new DeadLetterHandler(
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                deadLetterStream: $config['dead_letter']['stream'] ?? 'torque:stream:dead-letter',
                 ttl: $config['dead_letter']['ttl'] ?? 604800,
+                prefix: $config['redis']['prefix'] ?? 'torque:',
             );
         });
     }
@@ -131,7 +131,7 @@ final class TorqueServiceProvider extends ServiceProvider
         $basePath = __DIR__ . '/Dashboard/resources/views/livewire';
 
         foreach ($components as $alias => $file) {
-            Livewire::component($alias, $basePath . '/' . $file . '.wire.php');
+            Livewire::addComponent($alias, viewPath: $basePath . '/' . $file . '.wire.php');
         }
     }
 }

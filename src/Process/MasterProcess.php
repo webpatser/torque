@@ -104,6 +104,19 @@ final class MasterProcess
 
         $exitCode = $this->monitor();
 
+        // Clean up all worker metrics keys from Redis after all workers have exited.
+        // This is the safety net — individual workers clean up on graceful exit, but
+        // SIGKILL or crashes may leave ghost entries.
+        try {
+            $publisher = new MetricsPublisher(
+                redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+                prefix: $this->config['redis']['prefix'] ?? 'torque:',
+            );
+            $publisher->removeAllWorkerMetrics();
+        } catch (\Throwable) {
+            // Best-effort — don't prevent shutdown.
+        }
+
         $this->removePidFile();
 
         return $exitCode;

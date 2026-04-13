@@ -9,7 +9,7 @@ use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Records job lifecycle events to a per-job Redis Stream.
@@ -23,7 +23,7 @@ use function Amp\Redis\createRedisClient;
  */
 final class JobStreamRecorder
 {
-    private ?\Amp\Redis\RedisClient $redis = null;
+    private ?\Fledge\Async\Redis\RedisClient $redis = null;
 
     public function __construct(
         private readonly string $redisUri,
@@ -186,7 +186,7 @@ final class JobStreamRecorder
         return null;
     }
 
-    private function getRedis(): \Amp\Redis\RedisClient
+    private function getRedis(): \Fledge\Async\Redis\RedisClient
     {
         return $this->redis ??= createRedisClient($this->redisUri);
     }

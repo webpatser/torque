@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Worker;
 
-use Amp\Redis\RedisClient;
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
@@ -21,8 +21,8 @@ use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 
-use function Amp\async;
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\async;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * The heart of Torque. Runs inside a forked child process with a Revolt event loop.
@@ -105,8 +105,8 @@ final class WorkerProcess
         $deadLetterConfig = $this->config['dead_letter'] ?? [];
         $deadLetterHandler = new DeadLetterHandler(
             redisUri: $redisUri,
-            deadLetterStream: $deadLetterConfig['stream'] ?? 'torque:stream:dead-letter',
             ttl: (int) ($deadLetterConfig['ttl'] ?? 604800),
+            prefix: $prefix,
         );
 
         // Ensure consumer groups exist for all configured queues.
@@ -144,7 +144,7 @@ final class WorkerProcess
         fwrite(STDERR, "[torque:worker] Starting {$concurrency} reader Fibers\n");
 
         for ($i = 0; $i < $concurrency; $i++) {
-            async(function () use (
+            (void) async(function () use (
                 $redisUri,
                 $queues,
                 $prefix,
@@ -172,11 +172,11 @@ final class WorkerProcess
                     try {
                         $isPaused = $fiberRedis->execute('EXISTS', $prefix . 'paused');
                         if ($isPaused) {
-                            \Amp\delay(1.0);
+                            \Fledge\Async\delay(1.0);
                             continue;
                         }
                     } catch (\Throwable) {
-                        \Amp\delay(1.0);
+                        \Fledge\Async\delay(1.0);
                         continue;
                     }
 
@@ -248,6 +248,13 @@ final class WorkerProcess
         } catch (\Throwable $e) {
             fwrite(STDERR, "[torque:worker] EventLoop crashed: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
             fwrite(STDERR, $e->getTraceAsString() . "\n");
+        }
+
+        // Remove this worker's metrics key from Redis so it doesn't linger as a ghost.
+        try {
+            $metricsPublisher->removeWorkerMetrics($this->consumerId);
+        } catch (\Throwable) {
+            // Best-effort cleanup — don't prevent shutdown.
         }
 
         $this->isRunning = false;
@@ -482,7 +489,7 @@ final class WorkerProcess
                     'id' => $messageId,
                     'payload' => $payload,
                 ];
-            } catch (\Amp\Redis\RedisException) {
+            } catch (\Fledge\Async\Redis\RedisException) {
                 continue;
             }
         }
@@ -606,17 +613,27 @@ final class WorkerProcess
             $backoffSeconds = (int) (2 ** $job->attempts());
             $job->release($backoffSeconds);
         } else {
-            // Exhausted all retries — mark as permanently failed.
-            $job->fail($exception);
-            $events->dispatch(new JobFailed($connectionName, $job, $exception));
-
-            // Move to dead-letter stream for inspection / retry via dashboard.
+            // Write to dead-letter stream FIRST — $job->fail() may throw
+            // (e.g. job's failed() callback, DB write for failed_jobs table,
+            // or event listener), and we must not lose the failed job.
             $deadLetterHandler->handle(
                 queue: $queueName,
                 payload: $message['payload'],
                 messageId: $message['id'],
                 exception: $exception,
             );
+
+            // Mark as failed via Laravel's base Job — this ACKs/DELs the
+            // stream message and calls the job's failed() callback.
+            try {
+                $job->fail($exception);
+            } catch (\Throwable) {
+                // fail() already deleted the message from the stream.
+                // If it throws after that (e.g. failed() callback or DB),
+                // the job is already in dead-letter — safe to swallow.
+            }
+
+            $events->dispatch(new JobFailed($connectionName, $job, $exception));
 
             // Fire a domain event so users can hook in custom notification logic.
             $decoded = json_decode($message['payload'], true);

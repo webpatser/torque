@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Metrics;
 
-use Amp\Redis\RedisClient;
+use Fledge\Async\Redis\RedisClient;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Publishes worker metrics to Redis hashes for dashboard consumption.
@@ -124,6 +124,45 @@ final class MetricsPublisher
     }
 
     /**
+     * Remove a worker's metrics key from Redis.
+     *
+     * Called during graceful shutdown so the worker doesn't appear as a
+     * ghost in the dashboard until the TTL expires.
+     */
+    public function removeWorkerMetrics(string $workerId): void
+    {
+        $this->getRedis()->execute('DEL', $this->prefix . 'worker:' . $workerId);
+    }
+
+    /**
+     * Remove all worker metrics keys from Redis.
+     *
+     * Called by the master process after all workers have exited to ensure
+     * no ghost entries remain (e.g. after SIGKILL or crash).
+     */
+    public function removeAllWorkerMetrics(): void
+    {
+        $redis = $this->getRedis();
+        $pattern = $this->prefix . 'worker:*';
+        $cursor = '0';
+
+        do {
+            $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '100');
+
+            if (!is_array($result) || count($result) < 2) {
+                break;
+            }
+
+            $cursor = (string) $result[0];
+            $keys = is_array($result[1]) ? $result[1] : [];
+
+            foreach ($keys as $key) {
+                $redis->execute('DEL', (string) $key);
+            }
+        } while ($cursor !== '0');
+    }
+
+    /**
      * Read a single worker's metrics from Redis.
      *
      * @return array<string, string>|null  Null if the key does not exist (worker expired).
@@ -201,6 +240,60 @@ final class MetricsPublisher
         }
 
         return $this->flatPairsToAssoc($result);
+    }
+
+    /**
+     * Aggregate metrics on-the-fly from individual worker hashes.
+     *
+     * Unlike {@see getAggregatedMetrics()} which reads a pre-computed hash,
+     * this builds a summary directly from `{prefix}worker:*` keys — no
+     * master process required.
+     *
+     * @param  array<string, array<string, string>>  $workers  Output of {@see getAllWorkerMetrics()}.
+     * @return array<string, mixed>
+     */
+    #[\NoDiscard]
+    public function aggregateFromWorkers(array $workers): array
+    {
+        $totalProcessed = 0;
+        $totalFailed = 0;
+        $totalSlots = 0;
+        $totalActive = 0;
+        $totalMemory = 0;
+        $latencySum = 0.0;
+        $latencyCount = 0;
+        $latestHeartbeat = 0;
+
+        foreach ($workers as $w) {
+            $totalProcessed += (int) ($w['jobs_processed'] ?? 0);
+            $totalFailed += (int) ($w['jobs_failed'] ?? 0);
+            $totalSlots += (int) ($w['total_slots'] ?? 0);
+            $totalActive += (int) ($w['active_slots'] ?? 0);
+            $totalMemory += (int) ($w['memory_bytes'] ?? 0);
+            $heartbeat = (int) ($w['last_heartbeat'] ?? 0);
+
+            if ($heartbeat > $latestHeartbeat) {
+                $latestHeartbeat = $heartbeat;
+            }
+
+            $processed = (int) ($w['jobs_processed'] ?? 0);
+            if ($processed > 0) {
+                $latencySum += (float) ($w['avg_latency_ms'] ?? 0) * $processed;
+                $latencyCount += $processed;
+            }
+        }
+
+        return [
+            'workers' => count($workers),
+            'total_slots' => $totalSlots,
+            'concurrent' => $totalActive,
+            'jobs_processed' => $totalProcessed,
+            'jobs_failed' => $totalFailed,
+            'throughput' => 0.0,
+            'avg_latency' => $latencyCount > 0 ? round($latencySum / $latencyCount, 2) : 0,
+            'memory_mb' => round($totalMemory / 1024 / 1024, 2),
+            'updated_at' => $latestHeartbeat,
+        ];
     }
 
     /**

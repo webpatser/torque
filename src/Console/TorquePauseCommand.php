@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
-use Amp\Redis\RedisClient;
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Console\Command;
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Pause or resume the Torque queue worker.
@@ -79,7 +79,7 @@ final class TorquePauseCommand extends Command
             $result = $redis->execute('EXISTS', $key);
 
             return (int) $result === 1;
-        } catch (\Amp\Redis\RedisException) {
+        } catch (\Fledge\Async\Redis\RedisException) {
             return false;
         }
     }
