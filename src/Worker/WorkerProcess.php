@@ -45,6 +45,13 @@ final class WorkerProcess
         get => $this->stopRequested;
     }
 
+    /** Limits — set once in run(), checked by timers to know when to cancel. */
+    private int $maxJobs = 10_000;
+
+    private int $maxLifetime = 3600;
+
+    private int $startTime = 0;
+
     /** @var array<string, mixed> */
     private readonly array $config;
 
@@ -131,7 +138,10 @@ final class WorkerProcess
             $this->stopRequested = true;
         });
 
-        $startTime = time();
+        $this->maxJobs = $maxJobs;
+        $this->maxLifetime = $maxLifetime;
+        $this->startTime = time();
+        $startTime = $this->startTime;
 
         // Spawn N reader Fibers (one per concurrency slot).
         // Each Fiber loops: read → process → repeat. When XREADGROUP BLOCK waits,
@@ -224,7 +234,7 @@ final class WorkerProcess
 
         // Delayed job migration timer — checks every second for matured delayed jobs.
         EventLoop::repeat(1.0, function (string $id) use ($redisPool, $queues, $prefix) {
-            if ($this->stopRequested) {
+            if ($this->hasReachedLimits()) {
                 EventLoop::cancel($id);
                 return;
             }
@@ -235,7 +245,7 @@ final class WorkerProcess
         // Metrics publishing timer — pushes worker snapshot to Redis for the dashboard.
         $metricsInterval = (float) ($this->config['metrics']['publish_interval'] ?? 1);
         EventLoop::repeat($metricsInterval, function (string $id) use ($metricsPublisher, $metrics) {
-            if ($this->stopRequested) {
+            if ($this->hasReachedLimits()) {
                 EventLoop::cancel($id);
                 return;
             }
@@ -495,6 +505,16 @@ final class WorkerProcess
         }
 
         return null;
+    }
+
+    /**
+     * Check if the worker should stop due to any reason: signal, max jobs, or max lifetime.
+     */
+    private function hasReachedLimits(): bool
+    {
+        return $this->stopRequested
+            || $this->jobsProcessed >= $this->maxJobs
+            || (time() - $this->startTime) >= $this->maxLifetime;
     }
 
     /**
