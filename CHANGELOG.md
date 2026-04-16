@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-16
+
+### Fixed
+- **Workers not picking up new jobs while running.** Both immediate and delayed jobs dispatched while Torque was already running were invisible until a restart. Root cause: 50 simultaneous XREADGROUP BLOCK connections overwhelmed the async Redis client's notification chain, preventing Fibers from waking up on new messages or timeouts. Replaced BLOCK-based reads with non-blocking `XREADGROUP` + explicit `delay()` yield. Each Fiber now polls and yields cleanly, ensuring the event loop can always service timers (delayed job migration, metrics, pause checks)
+
+### Added
+- **Redis Cluster support.** Set `TORQUE_CLUSTER=true` to wrap all queue keys in hash tags (`{queue-name}`). Stream, delayed set, and notification keys for the same queue land on the same cluster slot. Existing hash tags in queue names are preserved (no double-wrapping). Matches the approach Laravel v13.5.0 introduced for its built-in RedisQueue
+- **Staggered Fiber startup.** Fibers now start with a small delay between each one (spread across the poll interval) to distribute polling evenly and prevent thundering-herd effects
+- **Shared pause flag.** A single `EventLoop::repeat` timer checks the pause key every 2 seconds and updates a shared flag. Fibers read the flag instead of each calling `EXISTS` on every iteration, reducing Redis overhead from 50 calls/cycle to 1
+- **Periodic pending re-check.** Fibers re-check their pending entry list every ~50 iterations (~25 seconds) instead of only once at startup. Catches any orphaned messages that were delivered but never acknowledged
+- **Delayed job migration logging.** `migrateDelayedJobs` now logs to STDERR when it moves matured jobs from the sorted set to the stream, making it easier to verify the migration timer fires correctly
+
+### Changed
+- `readNextMessage()` no longer uses `BLOCK` argument. Returns immediately with a message or null. Callers yield via `\Fledge\Async\delay()` when idle
+- `block_for` config now controls the poll interval (converted from ms to seconds) rather than the XREADGROUP BLOCK timeout
+- `readPendingMessage()`, `stealMessage()`, and `migrateDelayedJobs()` accept a `$buildStreamKey` closure for cluster-safe key construction
+- Updated dependencies from amphp to webpatser/fledge-fiber
+
+## [0.5.2] - 2026-04-12
+
+### Fixed
+- Workers stuck after reaching `max_jobs`: event loop timers are now cancelled when limits are reached, allowing the loop to exit cleanly
+
+## [0.5.1] - 2026-04-10
+
+### Fixed
+- Stop/start for Deployer: kill orphan worker processes instead of refusing to start
+
+## [0.5.0] - 2026-04-08
+
+### Changed
+- Migrated from amphp to webpatser/fledge-fiber for all async primitives (Redis, async/await, sync)
+- Fixed `#[\NoDiscard]` warning on async queue operations
+
 ## [0.4.0] - 2026-04-06
 
 ### Added
@@ -115,7 +149,11 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/webpatser/torque/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/webpatser/torque/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/webpatser/torque/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/webpatser/torque/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/webpatser/torque/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/webpatser/torque/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/webpatser/torque/compare/v0.1.0...v0.2.0
