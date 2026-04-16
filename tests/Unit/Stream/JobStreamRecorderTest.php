@@ -5,7 +5,7 @@ declare(strict_types=1);
 use Webpatser\Torque\Stream\JobStreamRecorder;
 
 it('does not record when disabled', function () {
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $uuid = 'test-disabled-' . bin2hex(random_bytes(8));
     $key = 'torque-test:job:' . $uuid;
 
@@ -21,7 +21,7 @@ it('does not record when disabled', function () {
 });
 
 it('does not record with empty uuid', function () {
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
 
     $recorder = new JobStreamRecorder(
         redisUri: 'redis://127.0.0.1:6379/15',
@@ -35,7 +35,7 @@ it('does not record with empty uuid', function () {
 });
 
 it('records a queued event to redis stream', function () {
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $uuid = 'test-' . bin2hex(random_bytes(8));
     $key = 'torque-test:job:' . $uuid;
 
@@ -68,7 +68,7 @@ it('records a queued event to redis stream', function () {
 });
 
 it('records custom events via emitCustom', function () {
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $uuid = 'test-' . bin2hex(random_bytes(8));
     $key = 'torque-test:job:' . $uuid;
 
@@ -99,7 +99,7 @@ it('records custom events via emitCustom', function () {
 });
 
 it('sets TTL on terminal events', function () {
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $uuid = 'test-' . bin2hex(random_bytes(8));
     $key = 'torque-test:job:' . $uuid;
 
@@ -125,7 +125,7 @@ it('sets TTL on terminal events', function () {
 });
 
 it('records multiple lifecycle events in order', function () {
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $uuid = 'test-' . bin2hex(random_bytes(8));
     $key = 'torque-test:job:' . $uuid;
 

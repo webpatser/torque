@@ -22,6 +22,10 @@ abstract class TestCase extends BaseTestCase
     {
         $app['config']->set('app.key', 'base64:' . base64_encode(str_repeat('a', 32)));
 
+        $app['config']->set('torque.redis.prefix', 'torque-test:');
+        $app['config']->set('torque.redis.uri', env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'));
+        $app['config']->set('torque.consumer_group', 'torque-test');
+
         $app['config']->set('queue.connections.torque', [
             'driver' => 'torque',
             'queue' => 'default',

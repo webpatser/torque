@@ -5,8 +5,8 @@ declare(strict_types=1);
 use Webpatser\Torque\Pool\PooledConnection;
 use Webpatser\Torque\Pool\RedisPool;
 
-use function Amp\async;
-use function Amp\Future\await;
+use function Fledge\Async\async;
+use function Fledge\Async\Future\await;
 
 beforeEach(function () {
     try {
@@ -85,7 +85,7 @@ it('respects pool size limit', function () {
     });
 
     // Give the event loop a tick — the third checkout should still be waiting.
-    \Amp\delay(0.05);
+    \Fledge\Async\delay(0.05);
     expect($acquired)->toBeFalse();
 
     // Release one slot to unblock the waiting fiber.

@@ -34,6 +34,27 @@ use function Fledge\Async\Redis\createRedisClient;
  */
 final class WorkerProcess
 {
+    /**
+     * Lua script for atomic delayed job migration.
+     *
+     * Atomically reads matured entries from the delayed sorted set, removes them,
+     * and adds them to the stream. This prevents race conditions where multiple
+     * workers migrate the same delayed jobs simultaneously.
+     *
+     * KEYS[1] = delayed sorted set key
+     * KEYS[2] = stream key
+     * ARGV[1] = current timestamp
+     */
+    private const LUA_MIGRATE_DELAYED = <<<'LUA'
+local entries = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+if #entries == 0 then return 0 end
+for i, payload in ipairs(entries) do
+    redis.call('ZREM', KEYS[1], payload)
+    redis.call('XADD', KEYS[2], '*', 'payload', payload)
+end
+return #entries
+LUA;
+
     public private(set) bool $isRunning = false;
 
     public private(set) int $jobsProcessed = 0;
@@ -728,18 +749,18 @@ final class WorkerProcess
                 $streamKey = $buildStreamKey($queue);
                 $delayedKey = $streamKey . ':delayed';
 
-                /** @var array|null $entries */
-                $entries = $redis->execute('ZRANGEBYSCORE', $delayedKey, '-inf', $now, 'LIMIT', '0', '100');
+                /** @var int|null $migrated */
+                $migrated = $redis->execute(
+                    'EVAL',
+                    self::LUA_MIGRATE_DELAYED,
+                    '2',
+                    $delayedKey,
+                    $streamKey,
+                    $now,
+                );
 
-                if (!is_array($entries) || $entries === []) {
-                    continue;
-                }
-
-                fwrite(STDERR, "[torque:worker] Migrating " . count($entries) . " delayed jobs from {$queue}\n");
-
-                foreach ($entries as $payload) {
-                    $redis->execute('ZREM', $delayedKey, $payload);
-                    $redis->execute('XADD', $streamKey, '*', 'payload', $payload);
+                if (is_int($migrated) && $migrated > 0) {
+                    fwrite(STDERR, "[torque:worker] Migrated {$migrated} delayed jobs from {$queue}\n");
                 }
             }
         });

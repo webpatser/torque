@@ -29,7 +29,7 @@ it('registers the torque queue connector', function () {
     // instead, which proves the connector itself is wired up.
     try {
         $manager->connection('torque');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         // Expected — Redis isn't running in CI. The connector resolved.
         expect(true)->toBeTrue();
 
@@ -48,7 +48,7 @@ it('registers MetricsPublisher as a singleton', function () {
         $instanceB = app(MetricsPublisher::class);
 
         expect($instanceA)->toBe($instanceB);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         // If Redis connect happens eagerly, the binding still exists.
         expect(app()->bound(MetricsPublisher::class))->toBeTrue();
     }
@@ -60,7 +60,7 @@ it('registers DeadLetterHandler as a singleton', function () {
         $instanceB = app(DeadLetterHandler::class);
 
         expect($instanceA)->toBe($instanceB);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         expect(app()->bound(DeadLetterHandler::class))->toBeTrue();
     }
 });

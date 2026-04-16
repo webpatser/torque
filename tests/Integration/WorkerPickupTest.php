@@ -186,7 +186,7 @@ it('picks up an immediate job dispatched while the worker is running', function 
         $consumed = pollUntil(fn () => $this->streamQueue->size() === 0, timeoutSeconds: 10.0);
 
         expect($consumed)->toBeTrue('Worker did not pick up the immediate job within 10 seconds');
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -235,7 +235,7 @@ it('picks up a delayed job after migration', function () {
         }, timeoutSeconds: 15.0);
 
         expect($consumed)->toBeTrue('Worker did not pick up the delayed job within 15 seconds');
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

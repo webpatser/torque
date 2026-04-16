@@ -11,7 +11,7 @@ afterEach(function () {
     }
 });
 
-it('shows error when no PID file exists', function () {
+it('shows info when no PID file exists', function () {
     // Ensure no PID file exists.
     $pidFile = storage_path('torque.pid');
 
@@ -20,8 +20,8 @@ it('shows error when no PID file exists', function () {
     }
 
     $this->artisan('torque:stop')
-        ->assertFailed()
-        ->expectsOutputToContain('no PID file found');
+        ->assertSuccessful()
+        ->expectsOutputToContain('No running Torque processes found');
 });
 
 it('cleans up stale PID file when process is not running', function () {
@@ -38,35 +38,36 @@ it('cleans up stale PID file when process is not running', function () {
     expect(file_exists($pidFile))->toBeFalse();
 });
 
-it('shows error when PID file contains invalid PID', function () {
+it('cleans up PID file with invalid PID', function () {
     $pidFile = storage_path('torque.pid');
 
     file_put_contents($pidFile, '0');
 
     $this->artisan('torque:stop')
-        ->assertFailed()
-        ->expectsOutputToContain('invalid PID');
+        ->assertSuccessful();
 
     // PID file should be cleaned up.
     expect(file_exists($pidFile))->toBeFalse();
 });
 
-it('shows error when PID file contains negative PID', function () {
+it('cleans up PID file with negative PID', function () {
     $pidFile = storage_path('torque.pid');
 
     file_put_contents($pidFile, '-1');
 
     $this->artisan('torque:stop')
-        ->assertFailed()
-        ->expectsOutputToContain('invalid PID');
+        ->assertSuccessful();
+
+    expect(file_exists($pidFile))->toBeFalse();
 });
 
-it('shows error when PID file contains non-numeric content', function () {
+it('cleans up PID file with non-numeric content', function () {
     $pidFile = storage_path('torque.pid');
 
     file_put_contents($pidFile, 'not-a-pid');
 
     $this->artisan('torque:stop')
-        ->assertFailed()
-        ->expectsOutputToContain('invalid PID');
+        ->assertSuccessful();
+
+    expect(file_exists($pidFile))->toBeFalse();
 });

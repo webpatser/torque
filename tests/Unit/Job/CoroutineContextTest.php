@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 use Webpatser\Torque\Job\CoroutineContext;
 
-use function Amp\async;
-use function Amp\delay;
+use function Fledge\Async\async;
+use function Fledge\Async\delay;
 
 beforeEach(function () {
     CoroutineContext::init();

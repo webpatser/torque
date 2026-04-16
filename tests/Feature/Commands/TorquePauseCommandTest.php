@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use function Amp\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisClient;
 
 beforeEach(function () {
     // Point the torque config at the test Redis database so the command
@@ -17,7 +17,7 @@ beforeEach(function () {
     try {
         $redis = createRedisClient($this->testRedisUri);
         $redis->execute('DEL', $this->testPrefix . 'paused');
-    } catch (\Amp\Redis\RedisException) {
+    } catch (\Fledge\Async\Redis\RedisException) {
         // Will be caught per-test.
     }
 });
@@ -26,7 +26,7 @@ afterEach(function () {
     try {
         $redis = createRedisClient($this->testRedisUri);
         $redis->execute('DEL', $this->testPrefix . 'paused');
-    } catch (\Amp\Redis\RedisException) {
+    } catch (\Fledge\Async\Redis\RedisException) {
         // Ignore.
     }
 });
@@ -40,7 +40,7 @@ it('pauses by setting Redis key', function () {
         $exists = (int) $redis->execute('EXISTS', $this->testPrefix . 'paused');
 
         expect($exists)->toBe(1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -57,7 +57,7 @@ it('continues by removing Redis key', function () {
         $exists = (int) $redis->execute('EXISTS', $this->testPrefix . 'paused');
 
         expect($exists)->toBe(0);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -71,7 +71,7 @@ it('toggles the paused state on when currently running', function () {
         $exists = (int) $redis->execute('EXISTS', $this->testPrefix . 'paused');
 
         expect($exists)->toBe(1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -88,7 +88,7 @@ it('toggles the paused state off when currently paused', function () {
         $exists = (int) $redis->execute('EXISTS', $this->testPrefix . 'paused');
 
         expect($exists)->toBe(0);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -98,7 +98,7 @@ it('rejects invalid action', function () {
         $this->artisan('torque:pause', ['action' => 'invalid'])
             ->assertFailed()
             ->expectsOutputToContain('Invalid action');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -110,7 +110,7 @@ it('reports already paused when pause is called twice', function () {
         $this->artisan('torque:pause', ['action' => 'pause'])
             ->assertSuccessful()
             ->expectsOutputToContain('already paused');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -120,7 +120,7 @@ it('reports already running when continue is called while not paused', function 
         $this->artisan('torque:pause', ['action' => 'continue'])
             ->assertSuccessful()
             ->expectsOutputToContain('already running');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

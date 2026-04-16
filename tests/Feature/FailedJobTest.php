@@ -44,7 +44,7 @@ it('increments attempts on release', function () {
         expect($reEnqueued->attempts())->toBe(2); // 1 + 1
 
         $reEnqueued->delete();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -70,7 +70,7 @@ it('can acknowledge and delete a job', function () {
 
         $sizeAfter = $queue->size($testQueue);
         expect($sizeAfter)->toBeLessThan($sizeBefore);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

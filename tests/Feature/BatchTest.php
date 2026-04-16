@@ -33,7 +33,7 @@ it('dispatches multiple jobs for batch processing', function () {
         foreach ($ids as $id) {
             $queue->deleteAndAcknowledge('default', $id);
         }
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

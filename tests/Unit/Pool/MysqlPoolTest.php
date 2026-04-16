@@ -43,7 +43,7 @@ it('passes callback to the inner pool via use()', function () {
         $this->markTestSkipped('MySQL is not available or DSN is invalid');
     }
 
-    $result = $pool->use(fn ($inner) => $inner instanceof \Amp\Mysql\MysqlConnectionPool);
+    $result = $pool->use(fn ($inner) => $inner instanceof \Fledge\Async\Database\Mysql\MysqlConnectionPool);
 
     expect($result)->toBeTrue();
 
