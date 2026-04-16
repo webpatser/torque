@@ -53,7 +53,7 @@ it('emits custom events via the recorder', function () {
     $uuid = 'test-' . bin2hex(random_bytes(8));
     $key = 'torque-test:job:' . $uuid;
 
-    $redis = \Amp\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $redis->execute('DEL', $key);
 
     // Bind the recorder in the container.

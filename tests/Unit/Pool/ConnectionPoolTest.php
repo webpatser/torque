@@ -5,9 +5,9 @@ declare(strict_types=1);
 use Webpatser\Torque\Pool\ConnectionPool;
 use Webpatser\Torque\Pool\PooledConnection;
 
-use function Amp\async;
-use function Amp\delay;
-use function Amp\Future\await;
+use function Fledge\Async\async;
+use function Fledge\Async\delay;
+use function Fledge\Async\Future\await;
 
 it('creates connections lazily via factory', function () {
     $created = 0;

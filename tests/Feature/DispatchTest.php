@@ -56,7 +56,7 @@ it('pushes a job to Redis stream', function () {
 
         // Clean up: delete the message.
         $queue->deleteAndAcknowledge('default', $messageId);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -77,7 +77,7 @@ it('pushes a delayed job to sorted set', function () {
         // Check delayed size is initially 0.
         $delayedSize = $queue->delayedSize('default');
         expect($delayedSize)->toBeGreaterThanOrEqual(0);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

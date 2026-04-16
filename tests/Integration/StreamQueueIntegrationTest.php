@@ -38,7 +38,7 @@ beforeEach(function () use ($testPrefix) {
 
         // Verify Redis is reachable.
         $this->streamQueue->size();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -62,7 +62,7 @@ afterEach(function () use ($testPrefix) {
                 $redis->execute('DEL', (string) $key);
             }
         } while ($cursor !== '0');
-    } catch (\Amp\Redis\RedisException) {
+    } catch (\Fledge\Async\Redis\RedisException) {
         // Cleanup best-effort; don't fail the test on cleanup issues.
     }
 });
@@ -78,7 +78,7 @@ it('tracks size correctly after pushing multiple messages', function () {
         (void) $this->streamQueue->pushRaw(json_encode(['uuid' => 'msg-3', 'attempts' => 0]));
 
         expect($this->streamQueue->size())->toBe(3);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -98,7 +98,7 @@ it('creates a consumer group idempotently', function () {
         $this->streamQueue->ensureConsumerGroup($streamKey, 'idempotent-group');
 
         expect(true)->toBeTrue();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -128,7 +128,7 @@ it('pops a job with correct payload and messageId', function () {
         expect($job->attempts())->toBe(1);
 
         $job->delete();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -142,7 +142,7 @@ it('returns null when popping from an empty queue', function () {
         $job = $this->streamQueue->pop();
 
         expect($job)->toBeNull();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -163,7 +163,7 @@ it('decreases stream size after deleteAndAcknowledge', function () {
         $this->streamQueue->deleteAndAcknowledge('default', $messageId);
 
         expect($this->streamQueue->size())->toBe(0);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -197,7 +197,7 @@ it('re-enqueues a released job with incremented attempts', function () {
         expect($reEnqueued->attempts())->toBe(2);
 
         $reEnqueued->delete();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -228,7 +228,7 @@ it('moves a released job to the delayed set when delay is specified', function (
         $delayedAfter = $this->streamQueue->delayedSize();
 
         expect($delayedAfter)->toBe($delayedBefore + 1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -261,7 +261,7 @@ it('pushes a delayed job and increases delayedSize', function () {
         $delayedAfter = $this->streamQueue->delayedSize();
 
         expect($delayedAfter)->toBe($delayedBefore + 1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -286,7 +286,7 @@ it('reports pending messages that are read but not acknowledged', function () {
 
         $pending = $this->streamQueue->pendingSize();
         expect($pending)->toBe(1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -315,7 +315,7 @@ it('returns the same value for reservedSize and pendingSize', function () {
 
         expect($reserved)->toBe($pending);
         expect($reserved)->toBe(2);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -342,7 +342,7 @@ it('returns the creation timestamp of the oldest pending job', function () {
         expect($timestamp)->not->toBeNull();
         expect($timestamp)->toBeGreaterThanOrEqual($before - 1);
         expect($timestamp)->toBeLessThanOrEqual(microtime(true) + 1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -362,7 +362,7 @@ it('returns null for oldest pending job when no messages are pending', function 
         $timestamp = $this->streamQueue->creationTimeOfOldestPendingJob();
 
         expect($timestamp)->toBeNull();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -381,7 +381,7 @@ it('maintains independent sizes across different queue names', function () {
         expect($this->streamQueue->size('queue-alpha'))->toBe(2);
         expect($this->streamQueue->size('queue-beta'))->toBe(1);
         expect($this->streamQueue->size('queue-gamma'))->toBe(0);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -428,7 +428,7 @@ it('pushes and pops with cluster-safe keys', function () {
         expect($job)->not->toBeNull();
         expect($job->getRawBody())->toBe($payload);
         $job->delete();
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -460,7 +460,7 @@ it('stores delayed jobs with cluster-safe keys', function () {
         expect($clusterQueue->delayedSize())->toBe(1);
 
         $redis->execute('DEL', $delayedKey);
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -486,7 +486,7 @@ it('returns null immediately with non-blocking XREADGROUP on empty stream', func
 
         expect($result)->toBeNull();
         expect($elapsed)->toBeLessThan(0.5);
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -524,7 +524,7 @@ it('returns message with non-blocking XREADGROUP when message exists', function 
             }
         }
         expect($payload)->toBe('{"uuid":"nb-1"}');
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -571,7 +571,7 @@ it('migrates matured delayed jobs from sorted set to stream', function () {
         expect($job)->not->toBeNull();
         expect($job->getRawBody())->toBe($payload);
         $job->delete();
-    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -627,7 +627,7 @@ it('allows different consumer groups to independently read the same stream', fun
         // The stream message is now deleted, but second group still has a pending entry.
         // After XDEL the pending entry remains in the PEL until acknowledged.
         expect($secondQueue->pendingSize())->toBe(1);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

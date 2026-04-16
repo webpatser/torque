@@ -103,9 +103,10 @@ it('creates a snapshot', function () {
     expect($snapshot)->toBeInstanceOf(WorkerSnapshot::class);
     expect($snapshot->jobsProcessed)->toBe(1);
     expect($snapshot->jobsFailed)->toBe(1);
-    expect($snapshot->activeSlots)->toBe(1);
+    // activeSlots in snapshot reports max(current, peak). Peak was 2 (two concurrent starts).
+    expect($snapshot->activeSlots)->toBe(2);
     expect($snapshot->totalSlots)->toBe(20);
-    expect($snapshot->slotUsageRatio)->toBe(0.05);
+    expect($snapshot->slotUsageRatio)->toBe(0.1);
     expect($snapshot->averageLatencyMs)->toBe(75.0);
     expect($snapshot->memoryBytes)->toBeGreaterThan(0);
     expect($snapshot->timestamp)->toBeGreaterThan(0);

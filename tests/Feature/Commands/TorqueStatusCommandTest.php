@@ -14,7 +14,7 @@ it('runs without error even with no metrics in Redis', function () {
     try {
         $this->artisan('torque:status')
             ->assertSuccessful();
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -30,7 +30,7 @@ it('shows master status as stopped when no PID file exists', function () {
         $this->artisan('torque:status')
             ->assertSuccessful()
             ->expectsOutputToContain('STOPPED');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

@@ -16,6 +16,10 @@ it('returns a StreamQueue instance', function () {
 });
 
 it('passes config values through to the queue', function () {
+    // Temporarily clear torque config so connect() params take precedence.
+    config()->set('torque.redis.prefix', null);
+    config()->set('torque.consumer_group', null);
+
     $connector = new StreamConnector();
 
     $queue = $connector->connect([
@@ -33,7 +37,25 @@ it('passes config values through to the queue', function () {
     expect($queue->getConsumerGroup())->toBe('workers');
 });
 
+it('uses torque config as source of truth for prefix and consumer group', function () {
+    config()->set('torque.redis.prefix', 'torque-test:');
+    config()->set('torque.consumer_group', 'torque-test');
+
+    $connector = new StreamConnector();
+
+    $queue = $connector->connect([
+        'prefix' => 'ignored:',
+        'consumer_group' => 'ignored',
+    ]);
+
+    expect($queue->getStreamKey())->toBe('torque-test:default');
+    expect($queue->getConsumerGroup())->toBe('torque-test');
+});
+
 it('uses defaults for missing config keys', function () {
+    config()->set('torque.redis.prefix', null);
+    config()->set('torque.consumer_group', null);
+
     $connector = new StreamConnector();
 
     $queue = $connector->connect([]);

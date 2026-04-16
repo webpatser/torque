@@ -6,9 +6,10 @@ use Webpatser\Torque\Job\DeadLetterHandler;
 
 it('stores failed jobs in dead letter stream', function () {
     try {
+        $uniquePrefix = 'torque-test-dl-store-' . bin2hex(random_bytes(4)) . ':';
         $handler = new DeadLetterHandler(
             redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
-            deadLetterStream: 'torque-test:dead-letter',
+            prefix: $uniquePrefix,
         );
 
         $handler->handle(
@@ -28,7 +29,7 @@ it('stores failed jobs in dead letter stream', function () {
 
         // Clean up.
         $handler->purge($last['id']);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -36,9 +37,10 @@ it('stores failed jobs in dead letter stream', function () {
 it('retries a dead-lettered job', function () {
     try {
         $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+        $uniquePrefix = 'torque-test-dl-retry-' . bin2hex(random_bytes(4)) . ':';
         $handler = new DeadLetterHandler(
             redisUri: $redisUri,
-            deadLetterStream: 'torque-test:dead-letter',
+            prefix: $uniquePrefix,
         );
 
         $handler->handle(
@@ -59,18 +61,19 @@ it('retries a dead-lettered job', function () {
         expect($ids)->not->toContain($last['id']);
 
         // Clean up the retried job from the target stream.
-        $redis = \Amp\Redis\createRedisClient($redisUri);
+        $redis = \Fledge\Async\Redis\createRedisClient($redisUri);
         $redis->execute('DEL', 'torque-test:retry-queue');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
 
 it('purges a dead-lettered entry', function () {
     try {
+        $uniquePrefix = 'torque-test-dl-purge-' . bin2hex(random_bytes(4)) . ':';
         $handler = new DeadLetterHandler(
             redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
-            deadLetterStream: 'torque-test:dead-letter',
+            prefix: $uniquePrefix,
         );
 
         $handler->handle(
@@ -88,21 +91,22 @@ it('purges a dead-lettered entry', function () {
         $remaining = $handler->list(count: 100);
         $ids = array_column($remaining, 'id');
         expect($ids)->not->toContain($last['id']);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
 
 it('returns empty list when stream is empty', function () {
     try {
+        $uniquePrefix = 'torque-test-empty-' . bin2hex(random_bytes(4)) . ':';
         $handler = new DeadLetterHandler(
             redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
-            deadLetterStream: 'torque-test:dead-letter-empty-' . bin2hex(random_bytes(4)),
+            prefix: $uniquePrefix,
         );
 
         $entries = $handler->list();
         expect($entries)->toBe([]);
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -110,13 +114,13 @@ it('returns empty list when stream is empty', function () {
 it('trim removes old entries based on TTL', function () {
     try {
         $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
-        $stream = 'torque-test:dead-letter-trim-' . bin2hex(random_bytes(4));
+        $uniquePrefix = 'torque-test-trim-' . bin2hex(random_bytes(4)) . ':';
 
         // Use a TTL of 1 second so entries become "old" quickly.
         $handler = new DeadLetterHandler(
             redisUri: $redisUri,
-            deadLetterStream: $stream,
             ttl: 1,
+            prefix: $uniquePrefix,
         );
 
         $handler->handle(
@@ -138,9 +142,9 @@ it('trim removes old entries based on TTL', function () {
         expect($remaining)->toBe([]);
 
         // Clean up.
-        $redis = \Amp\Redis\createRedisClient($redisUri);
-        $redis->execute('DEL', $stream);
-    } catch (\Amp\Redis\RedisException $e) {
+        $redis = \Fledge\Async\Redis\createRedisClient($redisUri);
+        $redis->execute('DEL', $uniquePrefix . 'dead-letter');
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -148,11 +152,11 @@ it('trim removes old entries based on TTL', function () {
 it('retry rejects invalid queue names', function () {
     try {
         $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
-        $stream = 'torque-test:dead-letter-invalid-q-' . bin2hex(random_bytes(4));
+        $uniquePrefix = 'torque-test-dl-invalid-' . bin2hex(random_bytes(4)) . ':';
 
         $handler = new DeadLetterHandler(
             redisUri: $redisUri,
-            deadLetterStream: $stream,
+            prefix: $uniquePrefix,
         );
 
         $handler->handle(
@@ -172,7 +176,7 @@ it('retry rejects invalid queue names', function () {
         expect(false)->toBeTrue();
     } catch (RuntimeException $e) {
         expect($e->getMessage())->toContain('Invalid queue name');
-    } catch (\Amp\Redis\RedisException $e) {
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
@@ -180,11 +184,11 @@ it('retry rejects invalid queue names', function () {
 it('handle truncates exception messages to 1000 chars', function () {
     try {
         $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
-        $stream = 'torque-test:dead-letter-truncate-' . bin2hex(random_bytes(4));
+        $uniquePrefix = 'torque-test-trunc-' . bin2hex(random_bytes(4)) . ':';
 
         $handler = new DeadLetterHandler(
             redisUri: $redisUri,
-            deadLetterStream: $stream,
+            prefix: $uniquePrefix,
         );
 
         $longMessage = str_repeat('X', 2000);
@@ -203,9 +207,9 @@ it('handle truncates exception messages to 1000 chars', function () {
 
         // Clean up.
         $handler->purge($last['id']);
-        $redis = \Amp\Redis\createRedisClient($redisUri);
-        $redis->execute('DEL', $stream);
-    } catch (\Amp\Redis\RedisException $e) {
+        $redis = \Fledge\Async\Redis\createRedisClient($redisUri);
+        $redis->execute('DEL', $uniquePrefix . 'dead-letter');
+    } catch (\Fledge\Async\Redis\RedisException $e) {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });

@@ -25,11 +25,11 @@ it('limits concurrency via the semaphore', function () {
     // the same way ConnectionPoolTest does.
 
     $order = [];
-    $suspension1 = new \Amp\DeferredFuture();
-    $suspension2 = new \Amp\DeferredFuture();
+    $suspension1 = new \Fledge\Async\DeferredFuture();
+    $suspension2 = new \Fledge\Async\DeferredFuture();
 
     // Occupy both slots.
-    $future1 = \Amp\async(function () use ($pool, &$order, $suspension1) {
+    $future1 = \Fledge\Async\async(function () use ($pool, &$order, $suspension1) {
         $pool->use(function () use (&$order, $suspension1) {
             $order[] = 'slot-1-acquired';
             $suspension1->getFuture()->await();
@@ -37,7 +37,7 @@ it('limits concurrency via the semaphore', function () {
         });
     });
 
-    $future2 = \Amp\async(function () use ($pool, &$order, $suspension2) {
+    $future2 = \Fledge\Async\async(function () use ($pool, &$order, $suspension2) {
         $pool->use(function () use (&$order, $suspension2) {
             $order[] = 'slot-2-acquired';
             $suspension2->getFuture()->await();
@@ -46,11 +46,11 @@ it('limits concurrency via the semaphore', function () {
     });
 
     // Let both fibers acquire their slots.
-    \Amp\delay(0.01);
+    \Fledge\Async\delay(0.01);
 
     // Third request should be blocked because both slots are taken.
     $thirdAcquired = false;
-    $future3 = \Amp\async(function () use ($pool, &$order, &$thirdAcquired) {
+    $future3 = \Fledge\Async\async(function () use ($pool, &$order, &$thirdAcquired) {
         $pool->use(function () use (&$order, &$thirdAcquired) {
             $thirdAcquired = true;
             $order[] = 'slot-3-acquired';
@@ -58,19 +58,19 @@ it('limits concurrency via the semaphore', function () {
     });
 
     // Give the event loop a tick — third should still be waiting.
-    \Amp\delay(0.01);
+    \Fledge\Async\delay(0.01);
     expect($thirdAcquired)->toBeFalse();
 
     // Free one slot.
     $suspension1->complete(null);
-    \Amp\delay(0.01);
+    \Fledge\Async\delay(0.01);
 
     // Now the third request should have acquired a slot.
     expect($thirdAcquired)->toBeTrue();
 
     // Clean up remaining fibers.
     $suspension2->complete(null);
-    \Amp\Future\await([$future1, $future2, $future3]);
+    \Fledge\Async\Future\await([$future1, $future2, $future3]);
 
     expect($order)->toBe([
         'slot-1-acquired',
