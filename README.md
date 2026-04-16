@@ -80,7 +80,7 @@ Bus::batch([
 
 ### Async jobs with TorqueJob
 
-Regular Laravel jobs work fine — they run synchronously within their coroutine slot. For full async I/O, extend `TorqueJob` and type-hint the pools you need:
+Regular Laravel jobs work fine; they run synchronously within their coroutine slot. For full async I/O, extend `TorqueJob` and type-hint the pools you need:
 
 ```php
 use Webpatser\Torque\Job\TorqueJob;
@@ -119,16 +119,16 @@ State is automatically cleaned up when the Fiber completes (backed by `WeakMap`)
 
 ## Job Event Streams
 
-Every job automatically records lifecycle events to a per-job Redis Stream — no code changes needed.
+Every job automatically records lifecycle events to a per-job Redis Stream. No code changes needed.
 
 ```bash
 $ php artisan torque:tail --job=088066c1-b045-4fb6-bc32-ca15cfdf7d08
 
-📦 11:08:34 queued App\Jobs\ScrapeKvK → scrpr
-▶ 11:10:28 started worker=web-01-4879 attempt=1
-⚠ 11:10:52 exception attempt=1 No alive nodes. All the 1 nodes seem to be down.
-▶ 11:11:34 started worker=web-01-4882 attempt=2
-✓ 11:11:34 completed memory=58.5MB
+queued 11:08:34  App\Jobs\ScrapeKvK -> scrpr
+started 11:10:28  worker=web-01-4879 attempt=1
+exception 11:10:52  attempt=1 No alive nodes. All the 1 nodes seem to be down.
+started 11:11:34  worker=web-01-4882 attempt=2
+completed 11:11:34  memory=58.5MB
 ```
 
 ### Custom progress events
@@ -173,6 +173,18 @@ $stream->isFinished($uuid); // true after completed/failed
 
 Streams auto-expire after 5 minutes (configurable via `job_streams.ttl`).
 
+## Redis Cluster Support
+
+Torque supports Redis Cluster out of the box. Enable it in your `.env`:
+
+```
+TORQUE_CLUSTER=true
+```
+
+When cluster mode is enabled, all Redis keys for a given queue are wrapped in hash tags (`{queue-name}`) so they land on the same cluster slot. This ensures Lua scripts and multi-key operations work correctly across the stream, delayed set, and notification keys.
+
+If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will not double-wrap them.
+
 ## CLI Commands
 
 | Command | Description |
@@ -196,7 +208,8 @@ All options are in `config/torque.php`. Key settings:
 | `coroutines_per_worker` | 50 | Concurrent job slots per worker |
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
-| `block_for` | 2000 | XREADGROUP block timeout (ms) |
+| `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
+| `redis.cluster` | false | Enable Redis Cluster hash tag support |
 
 ### Autoscaling
 
@@ -273,33 +286,34 @@ Event::listen(JobPermanentlyFailed::class, function ($event) {
 
 ```
 Master Process (torque:start)
-├── Worker 1 (Revolt event loop)
-│   ├── 50 Fibers (concurrent jobs)
-│   ├── Redis Pool
-│   ├── MySQL Pool
-│   └── HTTP Pool
-├── Worker 2
-│   └── ...
-├── Worker N
-│   └── ...
-└── AutoScaler (optional)
++-- Worker 1 (Revolt event loop)
+|   +-- 50 Fibers (non-blocking poll + yield)
+|   +-- Redis Pool
+|   +-- MySQL Pool
+|   +-- HTTP Pool
++-- Worker 2
+|   +-- ...
++-- Worker N
+|   +-- ...
++-- AutoScaler (optional)
 
 Redis Streams
-├── torque:default (XREADGROUP consumer groups)
-├── torque:default:delayed (sorted set)
-├── torque:stream:dead-letter
-├── torque:worker:* (per-worker stats with heartbeat TTL)
-└── torque:job:* (per-job event streams, auto-expiring)
++-- torque:{default} (XREADGROUP consumer groups)
++-- torque:{default}:delayed (sorted set, cluster-safe)
++-- torque:stream:dead-letter
++-- torque:worker:* (per-worker stats with heartbeat TTL)
++-- torque:job:* (per-job event streams, auto-expiring)
 ```
 
 ### How it works
 
 1. **Master** spawns N worker processes via `pcntl_exec()` (`php artisan torque:worker`)
 2. Each **worker** runs a Revolt event loop with M Fiber slots
-3. Each Fiber loops: `XREADGROUP COUNT 1 BLOCK` → process → repeat. When the job does async I/O, the Fiber suspends and another job runs
-4. **Work-stealing**: idle Fibers claim stale messages from dead consumers via `XAUTOCLAIM` (per-queue `retry_after` as idle threshold)
-5. On completion: `XACK` + `XDEL`. On failure: retry with exponential backoff or dead-letter
-6. Each Fiber has its own dedicated Redis connection for blocking reads
+3. Each Fiber polls for messages with non-blocking `XREADGROUP` (no BLOCK). When no work is available, the Fiber yields to the event loop with a configurable delay (`block_for` / 1000 seconds). This ensures timers (delayed job migration, metrics, pause checks) always fire reliably
+4. Fiber startup is staggered across the poll interval so polling is evenly distributed
+5. **Work-stealing**: idle Fibers claim stale messages from dead consumers via `XAUTOCLAIM` (per-queue `retry_after` as idle threshold)
+6. On completion: `XACK` + `XDEL`. On failure: retry with exponential backoff or dead-letter
+7. A shared pause flag (updated by a timer) replaces per-Fiber Redis checks, reducing overhead from 50 `EXISTS` calls per cycle to 1
 
 ### Queue backend: Redis Streams
 
@@ -307,8 +321,9 @@ Redis Streams (not LISTs like Horizon) provide:
 
 - **Consumer groups**: multiple workers, no duplicate processing
 - **Acknowledgment**: `XACK` after success, unacked jobs auto-reclaimed via `XAUTOCLAIM`
-- **Backpressure**: `XREADGROUP COUNT {slots} BLOCK {ms}` pulls exactly as many jobs as available slots
+- **Non-blocking reads**: `XREADGROUP` without BLOCK returns immediately, letting Fibers yield cleanly
 - **Pending Entries List**: Redis tracks assigned-but-unacked jobs natively
+- **Cluster support**: hash-tagged keys keep related data on the same slot
 
 ### Compatibility
 
@@ -316,12 +331,13 @@ Redis Streams (not LISTs like Horizon) provide:
 |---------|---------|--------|
 | Queue backend | Redis LIST | Redis Streams |
 | Concurrency | 1 job/process | N jobs/process (Fibers) |
-| I/O model | Blocking (PDO, curl) | Non-blocking (AMPHP) |
+| I/O model | Blocking (PDO, curl) | Non-blocking (fledge-fiber) |
 | PHP extensions | None | None |
 | Eloquent in jobs | Full support | Sync fallback (blocking) |
 | Laravel Queue contract | Full | Full |
 | Job batches | Yes | Yes |
 | Delayed jobs | Redis sorted set | Redis sorted set |
+| Redis Cluster | Yes | Yes |
 | Dashboard | Blade + polling | Livewire 4 + Flux UI |
 | Autoscaling | Balancing strategies | Slot-pressure based |
 
@@ -345,14 +361,12 @@ sudo supervisorctl start torque
 ## Dependencies
 
 **Required** (installed automatically):
-- `revolt/event-loop` — Fiber scheduler
-- `amphp/amp` — async/await primitives
-- `amphp/redis` — Non-blocking Redis client
-- `amphp/sync` — LocalSemaphore for pool management
+- `revolt/event-loop` -- Fiber scheduler
+- `webpatser/fledge-fiber` -- async/await primitives, non-blocking Redis, sync primitives
 
 **Optional** (install when needed):
-- `amphp/mysql` — Async MySQL for `MysqlPool`
-- `amphp/http-client` — Async HTTP for `HttpPool`
+- `webpatser/fledge-fiber-database` -- Async MySQL for `MysqlPool`
+- `webpatser/fledge-fiber-http` -- Async HTTP for `HttpPool`
 
 ## License
 

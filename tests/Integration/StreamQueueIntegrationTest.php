@@ -390,6 +390,196 @@ it('maintains independent sizes across different queue names', function () {
 //  14. consumer group isolation
 // -------------------------------------------------------------------------
 
+// -------------------------------------------------------------------------
+//  15. Cluster-safe push and pop
+// -------------------------------------------------------------------------
+
+it('pushes and pops with cluster-safe keys', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+
+        $clusterQueue = new StreamQueue(
+            redisUri: $redisUri,
+            default: 'default',
+            retryAfter: 90,
+            blockFor: 100,
+            prefix: $this->testPrefix,
+            consumerGroup: 'test-cluster-group',
+            cluster: true,
+        );
+        $clusterQueue->setContainer(app());
+        $clusterQueue->setConnectionName('torque');
+
+        $payload = json_encode([
+            'uuid' => 'cluster-test-1',
+            'displayName' => 'TestJob',
+            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+            'data' => [],
+            'attempts' => 0,
+        ]);
+
+        $messageId = $clusterQueue->pushRaw($payload);
+        expect($messageId)->toBeString()->not->toBeEmpty();
+
+        // Stream key should contain hash tag.
+        expect($clusterQueue->getStreamKey())->toContain('{default}');
+
+        $job = $clusterQueue->pop();
+        expect($job)->not->toBeNull();
+        expect($job->getRawBody())->toBe($payload);
+        $job->delete();
+    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+// -------------------------------------------------------------------------
+//  16. Cluster-safe delayed keys
+// -------------------------------------------------------------------------
+
+it('stores delayed jobs with cluster-safe keys', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+
+        $clusterQueue = new StreamQueue(
+            redisUri: $redisUri,
+            default: 'default',
+            retryAfter: 90,
+            blockFor: 100,
+            prefix: $this->testPrefix,
+            consumerGroup: 'test-cluster-delayed',
+            cluster: true,
+        );
+
+        $delayedKey = $clusterQueue->getStreamKey() . ':delayed';
+        expect($delayedKey)->toContain('{default}:delayed');
+
+        $redis = $clusterQueue->getRedisClient();
+        $redis->execute('ZADD', $delayedKey, (string) (time() + 3600), '{"uuid":"cluster-delayed-1"}');
+
+        expect($clusterQueue->delayedSize())->toBe(1);
+
+        $redis->execute('DEL', $delayedKey);
+    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+// -------------------------------------------------------------------------
+//  17. Non-blocking XREADGROUP returns null on empty stream
+// -------------------------------------------------------------------------
+
+it('returns null immediately with non-blocking XREADGROUP on empty stream', function () {
+    try {
+        $streamKey = $this->streamQueue->getStreamKey('nonblock-test');
+        $this->streamQueue->ensureConsumerGroup($streamKey, 'test-group');
+
+        $redis = $this->streamQueue->getRedisClient();
+        $start = microtime(true);
+
+        $result = $redis->execute(
+            'XREADGROUP', 'GROUP', 'test-group', 'test-consumer',
+            'COUNT', '1', 'STREAMS', $streamKey, '>',
+        );
+
+        $elapsed = microtime(true) - $start;
+
+        expect($result)->toBeNull();
+        expect($elapsed)->toBeLessThan(0.5);
+    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+// -------------------------------------------------------------------------
+//  18. Non-blocking XREADGROUP returns message when available
+// -------------------------------------------------------------------------
+
+it('returns message with non-blocking XREADGROUP when message exists', function () {
+    try {
+        $streamKey = $this->streamQueue->getStreamKey('nonblock-msg');
+        $redis = $this->streamQueue->getRedisClient();
+
+        $this->streamQueue->ensureConsumerGroup($streamKey, 'test-group');
+
+        $redis->execute('XADD', $streamKey, '*', 'payload', '{"uuid":"nb-1"}');
+
+        $result = $redis->execute(
+            'XREADGROUP', 'GROUP', 'test-group', 'test-consumer',
+            'COUNT', '1', 'STREAMS', $streamKey, '>',
+        );
+
+        expect($result)->not->toBeNull();
+        expect($result)->toBeArray();
+
+        $streamData = $result[0];
+        $messages = $streamData[1];
+        expect($messages)->toHaveCount(1);
+
+        $fields = $messages[0][1];
+        $payload = null;
+        for ($i = 0, $c = count($fields); $i < $c; $i += 2) {
+            if ((string) $fields[$i] === 'payload') {
+                $payload = (string) $fields[$i + 1];
+            }
+        }
+        expect($payload)->toBe('{"uuid":"nb-1"}');
+    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+// -------------------------------------------------------------------------
+//  19. Delayed job migration from sorted set to stream
+// -------------------------------------------------------------------------
+
+it('migrates matured delayed jobs from sorted set to stream', function () {
+    try {
+        $streamKey = $this->streamQueue->getStreamKey();
+        $delayedKey = $streamKey . ':delayed';
+        $redis = $this->streamQueue->getRedisClient();
+
+        $payload = json_encode([
+            'uuid' => 'migrate-test-1',
+            'displayName' => 'TestJob',
+            'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
+            'data' => [],
+            'attempts' => 0,
+        ]);
+
+        // Add a matured delayed job (score in the past).
+        $redis->execute('ZADD', $delayedKey, (string) (time() - 10), $payload);
+        expect($this->streamQueue->delayedSize())->toBe(1);
+
+        // Simulate migration: ZRANGEBYSCORE + ZREM + XADD.
+        $now = (string) time();
+        $entries = $redis->execute('ZRANGEBYSCORE', $delayedKey, '-inf', $now, 'LIMIT', '0', '100');
+
+        expect($entries)->toBeArray()->toHaveCount(1);
+
+        foreach ($entries as $entry) {
+            $redis->execute('ZREM', $delayedKey, $entry);
+            $redis->execute('XADD', $streamKey, '*', 'payload', $entry);
+        }
+
+        // Delayed set should be empty, stream should have the job.
+        expect($this->streamQueue->delayedSize())->toBe(0);
+        expect($this->streamQueue->size())->toBe(1);
+
+        // Pop and verify the migrated payload.
+        $job = $this->streamQueue->pop();
+        expect($job)->not->toBeNull();
+        expect($job->getRawBody())->toBe($payload);
+        $job->delete();
+    } catch (\Fledge\Async\Redis\RedisException|\Amp\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
+// -------------------------------------------------------------------------
+//  20. Consumer group isolation
+// -------------------------------------------------------------------------
+
 it('allows different consumer groups to independently read the same stream', function () {
     try {
         $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');

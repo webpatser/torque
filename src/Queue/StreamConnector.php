@@ -33,6 +33,7 @@ final class StreamConnector implements ConnectorInterface
             blockFor: (int) ($config['block_for'] ?? 2000),
             prefix: $torqueConfig['redis']['prefix'] ?? $config['prefix'] ?? 'torque:',
             consumerGroup: $torqueConfig['consumer_group'] ?? $config['consumer_group'] ?? 'torque',
+            cluster: (bool) ($torqueConfig['redis']['cluster'] ?? false),
         );
     }
 }

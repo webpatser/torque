@@ -43,6 +43,7 @@ return [
     'redis' => [
         'uri' => env('TORQUE_REDIS_URI', 'redis://127.0.0.1:6379'),
         'prefix' => env('TORQUE_PREFIX', 'torque:' . \Illuminate\Support\Str::slug(env('APP_NAME', 'laravel'), '_') . ':'),
+        'cluster' => (bool) env('TORQUE_CLUSTER', false),
     ],
 
     /*

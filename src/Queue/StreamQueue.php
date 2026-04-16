@@ -32,6 +32,7 @@ class StreamQueue extends Queue implements QueueContract
         private readonly int $blockFor = 2000,
         private readonly string $prefix = 'torque:',
         private readonly string $consumerGroup = 'torque',
+        private readonly bool $cluster = false,
     ) {
         $this->redis = createRedisClient($this->redisUri);
         $this->consumerId = gethostname() . '-' . getmypid();
@@ -386,10 +387,19 @@ class StreamQueue extends Queue implements QueueContract
 
     /**
      * Build the full Redis stream key for a given queue.
+     *
+     * When cluster mode is enabled, wraps the queue name in a Redis hash tag
+     * so all related keys (stream, :delayed, :notify) land on the same slot.
      */
     public function getStreamKey(?string $queue = null): string
     {
-        return $this->prefix . $this->getQueue($queue);
+        $queue = $this->getQueue($queue);
+
+        if ($this->cluster && !str_contains($queue, '{')) {
+            $queue = '{' . $queue . '}';
+        }
+
+        return $this->prefix . $queue;
     }
 
     /**

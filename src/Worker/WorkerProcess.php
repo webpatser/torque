@@ -79,7 +79,7 @@ final class WorkerProcess
         $prefix = $this->config['redis']['prefix'] ?? 'torque:';
         $consumerGroup = $this->config['consumer_group'] ?? 'torque';
         $concurrency = (int) ($this->config['coroutines_per_worker'] ?? 50);
-        $blockFor = (int) ($this->config['block_for'] ?? 2000);
+        $pollInterval = ((int) ($this->config['block_for'] ?? 2000)) / 1000.0;
         $maxJobs = (int) ($this->config['max_jobs_per_worker'] ?? 10_000);
         $maxLifetime = (int) ($this->config['max_worker_lifetime'] ?? 3600);
         $poolSize = (int) ($this->config['pools']['redis']['size'] ?? 30);
@@ -98,13 +98,16 @@ final class WorkerProcess
         $metrics = new MetricsCollector(totalSlots: $concurrency);
         $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix);
 
+        $cluster = (bool) ($this->config['redis']['cluster'] ?? false);
+
         $streamQueue = new StreamQueue(
             redisUri: $redisUri,
             default: $queues[0] ?? 'default',
             retryAfter: (int) ($streams[$queues[0]]['retry_after'] ?? 90),
-            blockFor: $blockFor,
+            blockFor: 0,
             prefix: $prefix,
             consumerGroup: $consumerGroup,
+            cluster: $cluster,
         );
 
         $events = app(Dispatcher::class);
@@ -116,10 +119,17 @@ final class WorkerProcess
             prefix: $prefix,
         );
 
+        // Build cluster-safe stream key (matches StreamQueue::getStreamKey).
+        $buildStreamKey = static function (string $queue) use ($prefix, $cluster): string {
+            if ($cluster && !str_contains($queue, '{')) {
+                $queue = '{' . $queue . '}';
+            }
+            return $prefix . $queue;
+        };
+
         // Ensure consumer groups exist for all configured queues.
         foreach ($queues as $queue) {
-            $streamKey = $prefix . $queue;
-            $streamQueue->ensureConsumerGroup($streamKey, $consumerGroup);
+            $streamQueue->ensureConsumerGroup($buildStreamKey($queue), $consumerGroup);
         }
 
         // Set error handler so uncaught Fiber exceptions are logged instead of exit(255).
@@ -143,23 +153,35 @@ final class WorkerProcess
         $this->startTime = time();
         $startTime = $this->startTime;
 
+        // Shared pause flag updated by a timer instead of per-Fiber EXISTS calls.
+        $pauseState = new \stdClass();
+        $pauseState->paused = false;
+
+        EventLoop::repeat(2.0, function (string $id) use ($redisPool, $prefix, $pauseState) {
+            if ($this->hasReachedLimits()) {
+                EventLoop::cancel($id);
+                return;
+            }
+            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState) {
+                $pauseState->paused = (bool) $redis->execute('EXISTS', $prefix . 'paused');
+            });
+        });
+
         // Spawn N reader Fibers (one per concurrency slot).
-        // Each Fiber loops: read → process → repeat. When XREADGROUP BLOCK waits,
-        // the Fiber suspends and others can run. The number of Fibers IS the
-        // concurrency limit — no semaphore needed.
-        //
-        // Each Fiber first drains pending messages (crash recovery via '0-0'),
-        // then switches to reading new messages via '>'. This spreads pending
-        // recovery across all Fibers instead of bottlenecking on one.
+        // Each Fiber loops: poll (non-blocking) -> process -> yield -> repeat.
+        // Non-blocking XREADGROUP avoids reliance on the async client's BLOCK
+        // notification chain, which stalls with many simultaneous connections.
         fwrite(STDERR, "[torque:worker] Starting {$concurrency} reader Fibers\n");
 
         for ($i = 0; $i < $concurrency; $i++) {
+            $fiberIndex = $i;
             (void) async(function () use (
+                $fiberIndex,
                 $redisUri,
                 $queues,
                 $prefix,
                 $consumerGroup,
-                $blockFor,
+                $pollInterval,
                 $maxJobs,
                 $maxLifetime,
                 $startTime,
@@ -169,47 +191,50 @@ final class WorkerProcess
                 $streams,
                 $metrics,
                 $deadLetterHandler,
+                $pauseState,
+                $concurrency,
+                $buildStreamKey,
             ) {
+                // Stagger Fiber startup to spread polling across time.
+                \Fledge\Async\delay($fiberIndex * ($pollInterval / $concurrency));
+
                 $fiberRedis = createRedisClient($redisUri);
-                $pendingDrained = false;
+                $loopCount = 0;
 
                 while (true) {
                     if ($this->stopRequested || $this->jobsProcessed >= $maxJobs || (time() - $startTime) >= $maxLifetime) {
                         return;
                     }
 
-                    // Check if paused.
-                    try {
-                        $isPaused = $fiberRedis->execute('EXISTS', $prefix . 'paused');
-                        if ($isPaused) {
-                            \Fledge\Async\delay(1.0);
-                            continue;
-                        }
-                    } catch (\Throwable) {
+                    if ($pauseState->paused) {
                         \Fledge\Async\delay(1.0);
                         continue;
                     }
 
                     $events->dispatch(new Looping($connectionName, $queues[0] ?? 'default'));
 
-                    // Priority: new messages first (instant), then recovery, then steal.
-                    $message = $this->readNextMessage($fiberRedis, $queues, $prefix, $consumerGroup, $blockFor);
+                    // Non-blocking poll for new messages.
+                    $message = $this->readNextMessage($fiberRedis, $queues, $prefix, $consumerGroup, $buildStreamKey);
 
-                    // No new messages — check own PEL (crash recovery).
-                    if ($message === null && ! $pendingDrained) {
-                        $message = $this->readPendingMessage($fiberRedis, $queues, $prefix, $consumerGroup);
-
-                        if ($message === null) {
-                            $pendingDrained = true;
-                        }
+                    // Periodically re-check PEL for any orphaned messages (~every 25s).
+                    $loopCount++;
+                    if ($message === null && $loopCount % 50 === 0) {
+                        $message = $this->readPendingMessage($fiberRedis, $queues, $prefix, $consumerGroup, $buildStreamKey);
                     }
 
-                    // Still nothing — steal from dead consumers.
+                    // Drain pending on first iteration (crash recovery).
+                    if ($message === null && $loopCount === 1) {
+                        $message = $this->readPendingMessage($fiberRedis, $queues, $prefix, $consumerGroup, $buildStreamKey);
+                    }
+
+                    // Still nothing: steal from dead consumers.
                     if ($message === null) {
-                        $message = $this->stealMessage($fiberRedis, $queues, $prefix, $consumerGroup, $streams);
+                        $message = $this->stealMessage($fiberRedis, $queues, $prefix, $consumerGroup, $streams, $buildStreamKey);
                     }
 
                     if ($message === null) {
+                        // No work: yield to event loop and wait before polling again.
+                        \Fledge\Async\delay($pollInterval);
                         continue;
                     }
 
@@ -232,14 +257,14 @@ final class WorkerProcess
             });
         }
 
-        // Delayed job migration timer — checks every second for matured delayed jobs.
-        EventLoop::repeat(1.0, function (string $id) use ($redisPool, $queues, $prefix) {
+        // Delayed job migration timer: checks every second for matured delayed jobs.
+        EventLoop::repeat(1.0, function (string $id) use ($redisPool, $queues, $buildStreamKey) {
             if ($this->hasReachedLimits()) {
                 EventLoop::cancel($id);
                 return;
             }
 
-            $this->migrateDelayedJobs($redisPool, $queues, $prefix);
+            $this->migrateDelayedJobs($redisPool, $queues, $buildStreamKey);
         });
 
         // Metrics publishing timer — pushes worker snapshot to Redis for the dashboard.
@@ -413,16 +438,21 @@ final class WorkerProcess
      * @param  string[]  $queues
      * @return array{stream: string, id: string, payload: string}|null
      */
+    /**
+     * @param  string[]  $queues
+     * @param  \Closure(string): string  $buildStreamKey
+     */
     private function readPendingMessage(
         RedisClient $readerRedis,
         array $queues,
         string $prefix,
         string $consumerGroup,
+        \Closure $buildStreamKey,
     ): ?array {
         $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
 
         foreach ($queues as $queue) {
-            $args[] = $prefix . $queue;
+            $args[] = $buildStreamKey($queue);
         }
 
         foreach ($queues as $queue) {
@@ -444,15 +474,21 @@ final class WorkerProcess
      * @param  array<string, array<string, mixed>>  $streams
      * @return array{stream: string, id: string, payload: string}|null
      */
+    /**
+     * @param  string[]  $queues
+     * @param  array<string, array<string, mixed>>  $streams
+     * @param  \Closure(string): string  $buildStreamKey
+     */
     private function stealMessage(
         RedisClient $readerRedis,
         array $queues,
         string $prefix,
         string $consumerGroup,
         array $streams,
+        \Closure $buildStreamKey,
     ): ?array {
         foreach ($queues as $queue) {
-            $streamKey = $prefix . $queue;
+            $streamKey = $buildStreamKey($queue);
             // Use the stream's retry_after as the idle threshold for stealing.
             // This prevents stealing from consumers that are still alive but
             // processing slow jobs (e.g. exports, slow scraping).
@@ -518,12 +554,13 @@ final class WorkerProcess
     }
 
     /**
-     * Read the next message from any configured stream using XREADGROUP.
+     * Poll for the next message from any configured stream using XREADGROUP.
      *
-     * Uses the dedicated reader Redis client (not the pool) to avoid tying up
-     * pooled connections during BLOCK waits.
+     * Non-blocking: returns immediately with a message or null. The caller
+     * is responsible for yielding (delay) when no work is available.
      *
      * @param  string[]  $queues
+     * @param  \Closure(string): string  $buildStreamKey
      * @return array{stream: string, id: string, payload: string}|null
      */
     private function readNextMessage(
@@ -531,12 +568,12 @@ final class WorkerProcess
         array $queues,
         string $prefix,
         string $consumerGroup,
-        int $blockFor,
+        \Closure $buildStreamKey,
     ): ?array {
-        $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'BLOCK', (string) $blockFor, 'STREAMS'];
+        $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
 
         foreach ($queues as $queue) {
-            $args[] = $prefix . $queue;
+            $args[] = $buildStreamKey($queue);
         }
 
         foreach ($queues as $queue) {
@@ -678,14 +715,18 @@ final class WorkerProcess
      *
      * @param  string[]  $queues
      */
-    private function migrateDelayedJobs(RedisPool $redisPool, array $queues, string $prefix): void
+    /**
+     * @param  string[]  $queues
+     * @param  \Closure(string): string  $buildStreamKey
+     */
+    private function migrateDelayedJobs(RedisPool $redisPool, array $queues, \Closure $buildStreamKey): void
     {
-        $redisPool->use(function (mixed $redis) use ($queues, $prefix) {
+        $redisPool->use(function (mixed $redis) use ($queues, $buildStreamKey) {
             $now = (string) time();
 
             foreach ($queues as $queue) {
-                $delayedKey = $prefix . $queue . ':delayed';
-                $streamKey = $prefix . $queue;
+                $streamKey = $buildStreamKey($queue);
+                $delayedKey = $streamKey . ':delayed';
 
                 /** @var array|null $entries */
                 $entries = $redis->execute('ZRANGEBYSCORE', $delayedKey, '-inf', $now, 'LIMIT', '0', '100');
@@ -693,6 +734,8 @@ final class WorkerProcess
                 if (!is_array($entries) || $entries === []) {
                     continue;
                 }
+
+                fwrite(STDERR, "[torque:worker] Migrating " . count($entries) . " delayed jobs from {$queue}\n");
 
                 foreach ($entries as $payload) {
                     $redis->execute('ZREM', $delayedKey, $payload);
