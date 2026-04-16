@@ -105,7 +105,8 @@ final class TorqueStartCommand extends Command
         $concurrency = (int) ($config['coroutines_per_worker'] ?? 50);
         $queues = implode(', ', $config['queues']);
 
-        $this->components->info("Torque starting with {$workers} workers x {$concurrency} coroutines");
+        $version = \Composer\InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev';
+        $this->components->info("Torque {$version} starting with {$workers} workers x {$concurrency} coroutines");
         $this->components->info("Queues: {$queues}");
         $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
         $this->components->info('Redis: ' . preg_replace('/:([^@]+)@/', ':***@', $redisUri));

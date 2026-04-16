@@ -52,8 +52,8 @@ final class TorqueMonitorCommand extends Command
         $prefix = $config['redis']['prefix'] ?? 'torque:';
         $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
 
-        // Hide cursor for cleaner rendering.
-        $this->output->write("\033[?25l");
+        // Switch to alternate screen buffer (like htop/vim) and hide cursor.
+        $this->output->write("\033[?1049h\033[?25l");
 
         try {
             while (!$this->shouldStop) {
@@ -61,10 +61,8 @@ final class TorqueMonitorCommand extends Command
                 usleep($refreshMs * 1000);
             }
         } finally {
-            // Show cursor, clear screen, print exit message.
-            $this->output->write("\033[?25h");
-            $this->newLine();
-            $this->components->info('Monitor stopped.');
+            // Restore main screen buffer and show cursor.
+            $this->output->write("\033[?25h\033[?1049l");
         }
 
         return self::SUCCESS;
