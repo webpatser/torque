@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-04-17
+
+### Fixed
+- **Workers go silent and never rotate after their lifetime expires.** When a worker reached `max_jobs_per_worker` or `max_worker_lifetime`, the metrics, migration, and pause-check timers self-cancelled and the Fibers tried to return at the top of their loop. Any Fiber suspended inside `processMessage()` or a half-open Redis socket kept the EventLoop alive forever, so the process never exited, the master never saw SIGCHLD, no replacement was spawned, and the dashboard went blank with `0 workers` while delayed jobs piled up. The worker now installs a hard-exit deadline timer: once limits are reached it gives Fibers `drain_grace_seconds` (default 10s) to finish, then calls `exit(0)` so the master can respawn unconditionally
+- Per-Fiber reader Redis client now issues a `PING` every ~30 idle iterations and recreates the client on failure, eliminating the half-open socket class of stalls (NAT timeout, `client_output_buffer_limit` kill, server restart) on long-lived workers
+
+### Added
+- `drain_grace_seconds` (env `TORQUE_DRAIN_GRACE`, default 10) controls how long Fibers get to drain on worker rotation before the hard exit
+- `stall_warn_seconds` (env `TORQUE_STALL_WARN`, default 300) plus a 30s watchdog timer that logs `WARN slot N processing same job for Xs` for any slot whose current job exceeds the threshold. Surfaces hung user jobs before they age out the worker
+- Monitor command now shows yellow `● DEGRADED` when the master is alive but no workers are reporting metrics, instead of misleading green `● RUNNING`
+
+### Changed
+- Migration, metrics, and pause-check timers no longer self-cancel when limits are reached. They keep firing through the drain window so the dashboard shows live data and delayed jobs keep migrating until the worker actually exits
+
 ## [0.7.0] - 2026-04-17
 
 ### Added

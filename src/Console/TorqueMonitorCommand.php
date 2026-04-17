@@ -129,6 +129,7 @@ final class TorqueMonitorCommand extends Command
 
         $status = match (true) {
             $paused => "\033[33m⏸ PAUSED\033[0m",
+            $masterPid !== null && $workerCount === 0 => "\033[33m● DEGRADED\033[0m",
             $masterPid !== null && $age < 10 => "\033[32m● RUNNING\033[0m",
             $masterPid !== null => "\033[33m● STALE\033[0m",
             default => "\033[31m● STOPPED\033[0m",
