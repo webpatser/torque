@@ -178,11 +178,14 @@ LUA;
         $pauseState = new \stdClass();
         $pauseState->paused = false;
 
-        EventLoop::repeat(2.0, function (string $id) use ($redisPool, $prefix, $pauseState) {
-            if ($this->hasReachedLimits()) {
-                EventLoop::cancel($id);
-                return;
-            }
+        // Per-slot job-start tracker for the stalled-job watchdog. Indexed by
+        // Fiber index; the value is the unix timestamp when the slot picked up
+        // its current job, or absent when the slot is idle.
+        /** @var array<int, int> $slotStarts */
+        $slotStarts = [];
+        $stallThreshold = (int) ($this->config['stall_warn_seconds'] ?? 300);
+
+        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState) {
             $redisPool->use(function (mixed $redis) use ($prefix, $pauseState) {
                 $pauseState->paused = (bool) $redis->execute('EXISTS', $prefix . 'paused');
             });
@@ -215,6 +218,7 @@ LUA;
                 $pauseState,
                 $concurrency,
                 $buildStreamKey,
+                &$slotStarts,
             ) {
                 // Stagger Fiber startup to spread polling across time.
                 \Fledge\Async\delay($fiberIndex * ($pollInterval / $concurrency));
@@ -256,11 +260,31 @@ LUA;
                     if ($message === null) {
                         // No work: yield to event loop and wait before polling again.
                         \Fledge\Async\delay($pollInterval);
+
+                        // Liveness check: PING the per-Fiber reader connection every
+                        // ~30 idle iterations (~60s at default pollInterval). On a
+                        // half-open socket (common after NAT timeout, redis client
+                        // output buffer kill, or a server restart), XREADGROUP can
+                        // block forever waiting for a reply that never comes. PING
+                        // surfaces the dead client so we can recreate it.
+                        if ($loopCount % 30 === 0) {
+                            try {
+                                $fiberRedis->execute('PING');
+                            } catch (\Throwable $e) {
+                                fwrite(STDERR, "[torque:worker] Fiber {$fiberIndex} reader Redis dead ({$e->getMessage()}); reconnecting.\n");
+                                try {
+                                    $fiberRedis = createRedisClient($redisUri);
+                                } catch (\Throwable $reconnect) {
+                                    fwrite(STDERR, "[torque:worker] Fiber {$fiberIndex} reconnect failed: {$reconnect->getMessage()}\n");
+                                }
+                            }
+                        }
                         continue;
                     }
 
                     $metrics->recordJobStarted();
                     $jobStartTime = hrtime(true);
+                    $slotStarts[$fiberIndex] = time();
 
                     try {
                         $this->processMessage($message, $streamQueue, $events, $connectionName, $streams, $prefix);
@@ -271,6 +295,7 @@ LUA;
                         $metrics->recordJobFailed($durationMs);
                         $this->handleFailure($message, $e, $streamQueue, $events, $connectionName, $streams, $prefix, $deadLetterHandler);
                     } finally {
+                        unset($slotStarts[$fiberIndex]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
                     }
@@ -279,24 +304,68 @@ LUA;
         }
 
         // Delayed job migration timer: checks every second for matured delayed jobs.
-        EventLoop::repeat(1.0, function (string $id) use ($redisPool, $queues, $buildStreamKey) {
-            if ($this->hasReachedLimits()) {
-                EventLoop::cancel($id);
-                return;
-            }
-
+        // Keeps running during the drain window so delayed jobs don't pile up while
+        // a hung Fiber prevents the worker from exiting cleanly.
+        EventLoop::repeat(1.0, function () use ($redisPool, $queues, $buildStreamKey) {
             $this->migrateDelayedJobs($redisPool, $queues, $buildStreamKey);
         });
 
         // Metrics publishing timer — pushes worker snapshot to Redis for the dashboard.
+        // Keeps publishing during the drain window so the dashboard does not blink
+        // to "0 workers" before the hard-exit deadline fires.
         $metricsInterval = (float) ($this->config['metrics']['publish_interval'] ?? 1);
-        EventLoop::repeat($metricsInterval, function (string $id) use ($metricsPublisher, $metrics) {
-            if ($this->hasReachedLimits()) {
-                EventLoop::cancel($id);
+        EventLoop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
+            $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
+        });
+
+        // Stalled-job watchdog: log a WARN line for any slot that has been
+        // processing the same job for longer than the configured threshold.
+        // Fires every 30s; threshold defaults to 300s. Catches hung user jobs
+        // (e.g. external HTTP calls without a timeout) before they block the
+        // worker through its full lifetime.
+        EventLoop::repeat(30.0, function () use (&$slotStarts, $stallThreshold) {
+            $now = time();
+            foreach ($slotStarts as $idx => $started) {
+                $age = $now - $started;
+                if ($age >= $stallThreshold) {
+                    fwrite(STDERR, "[torque:worker] WARN slot {$idx} processing same job for {$age}s (threshold {$stallThreshold}s)\n");
+                }
+            }
+        });
+
+        // Hard-exit deadline timer.
+        //
+        // Once limits are reached (max jobs, max lifetime, or stop signal), give
+        // Fibers up to drain_grace seconds to finish in-flight work, then call
+        // exit(0) so the master sees SIGCHLD and respawns. Without this, a single
+        // Fiber suspended inside processMessage() or a half-open Redis socket
+        // would keep the EventLoop running indefinitely and the worker would
+        // never rotate.
+        $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
+        $drainStartedAt = null;
+        EventLoop::repeat(1.0, function () use (&$drainStartedAt, $drainGrace, $metricsPublisher, $metrics) {
+            if (!$this->hasReachedLimits()) {
                 return;
             }
 
-            $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
+            if ($drainStartedAt === null) {
+                $drainStartedAt = time();
+                fwrite(STDERR, "[torque:worker] Limits reached; draining for up to {$drainGrace}s.\n");
+            }
+
+            if (time() - $drainStartedAt < $drainGrace) {
+                return;
+            }
+
+            try {
+                $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
+                $metricsPublisher->removeWorkerMetrics($this->consumerId);
+            } catch (\Throwable) {
+                // Best-effort cleanup; do not block the hard exit.
+            }
+
+            fwrite(STDERR, "[torque:worker] Drain window expired; forcing exit.\n");
+            exit(0);
         });
 
         try {

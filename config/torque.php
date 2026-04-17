@@ -37,6 +37,27 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Drain grace (seconds)
+    |--------------------------------------------------------------------------
+    | Once limits are reached (max jobs, max lifetime, or stop signal), Fibers
+    | get this many seconds to finish in-flight jobs before the worker forces
+    | exit(0). Guarantees the master sees SIGCHLD and respawns even if a Fiber
+    | is stuck inside processMessage() or a half-open Redis socket.
+    */
+    'drain_grace_seconds' => (int) env('TORQUE_DRAIN_GRACE', 10),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Stall warning threshold (seconds)
+    |--------------------------------------------------------------------------
+    | The watchdog logs a WARN line every 30s for any slot whose current job
+    | has been running longer than this. Helps catch hung user jobs (e.g.
+    | external HTTP calls without a timeout) before they age out the worker.
+    */
+    'stall_warn_seconds' => (int) env('TORQUE_STALL_WARN', 300),
+
+    /*
+    |--------------------------------------------------------------------------
     | Redis connection
     |--------------------------------------------------------------------------
     */

@@ -208,6 +208,8 @@ All options are in `config/torque.php`. Key settings:
 | `coroutines_per_worker` | 50 | Concurrent job slots per worker |
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
+| `drain_grace_seconds` | 10 | Seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation |
+| `stall_warn_seconds` | 300 | Watchdog logs a WARN for any slot whose current job has been running longer than this |
 | `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
 
