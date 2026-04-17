@@ -83,6 +83,140 @@ final class JobStream
     }
 
     /**
+     * List currently active (non-terminal) jobs.
+     *
+     * Reads uuids from the `{prefix}jobs:active` sorted-set index (newest
+     * first) and fetches the last event from each job's stream. Falls back to
+     * scanning `{prefix}job:*` keys when the index is empty (e.g. for legacy
+     * installs without the recorder running).
+     *
+     * @param  int  $limit  Maximum number of jobs to return.
+     * @return array<int, array{uuid: string, type: string, data: array<string, string>}>
+     */
+    public function activeJobs(int $limit = 100): array
+    {
+        $redis = $this->getRedis();
+        $indexKey = $this->prefix . 'jobs:active';
+
+        $uuids = $redis->execute('ZREVRANGE', $indexKey, '0', (string) ($limit - 1));
+
+        if (! is_array($uuids) || $uuids === []) {
+            return $this->scanActiveJobs($limit);
+        }
+
+        $active = [];
+
+        foreach ($uuids as $uuid) {
+            $uuid = (string) $uuid;
+            $key = $this->prefix . 'job:' . $uuid;
+            $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
+
+            if (! is_array($last) || $last === []) {
+                // Stale index entry: stream expired/was purged. Drop it.
+                $redis->execute('ZREM', $indexKey, $uuid);
+
+                continue;
+            }
+
+            $entry = $this->parseEntries($last)[0] ?? null;
+
+            if ($entry === null) {
+                continue;
+            }
+
+            if (in_array($entry['type'], ['completed', 'failed', 'dead_lettered'], true)) {
+                // Index drift: job reached terminal after ZADD but before the
+                // ZREM in the recorder. Self-heal by removing it here.
+                $redis->execute('ZREM', $indexKey, $uuid);
+
+                continue;
+            }
+
+            $active[] = [
+                'uuid' => $uuid,
+                'type' => $entry['type'],
+                'data' => $entry['data'],
+            ];
+        }
+
+        return $active;
+    }
+
+    /**
+     * List recent jobs (both active and completed).
+     *
+     * Reads uuids from the `{prefix}jobs:recent` sorted-set index, newest
+     * first, then fetches first + last events for each. Falls back to a SCAN
+     * over `{prefix}job:*` when the index is empty.
+     *
+     * @param  string|null  $status  Filter: 'active', 'completed', 'failed', or null for all.
+     * @param  int  $limit  Maximum number of jobs to return.
+     * @return array<int, array{uuid: string, first_event: array, last_event: array}>
+     */
+    public function recentJobs(?string $status = null, int $limit = 100): array
+    {
+        $redis = $this->getRedis();
+        $indexKey = $this->prefix . 'jobs:recent';
+
+        // Pull an oversized window so post-filtering by status can still
+        // produce a full page for statuses that match only some of the jobs.
+        $window = max($limit * 3, 300);
+        $uuids = $redis->execute('ZREVRANGE', $indexKey, '0', (string) ($window - 1));
+
+        if (! is_array($uuids) || $uuids === []) {
+            return $this->scanRecentJobs($status, $limit);
+        }
+
+        $terminalTypes = ['completed', 'failed', 'dead_lettered'];
+        $jobs = [];
+
+        foreach ($uuids as $uuid) {
+            $uuid = (string) $uuid;
+            $key = $this->prefix . 'job:' . $uuid;
+
+            $first = $redis->execute('XRANGE', $key, '-', '+', 'COUNT', '1');
+            $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
+
+            if (! is_array($first) || $first === [] || ! is_array($last) || $last === []) {
+                $redis->execute('ZREM', $indexKey, $uuid);
+
+                continue;
+            }
+
+            $firstEntry = $this->parseEntries($first)[0] ?? null;
+            $lastEntry = $this->parseEntries($last)[0] ?? null;
+
+            if ($firstEntry === null || $lastEntry === null) {
+                continue;
+            }
+
+            $isTerminal = in_array($lastEntry['type'], $terminalTypes, true);
+
+            if ($status === 'active' && $isTerminal) {
+                continue;
+            }
+            if ($status === 'completed' && $lastEntry['type'] !== 'completed') {
+                continue;
+            }
+            if ($status === 'failed' && ! in_array($lastEntry['type'], ['failed', 'dead_lettered'], true)) {
+                continue;
+            }
+
+            $jobs[] = [
+                'uuid' => $uuid,
+                'first_event' => $firstEntry,
+                'last_event' => $lastEntry,
+            ];
+
+            if (count($jobs) >= $limit) {
+                break;
+            }
+        }
+
+        return $jobs;
+    }
+
+    /**
      * Check if a job has reached a terminal state.
      */
     public function isFinished(string $uuid): bool
@@ -96,6 +230,135 @@ final class JobStream
         }
 
         return false;
+    }
+
+    /**
+     * SCAN fallback for `activeJobs()` when the sorted-set index is empty.
+     *
+     * @return array<int, array{uuid: string, type: string, data: array<string, string>}>
+     */
+    private function scanActiveJobs(int $limit): array
+    {
+        $redis = $this->getRedis();
+        $pattern = $this->prefix . 'job:*';
+        $prefixLen = strlen($this->prefix . 'job:');
+        $active = [];
+        $cursor = '0';
+
+        do {
+            $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '100');
+
+            if (! is_array($result) || count($result) < 2) {
+                break;
+            }
+
+            $cursor = (string) $result[0];
+            $keys = is_array($result[1]) ? $result[1] : [];
+
+            foreach ($keys as $key) {
+                $key = (string) $key;
+                $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
+
+                if (! is_array($last) || $last === []) {
+                    continue;
+                }
+
+                $entry = $this->parseEntries($last)[0] ?? null;
+
+                if ($entry === null) {
+                    continue;
+                }
+
+                if (in_array($entry['type'], ['completed', 'failed', 'dead_lettered'], true)) {
+                    continue;
+                }
+
+                $uuid = substr($key, $prefixLen);
+                $active[] = [
+                    'uuid' => $uuid,
+                    'type' => $entry['type'],
+                    'data' => $entry['data'],
+                ];
+
+                if (count($active) >= $limit) {
+                    return $active;
+                }
+            }
+        } while ($cursor !== '0');
+
+        return $active;
+    }
+
+    /**
+     * SCAN fallback for `recentJobs()` when the sorted-set index is empty.
+     *
+     * @return array<int, array{uuid: string, first_event: array, last_event: array}>
+     */
+    private function scanRecentJobs(?string $status, int $limit): array
+    {
+        $redis = $this->getRedis();
+        $pattern = $this->prefix . 'job:*';
+        $prefixLen = strlen($this->prefix . 'job:');
+        $jobs = [];
+        $cursor = '0';
+        $terminalTypes = ['completed', 'failed', 'dead_lettered'];
+
+        do {
+            $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '100');
+
+            if (! is_array($result) || count($result) < 2) {
+                break;
+            }
+
+            $cursor = (string) $result[0];
+            $keys = is_array($result[1]) ? $result[1] : [];
+
+            foreach ($keys as $key) {
+                $key = (string) $key;
+
+                $first = $redis->execute('XRANGE', $key, '-', '+', 'COUNT', '1');
+                $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
+
+                if (! is_array($first) || $first === [] || ! is_array($last) || $last === []) {
+                    continue;
+                }
+
+                $firstEntry = $this->parseEntries($first)[0] ?? null;
+                $lastEntry = $this->parseEntries($last)[0] ?? null;
+
+                if ($firstEntry === null || $lastEntry === null) {
+                    continue;
+                }
+
+                $isTerminal = in_array($lastEntry['type'], $terminalTypes, true);
+
+                if ($status === 'active' && $isTerminal) {
+                    continue;
+                }
+                if ($status === 'completed' && $lastEntry['type'] !== 'completed') {
+                    continue;
+                }
+                if ($status === 'failed' && ! in_array($lastEntry['type'], ['failed', 'dead_lettered'], true)) {
+                    continue;
+                }
+
+                $uuid = substr($key, $prefixLen);
+                $jobs[] = [
+                    'uuid' => $uuid,
+                    'first_event' => $firstEntry,
+                    'last_event' => $lastEntry,
+                ];
+            }
+        } while ($cursor !== '0');
+
+        usort($jobs, static function (array $a, array $b): int {
+            $tsA = (int) ($a['first_event']['data']['timestamp'] ?? 0);
+            $tsB = (int) ($b['first_event']['data']['timestamp'] ?? 0);
+
+            return $tsB <=> $tsA;
+        });
+
+        return array_slice($jobs, 0, $limit);
     }
 
     /**

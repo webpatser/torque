@@ -161,8 +161,8 @@ return [
         'enabled' => true,
         'path' => 'torque',
         'middleware' => ['web', 'auth'],
-        'poll_intervals' => [0, 1000, 2000, 5000, 10000, 30000, 60000],
-        'default_poll_interval' => 2000,
+        'poll_intervals' => [0, 1000, 2000, 5000, 10000, 30000],
+        'default_poll_interval' => 1000,
     ],
 
     /*

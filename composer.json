@@ -10,6 +10,7 @@
         "illuminate/console": "^12.0|^13.0",
         "illuminate/support": "^12.0|^13.0",
         "revolt/event-loop": "^1.0",
+        "livewire/flux": "^2.0",
         "webpatser/fledge-fiber": "^13.4"
     },
     "suggest": {},

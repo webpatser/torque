@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 
 new class extends Component {
+    use AuthorizesTorqueAccess;
+
     /** @var array<string, array<string, string>> */
     public array $workers = [];
 
@@ -41,8 +44,7 @@ new class extends Component {
 ?>
 
 <div>
-    <flux:card class="!p-0 overflow-hidden">
-        <flux:table>
+    <flux:table>
             <flux:table.columns>
                 <flux:table.column>Worker</flux:table.column>
                 <flux:table.column>Status</flux:table.column>
@@ -53,7 +55,6 @@ new class extends Component {
                 <flux:table.column>Memory</flux:table.column>
                 <flux:table.column>Heartbeat</flux:table.column>
             </flux:table.columns>
-
             <flux:table.rows>
                 @forelse($this->rows as $row)
                     <flux:table.row wire:key="worker-{{ $row['id'] }}">
@@ -132,7 +133,6 @@ new class extends Component {
                         </flux:table.cell>
                     </flux:table.row>
                 @endforelse
-            </flux:table.rows>
-        </flux:table>
-    </flux:card>
+        </flux:table.rows>
+    </flux:table>
 </div>

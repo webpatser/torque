@@ -29,11 +29,17 @@ final class TorqueSupervisorCommand extends Command
     {
         $path = $this->option('path') ?? storage_path('torque-supervisor.conf');
 
-        // Prevent path traversal: output must be within storage or base path.
-        $realParent = realpath(dirname($path));
-        if ($realParent === false
-            || (!str_starts_with($realParent, storage_path()) && !str_starts_with($realParent, base_path()))) {
-            $this->components->error('Output path must be within the application directory.');
+        // Output must resolve to an existing directory under storage_path().
+        // storage_path() is trusted; arbitrary dirs aren't, and realpath() on
+        // a non-existent parent returns false (so a prepared symlink can't
+        // slip past a !== false check).
+        $parent = dirname($path);
+        $realParent = is_dir($parent) ? realpath($parent) : false;
+        $realStorage = realpath(storage_path());
+
+        if ($realParent === false || $realStorage === false
+            || !str_starts_with($realParent.DIRECTORY_SEPARATOR, $realStorage.DIRECTORY_SEPARATOR)) {
+            $this->components->error('Output path must be within storage_path().');
             return self::FAILURE;
         }
 
@@ -46,13 +52,13 @@ final class TorqueSupervisorCommand extends Command
         $config = <<<INI
         [program:torque]
         process_name=%(program_name)s
-        command=php {$artisanPath} torque:start --workers={$workers}
+        command=php "{$artisanPath}" torque:start --workers={$workers}
         autostart=true
         autorestart=true
         stopwaitsecs=60
         user={$user}
         redirect_stderr=true
-        stdout_logfile={$logPath}
+        stdout_logfile="{$logPath}"
         stopasgroup=true
         killasgroup=true
         INI;
