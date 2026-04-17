@@ -168,13 +168,40 @@ final class MasterProcess
      */
     private function monitor(): int
     {
-        // Evaluate autoscaling every 10 iterations (~1 second at 100ms sleep).
+        // Prefer synchronous signal delivery so SIGCHLD and stop signals wake
+        // the master instantly, instead of waiting up to 100ms for the next
+        // usleep() tick. pcntl_sigtimedwait is POSIX but unavailable on macOS
+        // (sigtimedwait was never implemented there), so fall back to async
+        // signals + usleep on platforms that don't have it.
+        $syncSignals = function_exists('pcntl_sigtimedwait');
+
+        if ($syncSignals) {
+            pcntl_async_signals(false);
+            pcntl_sigprocmask(SIG_BLOCK, [SIGTERM, SIGINT, SIGCHLD]);
+        }
+
+        // Evaluate autoscaling every ~10 iterations (~1 second at 100ms wait).
         $autoscaleTick = 0;
 
         while (!empty($this->workerPids)) {
-            $pid = pcntl_waitpid(-1, $status, WNOHANG);
+            if ($syncSignals) {
+                $info = [];
+                $sig = \pcntl_sigtimedwait([SIGTERM, SIGINT, SIGCHLD], $info, 0, 100_000_000);
 
-            if ($pid > 0) {
+                if ($sig === SIGTERM || $sig === SIGINT) {
+                    $this->shouldStop = true;
+                    $this->signalChildren(SIGTERM);
+                }
+            } else {
+                // Async signal handlers registered in start() handle SIGTERM
+                // and SIGINT; usleep is interruptible by signals so it wakes
+                // early when one arrives.
+                usleep(100_000);
+            }
+
+            // Reap every exited child (SIGCHLD coalesces — one delivery may
+            // cover multiple exits).
+            while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
                 unset($this->workerPids[$pid]);
 
                 if (pcntl_wifexited($status)) {
@@ -182,14 +209,12 @@ final class MasterProcess
                     ($this->logger)("Worker PID {$pid} exited (code {$exitCode})");
                 } elseif (pcntl_wifsignaled($status)) {
                     $signal = pcntl_wtermsig($status);
-                    $exitCode = 128 + $signal;
-                    ($this->logger)("Worker PID {$pid} killed by signal {$signal} (" . match($signal) {
+                    ($this->logger)("Worker PID {$pid} killed by signal {$signal} (".match ($signal) {
                         1 => 'SIGHUP', 2 => 'SIGINT', 6 => 'SIGABRT', 9 => 'SIGKILL',
                         11 => 'SIGSEGV', 13 => 'SIGPIPE', 15 => 'SIGTERM',
-                        default => 'SIG' . $signal,
-                    } . ")");
+                        default => 'SIG'.$signal,
+                    }.')');
                 } else {
-                    $exitCode = -1;
                     ($this->logger)("Worker PID {$pid} exited (unknown status)");
                 }
 
@@ -208,9 +233,6 @@ final class MasterProcess
                 $autoscaleTick = 0;
                 $this->evaluateAutoscale();
             }
-
-            // Sleep 100ms to avoid busy-looping.
-            usleep(100_000);
         }
 
         ($this->logger)('All workers exited. Master shutting down.');
@@ -310,20 +332,30 @@ final class MasterProcess
     /**
      * Write the master PID to the PID file atomically.
      *
-     * Uses a temporary file + rename to prevent partial reads. Rejects
-     * symlinks at the target path to prevent symlink attacks.
+     * Refuses to start if the PID path already exists as a symlink: unlinking
+     * and recreating opens a small TOCTOU window where an attacker with write
+     * access to the storage dir could redirect the rename.
+     *
+     * @throws \RuntimeException
      */
     private function writePidFile(): void
     {
         $path = self::pidFilePath();
 
         if (is_link($path)) {
-            unlink($path);
+            throw new \RuntimeException("Refusing to start: PID path {$path} is a symlink.");
         }
 
-        $tmpPath = $path . '.' . getmypid() . '.tmp';
-        file_put_contents($tmpPath, (string) getmypid());
-        rename($tmpPath, $path);
+        $tmpPath = $path.'.'.getmypid().'.tmp';
+
+        if (file_put_contents($tmpPath, (string) getmypid(), LOCK_EX) === false) {
+            throw new \RuntimeException("Failed to write temporary PID file at {$tmpPath}.");
+        }
+
+        if (!rename($tmpPath, $path)) {
+            @unlink($tmpPath);
+            throw new \RuntimeException("Failed to move PID file to {$path}.");
+        }
     }
 
     /**

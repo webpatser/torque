@@ -133,6 +133,15 @@ final class JobStreamRecorder
 
     /**
      * Core: write an event to the per-job Redis Stream.
+     *
+     * Also maintains two sorted-set indexes used by the dashboard to avoid
+     * O(N) SCAN lookups:
+     *
+     * - `{prefix}jobs:active`: uuids whose most recent event is non-terminal.
+     * - `{prefix}jobs:recent`: all uuids, scored by timestamp (newest first).
+     *
+     * Both sets are trimmed opportunistically to drop entries older than the
+     * per-job stream TTL.
      */
     public function record(string $uuid, string $type, array $data, bool $terminal = false): void
     {
@@ -143,6 +152,7 @@ final class JobStreamRecorder
         try {
             $redis = $this->getRedis();
             $key = $this->prefix . 'job:' . $uuid;
+            $now = time();
 
             $args = [
                 $key,
@@ -159,9 +169,26 @@ final class JobStreamRecorder
 
             $redis->execute('XADD', ...$args);
 
-            // Set TTL on terminal events so the stream auto-cleans.
+            // Indexes: all recent jobs, and active (non-terminal) jobs.
+            $recentKey = $this->prefix . 'jobs:recent';
+            $activeKey = $this->prefix . 'jobs:active';
+
+            $redis->execute('ZADD', $recentKey, (string) $now, $uuid);
+
             if ($terminal) {
+                $redis->execute('ZREM', $activeKey, $uuid);
+                // Set TTL on terminal events so the stream auto-cleans.
                 $redis->execute('EXPIRE', $key, (string) $this->ttl);
+            } else {
+                $redis->execute('ZADD', $activeKey, (string) $now, $uuid);
+            }
+
+            // Opportunistic trim (~1/100 writes) so the indexes don't grow
+            // unbounded when many short-lived jobs run.
+            if (random_int(0, 99) === 0) {
+                $cutoff = (string) ($now - $this->ttl);
+                $redis->execute('ZREMRANGEBYSCORE', $recentKey, '-inf', '(' . $cutoff);
+                $redis->execute('ZREMRANGEBYSCORE', $activeKey, '-inf', '(' . $cutoff);
             }
         } catch (\Throwable) {
             // Never let stream recording break job processing.

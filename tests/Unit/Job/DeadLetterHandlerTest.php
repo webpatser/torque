@@ -181,6 +181,37 @@ it('retry rejects invalid queue names', function () {
     }
 });
 
+it('retry rejects queues not in the allowed whitelist', function () {
+    try {
+        $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+        $uniquePrefix = 'torque-test-dl-whitelist-' . bin2hex(random_bytes(4)) . ':';
+
+        $handler = new DeadLetterHandler(
+            redisUri: $redisUri,
+            prefix: $uniquePrefix,
+            allowedQueues: ['default', 'emails'],
+        );
+
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"wl-1"}',
+            messageId: '1680000000000-0',
+            exception: new RuntimeException('Whitelist test'),
+        );
+
+        $entries = $handler->list();
+        $last = end($entries);
+
+        $handler->retry($last['id'], targetQueue: 'dead-letter');
+
+        expect(false)->toBeTrue();
+    } catch (RuntimeException $e) {
+        expect($e->getMessage())->toContain('is not a configured Torque stream');
+    } catch (\Fledge\Async\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
+
 it('handle truncates exception messages to 1000 chars', function () {
     try {
         $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');

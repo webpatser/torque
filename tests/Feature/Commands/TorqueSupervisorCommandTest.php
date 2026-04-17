@@ -24,10 +24,27 @@ it('generates config file at default path', function () {
     expect($content)->toContain('[program:torque]');
 });
 
-it('rejects path outside application directory', function () {
+it('rejects path outside storage directory', function () {
     $this->artisan('torque:supervisor', ['--path' => '/tmp/torque.conf'])
         ->assertFailed()
-        ->expectsOutputToContain('must be within the application directory');
+        ->expectsOutputToContain('must be within storage_path()');
+});
+
+it('rejects path under base_path but outside storage_path', function () {
+    $this->artisan('torque:supervisor', ['--path' => base_path('torque.conf')])
+        ->assertFailed()
+        ->expectsOutputToContain('must be within storage_path()');
+});
+
+it('quotes artisan path in generated supervisor config', function () {
+    $expectedPath = storage_path('torque-supervisor.conf');
+
+    $this->artisan('torque:supervisor')->assertSuccessful();
+
+    $content = file_get_contents($expectedPath);
+    $artisan = base_path('artisan');
+
+    expect($content)->toContain("\"{$artisan}\"");
 });
 
 it('sanitizes user option by stripping special characters', function () {

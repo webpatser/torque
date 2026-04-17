@@ -55,10 +55,10 @@ final class TorqueDashboardController
         Route::prefix(config('torque.dashboard.path', 'torque'))
             ->middleware(config('torque.dashboard.middleware', ['web', 'auth']))
             ->group(function (): void {
-                Route::get('/{view?}', static function () {
+                Route::get('/{view?}', static function (?string $view = null) {
                     Gate::authorize('viewTorque');
 
-                    return view('torque::dashboard');
+                    return view('torque::dashboard', ['view' => $view]);
                 })->where('view', '(.*)')->name('torque.dashboard');
             });
     }

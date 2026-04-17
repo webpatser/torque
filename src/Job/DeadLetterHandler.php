@@ -21,10 +21,14 @@ final class DeadLetterHandler
 
     private readonly string $deadLetterStream;
 
+    /**
+     * @param  array<int, string>  $allowedQueues  Whitelist of queue names permitted as retry targets.
+     */
     public function __construct(
         private readonly string $redisUri,
         private readonly int $ttl = 604800, // 7 days
         private readonly string $prefix = 'torque:',
+        private readonly array $allowedQueues = [],
     ) {
         $this->deadLetterStream = $this->prefix . 'dead-letter';
         $this->redis = createRedisClient($this->redisUri);
@@ -77,8 +81,18 @@ final class DeadLetterHandler
         $queue = $targetQueue ?? $fields['original_queue']
             ?? throw new \RuntimeException("Cannot determine target queue for [{$deadLetterId}].");
 
-        if (!preg_match('/^[a-zA-Z0-9_\-.:]+$/', $queue)) {
+        // Structural check: keep Redis key space sane even when no explicit
+        // whitelist is configured (e.g. when the handler is instantiated
+        // outside the service provider).
+        if (preg_match('/^[a-zA-Z0-9_\-.:]+$/', $queue) !== 1) {
             throw new \RuntimeException("Invalid queue name: [{$queue}].");
+        }
+
+        // Whitelist check: when provided, the target must match a configured
+        // Torque stream so retries cannot push jobs into arbitrary streams
+        // (including the dead-letter stream itself).
+        if ($this->allowedQueues !== [] && ! in_array($queue, $this->allowedQueues, true)) {
+            throw new \RuntimeException("Queue [{$queue}] is not a configured Torque stream.");
         }
 
         $streamKey = $this->prefix . $queue;
@@ -151,6 +165,61 @@ final class DeadLetterHandler
                 'exception_trace' => $fields['exception_trace'] ?? '',
                 'failed_at' => $fields['failed_at'] ?? '',
             ];
+        }
+
+        return $result;
+    }
+
+    /**
+     * List entries before a given ID (cursor-based pagination), newest first.
+     *
+     * @param  string  $beforeId  The exclusive upper bound message ID.
+     * @param  int  $count  Maximum number of entries to return.
+     * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
+     */
+    #[\NoDiscard]
+    public function listBefore(string $beforeId, int $count = 50): array
+    {
+        // Fetch one extra so we can exclude the cursor entry itself,
+        // then take only $count entries that are strictly older.
+        $entries = $this->redis->execute(
+            'XREVRANGE',
+            $this->deadLetterStream,
+            $beforeId,
+            '-',
+            'COUNT',
+            (string) ($count + 1),
+        );
+
+        if (!is_array($entries) || $entries === []) {
+            return [];
+        }
+
+        $result = [];
+
+        foreach ($entries as $entry) {
+            $id = (string) $entry[0];
+
+            // Exclude the cursor entry itself (strict "before").
+            if ($id === $beforeId) {
+                continue;
+            }
+
+            $fields = $this->parseFields($entry[1]);
+
+            $result[] = [
+                'id' => $id,
+                'payload' => $fields['payload'] ?? '',
+                'original_queue' => $fields['original_queue'] ?? '',
+                'exception_class' => $fields['exception_class'] ?? '',
+                'exception_message' => $fields['exception_message'] ?? '',
+                'exception_trace' => $fields['exception_trace'] ?? '',
+                'failed_at' => $fields['failed_at'] ?? '',
+            ];
+
+            if (count($result) >= $count) {
+                break;
+            }
         }
 
         return $result;

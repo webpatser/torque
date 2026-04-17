@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Notifications;
 
 use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Notifications\Notification;
+use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
  * Notification sent when a job permanently fails after exhausting all retries.
@@ -45,19 +46,7 @@ final class JobFailedNotification extends Notification
 
     private function sanitizedMessage(): string
     {
-        return preg_replace(
-            [
-                '/password[\'"]?\s*[:=]\s*[\'"]?[^\s\'",]+/i',
-                '/api[_\-]?key[\'"]?\s*[:=]\s*[\'"]?[^\s\'",]+/i',
-                '/:\/\/[^:]+:[^@]+@/i',
-            ],
-            [
-                'password=***',
-                'api_key=***',
-                '://***:***@',
-            ],
-            $this->exceptionMessage,
-        );
+        return PayloadSanitizer::sanitizeMessage($this->exceptionMessage);
     }
 
     /**

@@ -9,6 +9,7 @@ use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
 use Webpatser\Torque\Console\TorqueMonitorCommand;
@@ -21,6 +22,7 @@ use Webpatser\Torque\Console\TorqueSupervisorCommand;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Queue\StreamConnector;
+use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 
 /**
@@ -57,6 +59,15 @@ final class TorqueServiceProvider extends ServiceProvider
             );
         });
 
+        $this->app->singleton(JobStream::class, function ($app) {
+            $config = $app['config']['torque'];
+
+            return new JobStream(
+                redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+                prefix: $config['redis']['prefix'] ?? 'torque:',
+            );
+        });
+
         $this->app->singleton(DeadLetterHandler::class, function ($app) {
             $config = $app['config']['torque'];
 
@@ -64,6 +75,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
                 ttl: $config['dead_letter']['ttl'] ?? 604800,
                 prefix: $config['redis']['prefix'] ?? 'torque:',
+                allowedQueues: array_keys($config['streams'] ?? []),
             );
         });
     }
@@ -88,6 +100,8 @@ final class TorqueServiceProvider extends ServiceProvider
         ], 'torque-views');
 
         if (config('torque.dashboard.enabled', false) && class_exists(\Livewire\Livewire::class)) {
+            $this->registerDefaultGate();
+
             TorqueDashboardController::register();
 
             $this->registerLivewireComponents();
@@ -116,20 +130,44 @@ final class TorqueServiceProvider extends ServiceProvider
     }
 
     /**
+     * Register a permissive default `viewTorque` gate.
+     *
+     * Allows access only in the `local` environment when the host application
+     * hasn't defined its own gate. Production apps must override this in their
+     * own `AuthServiceProvider`/`AppServiceProvider`.
+     */
+    private function registerDefaultGate(): void
+    {
+        if (Gate::has('viewTorque')) {
+            return;
+        }
+
+        Gate::define('viewTorque', static fn ($user = null): bool => app()->environment('local'));
+    }
+
+    /**
      * Register Livewire single-file components for the dashboard.
      */
     private function registerLivewireComponents(): void
     {
-        $components = [
-            'torque.dashboard' => 'dashboard',
-            'torque.metric-cards' => 'metric-cards',
-            'torque.workers-table' => 'workers-table',
-            'torque.streams-table' => 'streams-table',
-            'torque.failed-jobs' => 'failed-jobs',
-            'torque.poll-interval' => 'poll-interval',
-        ];
-
         $basePath = __DIR__ . '/Dashboard/resources/views/livewire';
+
+        $components = [
+            // Shell
+            'torque.dashboard-shell' => 'dashboard-shell',
+
+            // Pages
+            'torque.overview-page' => 'pages/overview-page',
+            'torque.jobs-page' => 'pages/jobs-page',
+            'torque.job-inspector-page' => 'pages/job-inspector-page',
+            'torque.streams-page' => 'pages/streams-page',
+            'torque.workers-page' => 'pages/workers-page',
+            'torque.failed-jobs-page' => 'pages/failed-jobs-page',
+            'torque.settings-page' => 'pages/settings-page',
+
+            // Shared components (workers table reused on overview page)
+            'torque.workers-table' => 'workers-table',
+        ];
 
         foreach ($components as $alias => $file) {
             Livewire::addComponent($alias, viewPath: $basePath . '/' . $file . '.wire.php');

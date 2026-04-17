@@ -242,16 +242,38 @@ Features:
 - Real-time metrics (throughput, latency, concurrent jobs, memory)
 - Worker table with coroutine slot usage bars
 - Stream/queue overview with pending and delayed counts
-- Failed jobs list with retry and delete actions
-- Kibana-style configurable poll interval (1s to 1m, or paused)
+- Failed jobs list with retry and delete actions (cursor-paginated)
+- Per-job inspector with a timeline of lifecycle events, payload, and exception details
+- Kibana-style configurable poll interval (1s to 30s, or paused)
+- Exception messages and payloads are scrubbed for secrets before rendering
+
+### Styling the dashboard
+
+The dashboard uses Flux UI Pro + Tailwind utilities, which are compiled from your application's own Vite build. Two things must be in place:
+
+1. Install Flux Pro in your host app (you almost certainly already have it):
+   ```css
+   @import '../../vendor/livewire/flux/dist/flux.css';
+   ```
+
+2. Add Torque's views to Tailwind's source scan in `resources/css/app.css`:
+   ```css
+   @source '../../vendor/webpatser/torque/src/Dashboard/resources/views/**/*.php';
+   ```
+
+Without the `@source` line, Tailwind won't generate the classes used inside the dashboard and you'll get an unstyled page.
 
 ### Authorization
 
-The dashboard is **denied by default**. Define the `viewTorque` gate in your `AuthServiceProvider`:
+The gate `viewTorque` is checked on the dashboard route **and** on every Livewire action (retry, purge, navigate), so the action endpoints cannot be reached by users who would fail the gate. Define it in your `AuthServiceProvider`:
 
 ```php
 Gate::define('viewTorque', fn (User $user) => $user->isAdmin());
 ```
+
+If you don't define a gate, Torque falls back to `app()->environment('local')`; the dashboard shows up in development but stays locked in production until you define the gate explicitly.
+
+Retries from the failed-jobs page only accept targets that exist in `config('torque.streams')`, so a compromised session cannot inject jobs into arbitrary Redis streams.
 
 ### Dashboard middleware
 
@@ -361,12 +383,12 @@ sudo supervisorctl start torque
 ## Dependencies
 
 **Required** (installed automatically):
-- `revolt/event-loop` -- Fiber scheduler
-- `webpatser/fledge-fiber` -- async/await primitives, non-blocking Redis, sync primitives
+- `revolt/event-loop`: Fiber scheduler
+- `webpatser/fledge-fiber`: async/await primitives, non-blocking Redis, sync primitives
 
 **Optional** (install when needed):
-- `webpatser/fledge-fiber-database` -- Async MySQL for `MysqlPool`
-- `webpatser/fledge-fiber-http` -- Async HTTP for `HttpPool`
+- `webpatser/fledge-fiber-database`: Async MySQL for `MysqlPool`
+- `webpatser/fledge-fiber-http`: Async HTTP for `HttpPool`
 
 ## License
 

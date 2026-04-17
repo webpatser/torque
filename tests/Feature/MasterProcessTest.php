@@ -67,6 +67,58 @@ it('readPid returns null for invalid pid content', function () {
     }
 });
 
+it('writePidFile refuses to start when the PID path is a symlink', function () {
+    $path = MasterProcess::pidFilePath();
+    $decoy = $path.'.decoy';
+
+    foreach ([$path, $decoy] as $p) {
+        if (is_link($p) || file_exists($p)) {
+            unlink($p);
+        }
+    }
+
+    file_put_contents($decoy, '0');
+    symlink($decoy, $path);
+
+    try {
+        $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+
+        $reflection = new ReflectionMethod($master, 'writePidFile');
+        $reflection->invoke($master);
+
+        expect(false)->toBeTrue('writePidFile should have thrown');
+    } catch (\RuntimeException $e) {
+        expect($e->getMessage())->toContain('symlink');
+    } finally {
+        if (is_link($path)) {
+            unlink($path);
+        }
+        if (file_exists($decoy)) {
+            unlink($decoy);
+        }
+    }
+});
+
+it('writePidFile writes the current pid atomically', function () {
+    $path = MasterProcess::pidFilePath();
+
+    foreach ([$path] as $p) {
+        if (is_link($p) || file_exists($p)) {
+            unlink($p);
+        }
+    }
+
+    $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+
+    $reflection = new ReflectionMethod($master, 'writePidFile');
+    $reflection->invoke($master);
+
+    expect(file_exists($path))->toBeTrue()
+        ->and((int) file_get_contents($path))->toBe(getmypid());
+
+    unlink($path);
+});
+
 it('constructor accepts config and logger', function () {
     $logMessages = [];
     $logger = function (string $message) use (&$logMessages) {
