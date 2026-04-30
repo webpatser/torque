@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-04-30
+
+### Added
+- **Interruptible job support.** When a worker receives `SIGTERM` or `SIGINT`, it now dispatches `Illuminate\Queue\Events\WorkerInterrupted` once and then forwards the signal to every in-flight user command implementing `Illuminate\Contracts\Queue\Interruptible::interrupted(int $signal)`. Mirrors the behaviour `Illuminate\Queue\Worker` introduced in `laravel/framework` 13.7.0 (PRs #59833, #59848), broadened to Torque's N concurrent fibers per worker so all running commands get the callback before shutdown. Jobs that don't implement `Interruptible` are unaffected; an exception thrown from one job's `interrupted()` does not block the rest
+
+### Changed
+- `WorkerProcess::processMessage()` and `WorkerProcess::handleFailure()` now accept a prepared `StreamJob` rather than constructing one internally. The fiber loop builds the job up front so each slot's job can be tracked for signal forwarding. No public API change for users
+
+### Test infrastructure
+- Test base case (`tests/TestCase.php`) now registers `Livewire\LivewireServiceProvider` and `Flux\FluxServiceProvider`, which the Torque dashboard provider already requires at runtime. Without this, `Feature` tests booting `TorqueServiceProvider` failed with `Target class [livewire.finder] does not exist`
+
 ## [0.7.1] - 2026-04-17
 
 ### Fixed

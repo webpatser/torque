@@ -13,6 +13,8 @@ abstract class TestCase extends BaseTestCase
     protected function getPackageProviders($app): array
     {
         return [
+            \Livewire\LivewireServiceProvider::class,
+            \Flux\FluxServiceProvider::class,
             TorqueServiceProvider::class,
         ];
     }
