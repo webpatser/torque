@@ -6,11 +6,14 @@ namespace Webpatser\Torque\Worker;
 
 use Fledge\Async\Redis\RedisClient;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Queue\Interruptible;
+use Illuminate\Queue\CallQueuedHandler;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Events\WorkerInterrupted;
 use Revolt\EventLoop;
 use Webpatser\Torque\Metrics\MetricsCollector;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -161,14 +164,6 @@ LUA;
 
         fwrite(STDERR, "[torque:worker] Setup complete, entering event loop\n");
 
-        // Install signal handlers for graceful shutdown.
-        EventLoop::onSignal(SIGTERM, function () {
-            $this->stopRequested = true;
-        });
-        EventLoop::onSignal(SIGINT, function () {
-            $this->stopRequested = true;
-        });
-
         $this->maxJobs = $maxJobs;
         $this->maxLifetime = $maxLifetime;
         $this->startTime = time();
@@ -184,6 +179,26 @@ LUA;
         /** @var array<int, int> $slotStarts */
         $slotStarts = [];
         $stallThreshold = (int) ($this->config['stall_warn_seconds'] ?? 300);
+
+        // Per-slot StreamJob tracker. Maintained in lockstep with $slotStarts so
+        // SIGTERM/SIGINT can reach the user command via $job->getResolvedJob().
+        /** @var array<int, StreamJob> $slotJobs */
+        $slotJobs = [];
+
+        // Install signal handlers for graceful shutdown.
+        // On SIGTERM/SIGINT we (1) flag the worker to stop, (2) dispatch
+        // Laravel's WorkerInterrupted event once, and (3) forward the signal
+        // to every in-flight command implementing Interruptible. This matches
+        // the behaviour Illuminate\Queue\Worker added in laravel/framework
+        // 13.7.0 (PRs #59833, #59848), adapted for N concurrent fibers.
+        $primaryQueue = $queues[0] ?? 'default';
+        $shutdownHandler = function (int $signal) use ($events, $connectionName, $primaryQueue, &$slotJobs) {
+            $this->stopRequested = true;
+            $this->notifyInterrupted($signal, $slotJobs, $events, $connectionName, $primaryQueue);
+        };
+
+        EventLoop::onSignal(SIGTERM, fn () => $shutdownHandler(SIGTERM));
+        EventLoop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
 
         EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState) {
             $redisPool->use(function (mixed $redis) use ($prefix, $pauseState) {
@@ -219,6 +234,7 @@ LUA;
                 $concurrency,
                 $buildStreamKey,
                 &$slotStarts,
+                &$slotJobs,
             ) {
                 // Stagger Fiber startup to spread polling across time.
                 \Fledge\Async\delay($fiberIndex * ($pollInterval / $concurrency));
@@ -286,16 +302,37 @@ LUA;
                     $jobStartTime = hrtime(true);
                     $slotStarts[$fiberIndex] = time();
 
+                    $queueName = $this->resolveQueueName($message['stream'], $prefix);
+
+                    if (!json_validate($message['payload'])) {
+                        // Corrupt payload — acknowledge and discard.
+                        $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
+                        unset($slotStarts[$fiberIndex]);
+                        CoroutineContext::flush();
+                        $this->jobsProcessed++;
+                        continue;
+                    }
+
+                    $streamJob = new StreamJob(
+                        container: app(),
+                        streamQueue: $streamQueue,
+                        rawBody: $message['payload'],
+                        messageId: $message['id'],
+                        connectionName: $connectionName,
+                        queue: $queueName,
+                    );
+                    $slotJobs[$fiberIndex] = $streamJob;
+
                     try {
-                        $this->processMessage($message, $streamQueue, $events, $connectionName, $streams, $prefix);
+                        $this->processMessage($streamJob, $events, $connectionName);
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
                         $metrics->recordJobCompleted($durationMs);
                     } catch (\Throwable $e) {
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
                         $metrics->recordJobFailed($durationMs);
-                        $this->handleFailure($message, $e, $streamQueue, $events, $connectionName, $streams, $prefix, $deadLetterHandler);
+                        $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler);
                     } finally {
-                        unset($slotStarts[$fiberIndex]);
+                        unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
                     }
@@ -559,6 +596,51 @@ LUA;
     }
 
     /**
+     * Dispatch WorkerInterrupted and forward the signal to in-flight Interruptible jobs.
+     *
+     * Mirrors Illuminate\Queue\Worker's signal handling (laravel/framework 13.7.0,
+     * PRs #59833 and #59848), broadened to N concurrent fibers: each slot's
+     * StreamJob is inspected and any user command implementing Interruptible
+     * receives interrupted($signal). Public so the behaviour can be exercised
+     * in tests without spinning up the event loop.
+     *
+     * @param  array<int, StreamJob>  $slotJobs
+     */
+    public function notifyInterrupted(
+        int $signal,
+        array $slotJobs,
+        Dispatcher $events,
+        string $connectionName,
+        ?string $queue,
+    ): void {
+        try {
+            $events->dispatch(new WorkerInterrupted($signal, $connectionName, $queue));
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] WorkerInterrupted dispatch failed: {$e->getMessage()}\n");
+        }
+
+        foreach ($slotJobs as $job) {
+            $resolved = $job->getResolvedJob();
+
+            if (!$resolved instanceof CallQueuedHandler) {
+                continue;
+            }
+
+            $command = $resolved->getRunningCommand();
+
+            if (!$command instanceof Interruptible) {
+                continue;
+            }
+
+            try {
+                $command->interrupted($signal);
+            } catch (\Throwable $e) {
+                fwrite(STDERR, "[torque:worker] Job interrupted({$signal}) threw: {$e->getMessage()}\n");
+            }
+        }
+    }
+
+    /**
      * Poll for the next message from any configured stream using XREADGROUP.
      *
      * Non-blocking: returns immediately with a message or null. The caller
@@ -591,37 +673,13 @@ LUA;
     }
 
     /**
-     * Process a single message: validate, create a StreamJob, fire events, execute.
-     *
-     * @param  array{stream: string, id: string, payload: string}  $message
-     * @param  array<string, array<string, mixed>>  $streams
+     * Fire the job and dispatch the surrounding processing events.
      */
     private function processMessage(
-        array $message,
-        StreamQueue $streamQueue,
+        StreamJob $job,
         Dispatcher $events,
         string $connectionName,
-        array $streams,
-        string $prefix,
     ): void {
-        if (!json_validate($message['payload'])) {
-            // Corrupt payload — acknowledge and discard.
-            $queueName = $this->resolveQueueName($message['stream'], $prefix);
-            $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
-            return;
-        }
-
-        $queueName = $this->resolveQueueName($message['stream'], $prefix);
-
-        $job = new StreamJob(
-            container: app(),
-            streamQueue: $streamQueue,
-            rawBody: $message['payload'],
-            messageId: $message['id'],
-            connectionName: $connectionName,
-            queue: $queueName,
-        );
-
         $events->dispatch(new JobProcessing($connectionName, $job));
 
         $job->fire();
@@ -645,25 +703,15 @@ LUA;
      * @param  array<string, array<string, mixed>>  $streams
      */
     private function handleFailure(
+        StreamJob $job,
         array $message,
         \Throwable $exception,
-        StreamQueue $streamQueue,
         Dispatcher $events,
         string $connectionName,
         array $streams,
-        string $prefix,
         DeadLetterHandler $deadLetterHandler,
     ): void {
-        $queueName = $this->resolveQueueName($message['stream'], $prefix);
-
-        $job = new StreamJob(
-            container: app(),
-            streamQueue: $streamQueue,
-            rawBody: $message['payload'],
-            messageId: $message['id'],
-            connectionName: $connectionName,
-            queue: $queueName,
-        );
+        $queueName = $job->getQueue();
 
         $events->dispatch(new JobExceptionOccurred($connectionName, $job, $exception));
 
