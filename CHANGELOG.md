@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-02
+
+### Added
+- **Optional igbinary serializer.** Set `TORQUE_SERIALIZER=igbinary` to encode the queue payload envelope as binary instead of JSON. Roughly 2x faster encode/decode on large payloads (~67% throughput gain on the `payload-large` workload), no measurable difference on small ones. Opt-in by design; JSON stays the default so `redis-cli XRANGE` keeps working during debugging. `composer.json` now `suggest`s `ext-igbinary`. `torque:start` prints a one-line install hint when the extension is missing and a `Serializer: igbinary` confirmation when active. Decode path sniffs the first byte (`{`/`[` or `\x00\x00\x00\x02`) so flipping the env var is safe while workers are running and in-flight messages organically drain
+- **`torque:bench` artisan command.** Reproducible end-to-end throughput and latency measurement against your own hardware and workload. Seven workload profiles (`cpu`, `io`, `async-io`, `fanout`, `mixed`, `payload-small`, `payload-large`) covering the dimensions where serializer choice, Fiber concurrency, and worker count actually matter. Console output mirrors `torque:status` formatting; `--json=path` (or `--json=-` for stdout) emits a machine-readable schema for CI / diff workflows. v1 requires `--use-running-master`; self-spawning workers from inside the bench command is tracked as v1.1
+- **Live `BenchAggregator`, `BenchRunner`, `BenchJob`, `BenchProbe` classes** under `src/Console/Bench/` for the bench machinery. `BenchProbe` is wired but per-stage breakdown (serialize / xadd / xreadgroup / unserialize / handle / xack) is v1.1; current output reports throughput, end-to-end latency p50/p95/p99, and median handle duration
+- **`bench/horizon-comparison/` reproduction kit.** `HorizonBenchJob.php` (the symmetric mirror of `BenchJob` for the redis-driver side), `run-horizon-bench.php` (standalone driver, auto-detects the host Laravel app from cwd), and a step-by-step README. Lets anyone reproduce the headline numbers from `BENCHMARKS.md` instead of taking them on faith
+- **`BENCHMARKS.md`.** Full apples-to-apples comparison vs Laravel `queue:work` (the engine Horizon runs underneath): up to 15x throughput on async I/O fan-out, 95% lower memory at equivalent throughput on the `fanout` workload. Methodology, raw numbers, igbinary A/B, memory-at-equivalent-throughput framing, and a "what this benchmark does NOT measure" section
+- **README rewrite.** Hero claim now sits on defensible measured numbers. New "When to use Torque" / "When to use Horizon instead" sections so users self-select before installing. New "Working with databases (avoid the Eloquent trap)" section explaining why blocking PDO calls in handlers destroy Fiber concurrency and how to use `MysqlPool` or pre-fetch in dispatch instead. Live job progress now positioned as a first-class differentiator with a hero callout and updated compatibility table
+
+### Fixed
+- **`StreamJob::payload()` now decodes via `StreamQueue::decodePayload`** instead of inheriting Laravel's JSON-only base implementation. Without this, `TORQUE_SERIALIZER=igbinary` workers crashed in `StreamJob::__construct` with a `TypeError` on the readonly array property when the raw body was igbinary-encoded; jobs piled up and the bench tail timed out. Caught by adding the redis-driver Horizon comparison: the JSON path was incidentally exercising the only code path that worked
+- `WorkerProcess::processMessage` now validates incoming payloads via `StreamQueue::isValidPayload` (which sniffs both formats) instead of `json_validate`, so igbinary blobs are no longer dropped as "corrupt"
+
+### Changed
+- `StreamQueue` constructor takes a new `serializer` parameter (default `'json'`, backwards compatible). `StreamConnector::connect()` reads `'serializer'` from the queue connection config and forwards it. New private `encodePayload`/`transcodeIncomingPayload` and public static `decodePayload`/`isValidPayload` helpers replace inline `json_encode`/`json_decode` at the four call sites in `pushRaw`, `laterRaw`, `release`, and the telemetry decode in `pushRaw`
+- `config/torque.php` adds a top-level `'serializer' => env('TORQUE_SERIALIZER', 'json')` key
+- Compatibility table in the README now reflects what Torque actually does for Eloquent (works, but blocks Fibers; use `MysqlPool` for fan-out) and adds rows for "Per-job event timeline" and "Live job progress" to make those differentiators visible
+
+### Production
+- Validated continuously on gt-tracker.com for ~1 month at time of release. Internal validation only; broader external rollout is a 1.0 prerequisite
+
 ## [0.7.2] - 2026-04-30
 
 ### Added

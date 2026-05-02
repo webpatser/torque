@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
 use Livewire\Livewire;
+use Webpatser\Torque\Console\TorqueBenchCommand;
 use Webpatser\Torque\Console\TorqueMonitorCommand;
 use Webpatser\Torque\Console\TorquePauseCommand;
 use Webpatser\Torque\Console\TorqueWorkerCommand;
@@ -125,6 +126,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 Console\TorqueFlushCommand::class,
                 TorqueWorkerCommand::class,
                 Console\TorqueTailCommand::class,
+                TorqueBenchCommand::class,
             ]);
         }
     }

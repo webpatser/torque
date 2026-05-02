@@ -132,6 +132,7 @@ LUA;
             prefix: $prefix,
             consumerGroup: $consumerGroup,
             cluster: $cluster,
+            serializer: (string) ($this->config['serializer'] ?? 'json'),
         );
 
         $events = app(Dispatcher::class);
@@ -304,8 +305,8 @@ LUA;
 
                     $queueName = $this->resolveQueueName($message['stream'], $prefix);
 
-                    if (!json_validate($message['payload'])) {
-                        // Corrupt payload — acknowledge and discard.
+                    if (!StreamQueue::isValidPayload($message['payload'])) {
+                        // Corrupt payload, unrecognized format: acknowledge and discard.
                         $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
                         unset($slotStarts[$fiberIndex]);
                         CoroutineContext::flush();
@@ -746,7 +747,11 @@ LUA;
             $events->dispatch(new JobFailed($connectionName, $job, $exception));
 
             // Fire a domain event so users can hook in custom notification logic.
-            $decoded = json_decode($message['payload'], true);
+            try {
+                $decoded = StreamQueue::decodePayload($message['payload']);
+            } catch (\Throwable) {
+                $decoded = [];
+            }
             $failedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c');
 
             $events->dispatch(new JobPermanentlyFailed(

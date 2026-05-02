@@ -111,6 +111,24 @@ final class TorqueStartCommand extends Command
         $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
         $this->components->info('Redis: ' . preg_replace('/:([^@]+)@/', ':***@', $redisUri));
 
+        // Serializer detection: hard error when igbinary is configured but the
+        // extension is missing, gentle nudge when ext is missing under json,
+        // confirmation when ext is present and configured.
+        $serializer = (string) ($config['serializer'] ?? 'json');
+        $hasIgbinary = extension_loaded('igbinary');
+
+        if ($serializer === 'igbinary' && !$hasIgbinary) {
+            $this->components->error('TORQUE_SERIALIZER=igbinary but ext-igbinary is not loaded. Install with: pecl install igbinary');
+
+            return self::FAILURE;
+        }
+
+        if ($serializer === 'igbinary' && $hasIgbinary) {
+            $this->components->info('Serializer: igbinary');
+        } elseif ($serializer === 'json' && !$hasIgbinary) {
+            $this->components->info('Tip: install ext-igbinary for ~2x faster payload encoding (set TORQUE_SERIALIZER=igbinary).');
+        }
+
         $master = new MasterProcess(
             config: $config,
             logger: fn (string $message) => $this->components->info($message),

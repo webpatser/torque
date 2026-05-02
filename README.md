@@ -2,11 +2,37 @@
 
 **The queue that keeps spinning.** Coroutine-based queue worker for Laravel.
 
-Torque replaces Horizon's 1-job-per-process model with N-jobs-per-process using PHP 8.5 Fibers. When a job waits on I/O, the coroutine scheduler switches to another job. Same hardware, 3-10x throughput for I/O-bound workloads.
+Torque replaces Horizon's 1-job-per-process model with N-jobs-per-process using PHP 8.5 Fibers. When a job waits on I/O, the scheduler switches to another job, so a handful of processes deliver the throughput Horizon needs dozens of processes for.
 
+```text
+2 workers x 50 coroutines = 100 concurrent jobs in ~120 MB RAM
+equivalent Horizon throughput on async I/O ≈ 30 processes (~2.5 GB)
 ```
-4 workers x 50 coroutines = 200 concurrent jobs in ~300MB RAM
-```
+
+> [!NOTE]
+> Numbers from the [fair benchmark](BENCHMARKS.md). On long-running async I/O (HTTP fan-out, slow external APIs) Torque delivers up to **15x throughput** at **95% lower memory footprint**. On pure CPU work it is comparable or slightly slower than Horizon, by design.
+
+> [!TIP]
+> **Live job progress, built in.** Every job records a per-job event timeline (queued / started / exception / completed) to a Redis Stream. Tail it from the CLI with `torque:tail --job=<uuid>`, read it programmatically, or stream it to the dashboard / your own UI. Custom progress events are a one-line `$this->emit('...', progress: 0.42)` away. No log scraping, no separate progress table, no extra Redis keys to manage.
+
+## When to use Torque
+
+- HTTP fan-out: calling N external APIs per job
+- Slow external services (>50 ms latency per call)
+- Webhook delivery to many endpoints
+- Bulk operations against rate-limited APIs
+- Search index updates, cache warming, notification fan-out
+- Any I/O-bound workload where you currently scale by adding more Horizon processes
+
+## When to use Horizon instead
+
+- CPU-bound jobs (image processing, PDF generation, encoding, ML inference)
+- Jobs using sync-blocking calls (`curl_exec`, `usleep`, `PDO` without an async wrapper)
+- Mature ops tooling around Horizon (we are catching up, not there yet)
+- Workloads where memory footprint per worker is not a concern
+
+> [!IMPORTANT]
+> Torque only wins when your jobs spend time waiting. If they spend time computing, the Fiber scheduler has nothing to switch to and you pay overhead for nothing. Use the right tool for the workload.
 
 ## Requirements
 
@@ -103,6 +129,54 @@ class IndexDocument extends TorqueJob
 }
 ```
 
+### Working with databases (avoid the Eloquent trap)
+
+> [!WARNING]
+> Eloquent uses PDO, which is sync-blocking. **One `User::find($id)` in a handler stalls the entire worker** (and every other Fiber on it) until the round-trip completes. On a 25-coroutine worker that's effectively concurrency 1 for the duration of that call, which destroys the `fanout` advantage Torque is built around.
+
+The fix is to either keep Eloquent out of the handler, or use the async `MysqlPool` for the queries that matter:
+
+```php
+// ❌ BAD: blocks the OS thread, every Fiber on this worker waits
+public function handle(): void
+{
+    $user = User::find($this->userId);
+    foreach ($user->subscriptions as $sub) {
+        Http::post($sub->webhook_url, $payload);
+    }
+}
+
+// ✅ GOOD (option 1): pre-fetch in dispatch, pass plain data into the handler
+ProcessWebhooks::dispatch(
+    userId: $user->id,
+    webhooks: $user->subscriptions->pluck('webhook_url')->all(),
+);
+
+// ✅ GOOD (option 2): extend TorqueJob, use MysqlPool for async queries
+class ProcessWebhooks extends TorqueJob
+{
+    public function handle(MysqlPool $db, HttpPool $http): void
+    {
+        $rows = $db->query('SELECT webhook_url FROM subscriptions WHERE user_id = ?', [$this->userId]);
+        foreach ($rows as $row) {
+            $http->post($row['webhook_url'], $this->payload);
+        }
+    }
+}
+```
+
+**When sync Eloquent is fine**:
+- The handler does at most one or two queries
+- The queries are fast (<5 ms) and the worker isn't fanout-heavy
+- You're running a CPU or low-concurrency workload where Fiber concurrency wasn't the goal anyway
+
+**When sync Eloquent is a footgun**:
+- HTTP fan-out jobs (the `fanout` workload from [BENCHMARKS.md](BENCHMARKS.md))
+- Long-running queries (slow joins, large scans)
+- Anywhere you'd otherwise be looking at "why am I not getting the throughput Torque promised"
+
+Same pattern applies to other sync clients: `curl_exec`, `Guzzle` without a non-blocking handler, `usleep`, blocking file I/O. Replace with `HttpPool`, `Fledge\Async\delay()`, or pre-compute outside the handler.
+
 ### Per-Fiber state isolation
 
 Use `CoroutineContext` when you need per-job isolated state (e.g., request-scoped data):
@@ -117,9 +191,9 @@ $tenantId = CoroutineContext::get('tenant_id');
 
 State is automatically cleaned up when the Fiber completes (backed by `WeakMap`).
 
-## Job Event Streams
+## Live job progress (built in)
 
-Every job automatically records lifecycle events to a per-job Redis Stream. No code changes needed.
+Every job automatically records a lifecycle timeline to a per-job Redis Stream: queued, started, exception, completed, plus any custom events you emit. Watch it live from the CLI, the dashboard, or your own UI without instrumenting each job by hand.
 
 ```bash
 $ php artisan torque:tail --job=088066c1-b045-4fb6-bc32-ca15cfdf7d08
@@ -351,19 +425,21 @@ Redis Streams (not LISTs like Horizon) provide:
 
 ### Compatibility
 
-| Feature | Horizon | Torque |
-|---------|---------|--------|
-| Queue backend | Redis LIST | Redis Streams |
-| Concurrency | 1 job/process | N jobs/process (Fibers) |
-| I/O model | Blocking (PDO, curl) | Non-blocking (fledge-fiber) |
-| PHP extensions | None | None |
-| Eloquent in jobs | Full support | Sync fallback (blocking) |
-| Laravel Queue contract | Full | Full |
-| Job batches | Yes | Yes |
-| Delayed jobs | Redis sorted set | Redis sorted set |
-| Redis Cluster | Yes | Yes |
-| Dashboard | Blade + polling | Livewire 4 + Flux UI |
-| Autoscaling | Balancing strategies | Slot-pressure based |
+| Feature                  | Horizon                 | Torque                                |
+| ------------------------ | ----------------------- | ------------------------------------- |
+| Queue backend            | Redis LIST              | Redis Streams                         |
+| Concurrency              | 1 job/process           | N jobs/process (Fibers)               |
+| I/O model                | Blocking (PDO, curl)    | Non-blocking (fledge-fiber)           |
+| PHP extensions           | None                    | None (igbinary optional)              |
+| Eloquent in jobs         | Full support            | Works, but blocks Fibers; use `MysqlPool` for fan-out |
+| Laravel Queue contract   | Full                    | Full                                  |
+| Job batches              | Yes                     | Yes                                   |
+| Delayed jobs             | Redis sorted set        | Redis sorted set                      |
+| Redis Cluster            | Yes                     | Yes                                   |
+| Dashboard                | Blade + polling         | Livewire 4 + Flux UI                  |
+| Autoscaling              | Balancing strategies    | Slot-pressure based                   |
+| Per-job event timeline   | Logs + failed-job retry | First-class, live-tailable per UUID   |
+| Live job progress        | Custom code per job     | `$this->emit(...)` via `Streamable`   |
 
 ## Production deployment
 
@@ -382,6 +458,104 @@ sudo supervisorctl update
 sudo supervisorctl start torque
 ```
 
+## Performance
+
+### Fair comparison vs Laravel `queue:work` / Horizon
+
+Same hardware, same Redis, same number of OS processes (2 each), 1000 jobs per run, median of 3 measured runs after a 100-job warmup. Each job emits one `XADD` result-event so measurement overhead is symmetric on both sides. Full reproduction recipe in [BENCHMARKS.md](BENCHMARKS.md).
+
+| Workload                                | Laravel `queue:work` (2 procs) | Torque (2 workers x 25 fibers) |  Δ vs Laravel |
+| --------------------------------------- | -----------------------------: | -----------------------------: | ------------: |
+| `cpu` (5000x `xxh3` hash per job)       |                          782/s |                          560/s | 0.72x slower  |
+| `mixed` (sync I/O + CPU)                |                          490/s |                          410/s | 0.84x slower  |
+| `io` (`usleep` 2 ms, blocking)          |                          387/s |                          387/s |          1.0x |
+| `payload-large` (64 KiB JSON)           |                          337/s |                          535/s |    **1.6x**   |
+| `async-io` (`Fledge\Async\delay` 2 ms)  |                          378/s |                          910/s |    **2.4x**   |
+| `fanout` (100 ms async wait)            |                           18/s |                          281/s |    **15x**    |
+
+> [!TIP]
+> The pattern is consistent: Torque wins when handlers yield to I/O, loses when handlers occupy the OS thread. The `fanout` row is the workload Torque was built for. Pure CPU is not.
+
+**Memory at equivalent throughput** (the production framing):
+
+| Workload                     | Horizon procs for ~280 jobs/sec | Torque procs | Memory savings |
+| ---------------------------- | ------------------------------: | -----------: | -------------: |
+| `fanout` (100 ms async wait) |               ~30 (~2.5 GB RAM) |  2 (~120 MB) |          ~95%  |
+| `async-io` (2 ms wait)       |               ~5  (~400 MB RAM) |  2 (~120 MB) |          ~70%  |
+
+For a queue dominated by external API calls and webhooks, that translates directly to fewer servers, less memory pressure, and headroom to absorb traffic spikes without provisioning ahead of time.
+
+### Benchmarking your own workload
+
+Torque ships with a `torque:bench` command that produces reproducible numbers (jobs/sec, p50/p95/p99 latency) on your actual hardware. Run it before tuning anything: serializer choice, worker count, coroutines per worker. Optimization without numbers is guesswork.
+
+```bash
+# Default mixed workload (80% I/O, 20% CPU), 10k jobs, 4 workers
+php artisan torque:bench
+
+# Specific workload profile
+php artisan torque:bench --workload=payload-large --jobs=10000
+
+# Compare serializers (json vs igbinary), JSON output for diffing
+php artisan torque:bench --workload=payload-large --serializer=json --json=baseline.json
+php artisan torque:bench --workload=payload-large --serializer=igbinary --json=igbinary.json
+jq -s '.[0].results.throughput_per_sec, .[1].results.throughput_per_sec' baseline.json igbinary.json
+```
+
+**Workload profiles**:
+
+| Profile | What it simulates |
+|---|---|
+| `cpu` | Tight hash loop, measures handler-side CPU under Fibers |
+| `io` | `usleep(2 ms)` per job, simulates Redis/HTTP/DB wait |
+| `mixed` (default) | 80% I/O, 20% CPU, realistic web-app queue |
+| `payload-small` | 256 B blob, baseline for serializer overhead |
+| `payload-large` | 64 KiB blob, where serializer choice actually shows |
+
+**Flags**: `--workers`, `--coroutines`, `--jobs`, `--warmup`, `--serializer`, `--json`, `--force`. See `php artisan torque:bench --help` for the full list.
+
+> [!NOTE]
+> The v1 bench command requires `--use-running-master`. Start a torque worker fleet first (`php artisan torque:start`), then run the bench against it. Self-spawning workers from inside the bench command lands in a follow-up release.
+
+For deeper profiling, use [XHProf](https://www.php.net/manual/en/book.xhprof.php) or [Excimer](https://github.com/wikimedia/php-excimer) on a running worker. The bench output tells you whether to bother.
+
+### igbinary: ~2x faster payload encoding
+
+Torque can encode its Redis Streams envelope with [igbinary](https://github.com/igbinary/igbinary7) instead of JSON. Roughly 2x faster on encode and decode, smaller on the wire. Recommended once you have a baseline benchmark to compare against.
+
+**Install** (PECL):
+
+```bash
+pecl install igbinary
+echo "extension=igbinary" | sudo tee -a /etc/php/8.5/cli/php.ini
+echo "extension=igbinary" | sudo tee -a /etc/php/8.5/fpm/php.ini
+```
+
+Or via your distro: `apt install php8.5-igbinary` on Debian/Ubuntu, `brew install php@8.5-igbinary` style packages on macOS.
+
+**Enable** in your `.env`:
+
+```env
+TORQUE_SERIALIZER=igbinary
+```
+
+**Verify** with the bench command:
+
+```bash
+php artisan torque:bench --workload=payload-large --serializer=igbinary
+```
+
+`torque:start` prints `Serializer: igbinary` on boot when active, and a one-line install hint when the extension is missing.
+
+> [!TIP]
+> **Safe to flip while running.** Torque sniffs the first byte of every payload (`{`/`[` for JSON, `\x00\x00\x00\x02` for igbinary), so in-flight messages decoded with the old format keep working. New messages come out as igbinary. Both coexist until the stream organically drains.
+
+> [!WARNING]
+> Igbinary payloads are binary, not human-readable. `redis-cli XRANGE torque:default - +` returns gibberish for the payload field once you flip the switch. Stick with `--serializer=json` (the default) during debugging sessions.
+
+> [!TIP]
+> Setting `igbinary.compact_strings = On` in `php.ini` also speeds up Laravel's session and cache `serialize()` calls globally, even without flipping the torque serializer. Free win across your whole app.
+
 ## Dependencies
 
 **Required** (installed automatically):
@@ -391,6 +565,7 @@ sudo supervisorctl start torque
 **Optional** (install when needed):
 - `webpatser/fledge-fiber-database`: Async MySQL for `MysqlPool`
 - `webpatser/fledge-fiber-http`: Async HTTP for `HttpPool`
+- `ext-igbinary`: ~2x faster payload encoding when `TORQUE_SERIALIZER=igbinary` is set. See [Performance](#performance).
 
 ## License
 

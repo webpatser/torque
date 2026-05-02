@@ -33,9 +33,109 @@ class StreamQueue extends Queue implements QueueContract
         private readonly string $prefix = 'torque:',
         private readonly string $consumerGroup = 'torque',
         private readonly bool $cluster = false,
+        private readonly string $serializer = 'json',
     ) {
         $this->redis = createRedisClient($this->redisUri);
         $this->consumerId = gethostname() . '-' . getmypid();
+    }
+
+    // -------------------------------------------------------------------------
+    //  Serialization
+    // -------------------------------------------------------------------------
+
+    /**
+     * Encode a job payload array using the configured serializer.
+     *
+     * 'json'     : JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR.
+     * 'igbinary' : igbinary_serialize (requires ext-igbinary).
+     */
+    private function encodePayload(array $payload): string
+    {
+        if ($this->serializer === 'igbinary') {
+            return igbinary_serialize($payload);
+        }
+
+        return json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    }
+
+    /**
+     * Re-encode an already-serialized payload string into the configured wire format.
+     *
+     * Laravel's Queue::createPayload always emits JSON, so when the configured
+     * serializer is igbinary we transcode here, just before XADD, to keep the
+     * wire format consistent. No-op for json mode.
+     */
+    private function transcodeIncomingPayload(string $payload): string
+    {
+        if ($this->serializer !== 'igbinary') {
+            return $payload;
+        }
+
+        if ($payload === '' || ($payload[0] ?? '') === "\x00") {
+            // Already non-JSON (likely already igbinary from a re-push). Leave it.
+            return $payload;
+        }
+
+        $decoded = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
+
+        return igbinary_serialize($decoded);
+    }
+
+    /**
+     * Decode a raw payload string by sniffing the format header.
+     *
+     * Static so that {@see \Webpatser\Torque\Worker\WorkerProcess} can call it
+     * without holding a StreamQueue instance.
+     *
+     * @return array<string, mixed>
+     *
+     * @throws \InvalidArgumentException When the format cannot be recognized.
+     * @throws \JsonException When JSON decoding fails.
+     */
+    public static function decodePayload(string $raw): array
+    {
+        if ($raw === '') {
+            throw new \InvalidArgumentException('Unrecognized payload format');
+        }
+
+        $first = $raw[0];
+
+        if ($first === '{' || $first === '[') {
+            return json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+        }
+
+        if (str_starts_with($raw, "\x00\x00\x00\x02")) {
+            $decoded = igbinary_unserialize($raw);
+
+            if (!is_array($decoded)) {
+                throw new \InvalidArgumentException('igbinary payload did not decode to an array');
+            }
+
+            return $decoded;
+        }
+
+        throw new \InvalidArgumentException('Unrecognized payload format');
+    }
+
+    /**
+     * Cheap pre-flight check: does this raw payload look like a payload we can decode?
+     *
+     * Used by {@see \Webpatser\Torque\Worker\WorkerProcess} as a replacement for
+     * the old json_validate() gate, so igbinary blobs are not dropped as corrupt.
+     */
+    public static function isValidPayload(string $raw): bool
+    {
+        if ($raw === '') {
+            return false;
+        }
+
+        try {
+            self::decodePayload($raw);
+
+            return true;
+        } catch (\Throwable) {
+            return false;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -75,6 +175,11 @@ class StreamQueue extends Queue implements QueueContract
     #[\Override]
     public function pushRaw($payload, $queue = null, array $options = []): string
     {
+        // Laravel's Queue::createPayload always emits JSON. When the configured
+        // serializer is igbinary we transcode here so the on-the-wire format
+        // matches the configured serializer.
+        $payload = $this->transcodeIncomingPayload($payload);
+
         $messageId = $this->redis->execute(
             'XADD',
             $this->getStreamKey($queue),
@@ -85,7 +190,7 @@ class StreamQueue extends Queue implements QueueContract
 
         // Record "queued" event to per-job stream.
         try {
-            $decoded = json_decode($payload, true);
+            $decoded = self::decodePayload($payload);
 
             if (isset($decoded['uuid'])) {
                 app(\Webpatser\Torque\Stream\JobStreamRecorder::class)->onQueued(
@@ -128,6 +233,9 @@ class StreamQueue extends Queue implements QueueContract
      */
     private function laterRaw(DateTimeInterface|DateInterval|int $delay, string $payload, ?string $queue = null): string
     {
+        // Same transcode rationale as pushRaw: createPayload emits JSON.
+        $payload = $this->transcodeIncomingPayload($payload);
+
         $score = $this->availableAt($delay);
 
         $this->redis->execute(
@@ -137,7 +245,11 @@ class StreamQueue extends Queue implements QueueContract
             $payload,
         );
 
-        $decoded = json_decode($payload, true);
+        try {
+            $decoded = self::decodePayload($payload);
+        } catch (\Throwable) {
+            return '';
+        }
 
         return $decoded['uuid'] ?? $decoded['id'] ?? '';
     }
@@ -333,9 +445,9 @@ class StreamQueue extends Queue implements QueueContract
         $this->redis->execute('XDEL', $streamKey, $job->messageId);
 
         // Rebuild payload with incremented attempts.
-        $payload = json_decode($job->getRawBody(), true);
+        $payload = self::decodePayload($job->getRawBody());
         $payload['attempts'] = ($payload['attempts'] ?? 0) + 1;
-        $newPayload = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        $newPayload = $this->encodePayload($payload);
 
         if ($delay > 0) {
             (void) $this->laterRaw($delay, $newPayload, $queue);

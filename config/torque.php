@@ -4,6 +4,21 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Payload serializer
+    |--------------------------------------------------------------------------
+    | Controls how the queue envelope is encoded on the wire.
+    |
+    | 'json'     : default, human readable via redis-cli XRANGE.
+    | 'igbinary' : ~2x faster encoding and ~30% smaller payloads. Requires
+    |              ext-igbinary (pecl install igbinary). Binary on the wire,
+    |              so redis-cli output becomes unreadable. Decoding is format
+    |              sniffing, so flipping this value is safe with in-flight
+    |              JSON messages still in the stream.
+    */
+    'serializer' => env('TORQUE_SERIALIZER', 'json'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Worker processes
     |--------------------------------------------------------------------------
     */

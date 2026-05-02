@@ -18,6 +18,7 @@ final class StreamConnector implements ConnectorInterface
      *  - block_for       (int)     Milliseconds XREADGROUP blocks
      *  - prefix          (string)  Key prefix for all Redis keys
      *  - consumer_group  (string)  Consumer group name
+     *  - serializer      (string)  Wire format: 'json' (default) or 'igbinary'
      */
     #[\Override]
     public function connect(array $config): StreamQueue
@@ -34,6 +35,7 @@ final class StreamConnector implements ConnectorInterface
             prefix: $torqueConfig['redis']['prefix'] ?? $config['prefix'] ?? 'torque:',
             consumerGroup: $torqueConfig['consumer_group'] ?? $config['consumer_group'] ?? 'torque',
             cluster: (bool) ($torqueConfig['redis']['cluster'] ?? false),
+            serializer: (string) ($torqueConfig['serializer'] ?? $config['serializer'] ?? 'json'),
         );
     }
 }

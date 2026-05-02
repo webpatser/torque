@@ -56,6 +56,21 @@ class StreamJob extends Job implements JobContract
     }
 
     /**
+     * Decode the job payload.
+     *
+     * Overrides Laravel's base implementation (which assumes JSON) so igbinary
+     * payloads decoded by {@see StreamQueue::decodePayload} flow through the
+     * standard CallQueuedHandler pipeline.
+     *
+     * @return array<string, mixed>
+     */
+    #[\Override]
+    public function payload(): array
+    {
+        return StreamQueue::decodePayload($this->rawBody);
+    }
+
+    /**
      * Get the number of times the job has been attempted.
      *
      * The payload stores a zero-based attempt counter that is incremented on
