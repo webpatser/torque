@@ -26,9 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config/torque.php` adds a top-level `'serializer' => env('TORQUE_SERIALIZER', 'json')` key
 - Compatibility table in the README now reflects what Torque actually does for Eloquent (works, but blocks Fibers; use `MysqlPool` for fan-out) and adds rows for "Per-job event timeline" and "Live job progress" to make those differentiators visible
 
-### Production
-- Validated continuously on gt-tracker.com for ~1 month at time of release. Internal validation only; broader external rollout is a 1.0 prerequisite
-
 ## [0.7.2] - 2026-04-30
 
 ### Added
