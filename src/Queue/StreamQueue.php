@@ -8,7 +8,9 @@ use Fledge\Async\Redis\RedisClient;
 use DateInterval;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
+use Illuminate\Queue\Jobs\InspectedJob;
 use Illuminate\Queue\Queue;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -306,16 +308,7 @@ class StreamQueue extends Queue implements QueueContract
 
         $message = $messages[0];
         $messageId = (string) $message[0];
-        $fields = $message[1];
-
-        // Fields come as a flat list: ['payload', '{json}', ...]
-        $payload = null;
-        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-            if ((string) $fields[$i] === 'payload') {
-                $payload = (string) $fields[$i + 1];
-                break;
-            }
-        }
+        $payload = self::extractPayload($message[1]);
 
         if ($payload === null) {
             // Corrupt message — acknowledge and skip.
@@ -413,6 +406,218 @@ class StreamQueue extends Queue implements QueueContract
         $timestampMs = (int) Str::before($messageId, '-');
 
         return $timestampMs / 1000;
+    }
+
+    /**
+     * Get all pending (waiting) jobs across every queue.
+     *
+     * Stream entries that are not in the consumer group's Pending Entries List
+     * (PEL) — i.e. jobs that have been XADDed but not yet claimed by any
+     * consumer.
+     *
+     * @return Collection<int, InspectedJob>
+     */
+    public function allPendingJobs(): Collection
+    {
+        return $this->allQueueNames()->flatMap(
+            fn (string $name) => $this->pendingJobsForQueue($name),
+        );
+    }
+
+    /**
+     * Get all reserved (in-flight) jobs across every queue.
+     *
+     * Stream entries currently in the consumer group's PEL — jobs that have
+     * been claimed by a consumer but not yet acknowledged. The XPENDING
+     * delivery count is exposed as the inspected job's `attempts`.
+     *
+     * Capped at 1000 entries per queue to bound memory; the per-queue
+     * {@see pendingSize()} is still authoritative for totals.
+     *
+     * @return Collection<int, InspectedJob>
+     */
+    public function allReservedJobs(): Collection
+    {
+        return $this->allQueueNames()->flatMap(
+            fn (string $name) => $this->reservedJobsForQueue($name),
+        );
+    }
+
+    /**
+     * Get all delayed jobs across every queue.
+     *
+     * Entries waiting in the per-queue `:delayed` sorted set, scored by the
+     * unix timestamp at which they become eligible.
+     *
+     * @return Collection<int, InspectedJob>
+     */
+    public function allDelayedJobs(): Collection
+    {
+        return $this->allQueueNames()->flatMap(
+            fn (string $name) => $this->delayedJobsForQueue($name),
+        );
+    }
+
+    /**
+     * Enumerate the configured queue names by scanning the prefix.
+     *
+     * Includes queues that exist only as a `:delayed` sorted set (no stream
+     * yet) and filters out the singleton `paused` flag. Auxiliary suffixes
+     * after the queue name are stripped so a single queue with both a
+     * stream and a `:delayed` set is reported once.
+     *
+     * @return Collection<int, string>
+     */
+    private function allQueueNames(): Collection
+    {
+        /** @var list<string> $keys */
+        $keys = $this->redis->execute('KEYS', $this->prefix . '*') ?: [];
+
+        return (new Collection($keys))
+            ->map(fn (string $key) => Str::after($key, $this->prefix))
+            ->map(fn (string $name) => str_contains($name, ':') ? Str::before($name, ':') : $name)
+            ->reject(fn (string $name) => $name === '' || $name === 'paused')
+            ->map(fn (string $name) => $this->cluster ? trim($name, '{}') : $name)
+            ->unique()
+            ->values();
+    }
+
+    /**
+     * Inspect pending (not yet claimed) entries for a single queue.
+     *
+     * @return Collection<int, InspectedJob>
+     */
+    private function pendingJobsForQueue(string $queue): Collection
+    {
+        $streamKey = $this->getStreamKey($queue);
+
+        /** @var list<array{0: string, 1: list<string>}>|null $entries */
+        $entries = $this->redis->execute('XRANGE', $streamKey, '-', '+');
+
+        if (empty($entries)) {
+            return new Collection;
+        }
+
+        $pendingIds = $this->pelMessageIds($streamKey, count($entries));
+
+        return (new Collection($entries))
+            ->reject(fn (array $entry) => isset($pendingIds[(string) $entry[0]]))
+            ->map(function (array $entry) {
+                $payload = self::extractPayload($entry[1]);
+
+                return $payload === null ? null : InspectedJob::fromPayload($payload);
+            })
+            ->filter()
+            ->values();
+    }
+
+    /**
+     * Inspect reserved (in-flight) entries for a single queue.
+     *
+     * @return Collection<int, InspectedJob>
+     */
+    private function reservedJobsForQueue(string $queue): Collection
+    {
+        $streamKey = $this->getStreamKey($queue);
+
+        $pending = $this->fetchPendingEntries($streamKey, 1000);
+
+        return (new Collection($pending))
+            ->map(function (array $entry) use ($streamKey) {
+                $messageId = (string) $entry[0];
+                $deliveryCount = (int) $entry[3];
+
+                /** @var list<array{0: string, 1: list<string>}>|null $rows */
+                $rows = $this->redis->execute('XRANGE', $streamKey, $messageId, $messageId);
+
+                if (empty($rows)) {
+                    return null;
+                }
+
+                $payload = self::extractPayload($rows[0][1]);
+
+                return $payload === null ? null : InspectedJob::fromPayload($payload, $deliveryCount);
+            })
+            ->filter()
+            ->values();
+    }
+
+    /**
+     * Fetch up to $count entries from the consumer group's PEL.
+     *
+     * Tolerates the NOGROUP error that Redis returns when no consumer has
+     * ever read from the stream (so the group has not been auto-created).
+     * In that case the PEL is by definition empty, so we return an empty list.
+     *
+     * @return list<array{0: string, 1: string, 2: int, 3: int}>
+     */
+    private function fetchPendingEntries(string $streamKey, int $count): array
+    {
+        try {
+            /** @var list<array{0: string, 1: string, 2: int, 3: int}>|null $pending */
+            $pending = $this->redis->execute(
+                'XPENDING',
+                $streamKey,
+                $this->consumerGroup,
+                '-',
+                '+',
+                (string) $count,
+            );
+        } catch (\Throwable $e) {
+            if (str_contains($e->getMessage(), 'NOGROUP')) {
+                return [];
+            }
+
+            throw $e;
+        }
+
+        return $pending ?: [];
+    }
+
+    /**
+     * Build a fast lookup of PEL message IDs for the given stream.
+     *
+     * @return array<string, int>
+     */
+    private function pelMessageIds(string $streamKey, int $count): array
+    {
+        $pending = $this->fetchPendingEntries($streamKey, $count);
+
+        return array_flip(array_map(fn (array $row) => (string) $row[0], $pending));
+    }
+
+    /**
+     * Inspect delayed entries for a single queue.
+     *
+     * @return Collection<int, InspectedJob>
+     */
+    private function delayedJobsForQueue(string $queue): Collection
+    {
+        $delayedKey = $this->getStreamKey($queue) . ':delayed';
+
+        /** @var list<string>|null $payloads */
+        $payloads = $this->redis->execute('ZRANGE', $delayedKey, '0', '-1') ?: [];
+
+        return (new Collection($payloads))
+            ->map(fn (string $payload) => InspectedJob::fromPayload($payload));
+    }
+
+    /**
+     * Extract the `payload` field value from a stream entry's flat field list.
+     *
+     * Returns null when the field is missing (corrupt or non-torque entry).
+     *
+     * @param  array<int, mixed>  $fields  Flat list: ['payload', '{json}', ...]
+     */
+    private static function extractPayload(array $fields): ?string
+    {
+        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
+            if ((string) $fields[$i] === 'payload') {
+                return (string) $fields[$i + 1];
+            }
+        }
+
+        return null;
     }
 
     // -------------------------------------------------------------------------

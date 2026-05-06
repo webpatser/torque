@@ -14,6 +14,8 @@ use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerInterrupted;
+use Illuminate\Queue\Events\WorkerPausing;
+use Illuminate\Queue\Events\WorkerResuming;
 use Revolt\EventLoop;
 use Webpatser\Torque\Metrics\MetricsCollector;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -201,9 +203,11 @@ LUA;
         EventLoop::onSignal(SIGTERM, fn () => $shutdownHandler(SIGTERM));
         EventLoop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
 
-        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState) {
-            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState) {
-                $pauseState->paused = (bool) $redis->execute('EXISTS', $prefix . 'paused');
+        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue) {
+            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue) {
+                $isPaused = (bool) $redis->execute('EXISTS', $prefix . 'paused');
+
+                self::applyPauseTransition($isPaused, $pauseState, $events, $connectionName, $primaryQueue);
             });
         });
 
@@ -638,6 +642,38 @@ LUA;
             } catch (\Throwable $e) {
                 fwrite(STDERR, "[torque:worker] Job interrupted({$signal}) threw: {$e->getMessage()}\n");
             }
+        }
+    }
+
+    /**
+     * Reconcile the pause flag with the latest Redis state and dispatch the
+     * matching Laravel event when it transitions.
+     *
+     * Static so unit tests can drive it without a live event loop. The poller
+     * runs every 2 seconds, so without the transition guard listeners would
+     * receive the event repeatedly while the worker stays paused; the Laravel
+     * 13.8 Worker dispatches once per signal and we match that semantic.
+     */
+    public static function applyPauseTransition(
+        bool $isPaused,
+        \stdClass $pauseState,
+        Dispatcher $events,
+        string $connectionName,
+        ?string $queue,
+    ): void {
+        if ($isPaused === $pauseState->paused) {
+            return;
+        }
+
+        $pauseState->paused = $isPaused;
+
+        try {
+            $events->dispatch($isPaused
+                ? new WorkerPausing($connectionName, $queue)
+                : new WorkerResuming($connectionName, $queue));
+        } catch (\Throwable $e) {
+            $name = $isPaused ? 'WorkerPausing' : 'WorkerResuming';
+            fwrite(STDERR, "[torque:worker] {$name} dispatch failed: {$e->getMessage()}\n");
         }
     }
 

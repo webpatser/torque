@@ -6,9 +6,9 @@
     "type": "library",
     "require": {
         "php": "^8.5",
-        "illuminate/queue": "^12.0|^13.0",
-        "illuminate/console": "^12.0|^13.0",
-        "illuminate/support": "^12.0|^13.0",
+        "illuminate/queue": "^13.8",
+        "illuminate/console": "^13.8",
+        "illuminate/support": "^13.8",
         "revolt/event-loop": "^1.0",
         "livewire/flux": "^2.0",
         "webpatser/fledge-fiber": "^13.4"

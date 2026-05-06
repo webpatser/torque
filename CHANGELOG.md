@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-06
+
+### Added
+- **Laravel 13.8 worker pause/resume events.** `WorkerProcess` now dispatches `Illuminate\Queue\Events\WorkerPausing` and `Illuminate\Queue\Events\WorkerResuming` whenever the Redis-backed pause flag flips. Listeners written for stock Laravel queue workers fire transparently when running on Torque. One dispatch per flip across the 2-second pause poller, not one per tick. Mirrors the `WorkerPausing`/`WorkerResuming` events upstream added in `laravel/framework` 13.8.0 (PR #59895)
+- **Laravel 13.8 queue inspection methods.** `StreamQueue::allPendingJobs()`, `StreamQueue::allReservedJobs()`, and `StreamQueue::allDelayedJobs()` returning `Collection<int, Illuminate\Queue\Jobs\InspectedJob>` aggregated across every queue name. Mirrors the `all*` inspection contract upstream added in `laravel/framework` 13.8.0 (PR #59997). Stream-to-Laravel mapping: pending = stream entries not in the consumer group's PEL, reserved = entries in the PEL with the XPENDING delivery count exposed as `attempts`, delayed = entries in the per-queue `:delayed` ZSET. Reserved aggregation is capped at 1000 per queue to bound memory; per-queue `pendingSize()` remains authoritative for totals
+
+### Changed
+- `WorkerProcess::applyPauseTransition()` extracted as a public static helper so the transition logic can be unit-tested without standing up a live event loop
+- Inline payload-field extraction in `StreamQueue::pop()` extracted to a private static `extractPayload()` helper, reused by the new inspection methods. No behavior change for `pop()`
+- Bumped minimum framework support to `laravel/framework ^13.8` (the version that introduces `WorkerPausing`/`WorkerResuming` and `InspectedJob`)
+
+### Test infrastructure
+- 7 new unit tests in `tests/Unit/Worker/WorkerProcessTest.php` covering the pause/resume transition: false to true, true to false, no-change idempotency, stuck-paused idempotency, full pause-then-resume cycle, custom connection/queue forwarding, and exception swallowing
+- 9 new integration tests in `tests/Integration/StreamQueueInspectionTest.php` covering empty cases, multi-queue aggregation, pending to reserved transition on pop, XPENDING delivery count to `attempts` mapping (using XCLAIM redelivery), delayed-only queues, and aux-key filtering for the `paused` flag and `:delayed` ZSETs
+
 ## [0.8.0] - 2026-05-02
 
 ### Added

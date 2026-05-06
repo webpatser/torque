@@ -268,8 +268,8 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:status` | Show worker metrics, throughput, and queue depths |
 | `torque:monitor` | Live htop-style terminal dashboard |
 | `torque:tail` | Tail a job's event stream in real-time |
-| `torque:pause` | Pause job processing (in-flight jobs complete) |
-| `torque:pause continue` | Resume processing |
+| `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
+| `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
 | `torque:supervisor` | Generate a Supervisor config file |
 
 ## Configuration
@@ -440,6 +440,8 @@ Redis Streams (not LISTs like Horizon) provide:
 | Autoscaling              | Balancing strategies    | Slot-pressure based                   |
 | Per-job event timeline   | Logs + failed-job retry | First-class, live-tailable per UUID   |
 | Live job progress        | Custom code per job     | `$this->emit(...)` via `Streamable`   |
+| Worker pause/resume events | `WorkerPausing` / `WorkerResuming` (13.8) | Same events, dispatched on `torque:pause` flips |
+| Queue inspection (`all*`) | `allPendingJobs` / `allReservedJobs` / `allDelayedJobs` (13.8) | Same API on `StreamQueue` |
 
 ## Production deployment
 
