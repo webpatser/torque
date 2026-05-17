@@ -8,6 +8,7 @@ use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
@@ -15,13 +16,15 @@ use Livewire\Livewire;
 use Webpatser\Torque\Console\TorqueBenchCommand;
 use Webpatser\Torque\Console\TorqueMonitorCommand;
 use Webpatser\Torque\Console\TorquePauseCommand;
-use Webpatser\Torque\Console\TorqueWorkerCommand;
+use Webpatser\Torque\Console\TorqueReloadCommand;
 use Webpatser\Torque\Console\TorqueStartCommand;
 use Webpatser\Torque\Console\TorqueStatusCommand;
 use Webpatser\Torque\Console\TorqueStopCommand;
 use Webpatser\Torque\Console\TorqueSupervisorCommand;
+use Webpatser\Torque\Console\TorqueWorkerCommand;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamConnector;
 use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Stream\JobStreamRecorder;
@@ -36,12 +39,12 @@ final class TorqueServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        $this->mergeConfigFrom(__DIR__ . '/../config/torque.php', 'torque');
+        $this->mergeConfigFrom(__DIR__.'/../config/torque.php', 'torque');
 
-        $this->app->singleton(\Webpatser\Torque\Metrics\MetricsPublisher::class, function ($app) {
+        $this->app->singleton(MetricsPublisher::class, function ($app) {
             $config = $app['config']['torque'];
 
-            return new \Webpatser\Torque\Metrics\MetricsPublisher(
+            return new MetricsPublisher(
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
                 prefix: $config['redis']['prefix'] ?? 'torque:',
             );
@@ -87,20 +90,20 @@ final class TorqueServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $this->publishes([
-            __DIR__ . '/../config/torque.php' => config_path('torque.php'),
+            __DIR__.'/../config/torque.php' => config_path('torque.php'),
         ], 'torque-config');
 
-        /** @var \Illuminate\Queue\QueueManager $manager */
+        /** @var QueueManager $manager */
         $manager = $this->app['queue'];
-        $manager->addConnector('torque', fn (): StreamConnector => new StreamConnector());
+        $manager->addConnector('torque', fn (): StreamConnector => new StreamConnector);
 
-        $this->loadViewsFrom(__DIR__ . '/Dashboard/resources/views', 'torque');
+        $this->loadViewsFrom(__DIR__.'/Dashboard/resources/views', 'torque');
 
         $this->publishes([
-            __DIR__ . '/Dashboard/resources/views' => resource_path('views/vendor/torque'),
+            __DIR__.'/Dashboard/resources/views' => resource_path('views/vendor/torque'),
         ], 'torque-views');
 
-        if (config('torque.dashboard.enabled', false) && class_exists(\Livewire\Livewire::class)) {
+        if (config('torque.dashboard.enabled', false) && class_exists(Livewire::class)) {
             $this->registerDefaultGate();
 
             TorqueDashboardController::register();
@@ -121,6 +124,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorqueStopCommand::class,
                 TorqueStatusCommand::class,
                 TorquePauseCommand::class,
+                TorqueReloadCommand::class,
                 TorqueSupervisorCommand::class,
                 TorqueMonitorCommand::class,
                 Console\TorqueFlushCommand::class,
@@ -152,7 +156,7 @@ final class TorqueServiceProvider extends ServiceProvider
      */
     private function registerLivewireComponents(): void
     {
-        $basePath = __DIR__ . '/Dashboard/resources/views/livewire';
+        $basePath = __DIR__.'/Dashboard/resources/views/livewire';
 
         $components = [
             // Shell
@@ -172,7 +176,7 @@ final class TorqueServiceProvider extends ServiceProvider
         ];
 
         foreach ($components as $alias => $file) {
-            Livewire::addComponent($alias, viewPath: $basePath . '/' . $file . '.wire.php');
+            Livewire::addComponent($alias, viewPath: $basePath.'/'.$file.'.wire.php');
         }
     }
 }

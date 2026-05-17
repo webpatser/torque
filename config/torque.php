@@ -1,5 +1,7 @@
 <?php
 
+use Illuminate\Support\Str;
+
 return [
 
     /*
@@ -58,6 +60,10 @@ return [
     | get this many seconds to finish in-flight jobs before the worker forces
     | exit(0). Guarantees the master sees SIGCHLD and respawns even if a Fiber
     | is stuck inside processMessage() or a half-open Redis socket.
+    |
+    | Also reused by `torque:reload`: when the master receives SIGUSR2, it
+    | pauses pickup, waits this many seconds for in-flight jobs to clear,
+    | and then signals workers to stop.
     */
     'drain_grace_seconds' => (int) env('TORQUE_DRAIN_GRACE', 10),
 
@@ -78,7 +84,7 @@ return [
     */
     'redis' => [
         'uri' => env('TORQUE_REDIS_URI', 'redis://127.0.0.1:6379'),
-        'prefix' => env('TORQUE_PREFIX', 'torque:' . \Illuminate\Support\Str::slug(env('APP_NAME', 'laravel'), '_') . ':'),
+        'prefix' => env('TORQUE_PREFIX', 'torque:'.Str::slug(env('APP_NAME', 'laravel'), '_').':'),
         'cluster' => (bool) env('TORQUE_CLUSTER', false),
     ],
 

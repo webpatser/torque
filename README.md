@@ -270,6 +270,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:tail` | Tail a job's event stream in real-time |
 | `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
 | `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
+| `torque:reload` | Zero-downtime reload. Spawns a replacement master, waits for it to take over the PID file, then drains the old one. `--drain` for supervisor-driven setups |
 | `torque:supervisor` | Generate a Supervisor config file |
 
 ## Configuration
@@ -459,6 +460,22 @@ sudo supervisorctl reread
 sudo supervisorctl update
 sudo supervisorctl start torque
 ```
+
+### Zero-downtime reload
+
+`torque:stop` followed by `torque:start` works for cold deploys, but it leaves a queue-processing gap (jobs queue up in Redis until the new master is back). `torque:reload` swaps the master in one step, with no manual chaining of pause + wait + stop:
+
+```bash
+# Default: spawn a replacement, wait for it to take over the PID file,
+# then drain the old master (pause pickup, wait drain_grace_seconds, SIGTERM).
+php artisan torque:reload
+
+# Signal-only mode for systemd ExecReload= / Kubernetes preStop / Supervisor
+# recipes that own spawning the replacement themselves.
+php artisan torque:reload --drain
+```
+
+In-flight jobs finish naturally on the old master while the new one starts taking new work; the Redis queue handles claim-once semantics across both. Tune the drain window with `TORQUE_DRAIN_GRACE` (default `10` seconds).
 
 ## Performance
 

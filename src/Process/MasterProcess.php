@@ -9,6 +9,8 @@ use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 
+use function Fledge\Async\Redis\createRedisClient;
+
 /**
  * Forks N worker processes and monitors them.
  *
@@ -25,6 +27,17 @@ final class MasterProcess
     private array $scalingDownPids = [];
 
     private bool $shouldStop = false;
+
+    /**
+     * Drain coordination, written by the SIGUSR2 handler and read by the
+     * monitor loop. The signal handler stays minimal; the monitor tick
+     * promotes the request into the {@see $draining} timer.
+     */
+    private bool $drainRequested = false;
+
+    private bool $draining = false;
+
+    private ?float $drainStartedAt = null;
 
     private ?AutoScaler $autoScaler = null;
 
@@ -71,6 +84,15 @@ final class MasterProcess
             $this->signalChildren(SIGTERM);
         });
 
+        // Graceful drain: stop pickup, wait drain_grace_seconds for in-flight
+        // jobs to finish, then SIGTERM workers. Used by `torque:reload`. The
+        // handler stays trivial because the sync-signal path (Linux) reads
+        // the flag from `pcntl_sigtimedwait` and the async path (macOS)
+        // delivers into this same closure.
+        pcntl_signal(SIGUSR2, function () {
+            $this->drainRequested = true;
+        });
+
         $numWorkers = (int) ($this->config['workers'] ?? 4);
 
         ($this->logger)("Starting {$numWorkers} worker processes...");
@@ -98,8 +120,8 @@ final class MasterProcess
             );
 
             ($this->logger)('Autoscaling enabled ('
-                . $autoscaleConfig['min_workers'] . '-' . $autoscaleConfig['max_workers']
-                . ' workers)');
+                .$autoscaleConfig['min_workers'].'-'.$autoscaleConfig['max_workers']
+                .' workers)');
         }
 
         $exitCode = $this->monitor();
@@ -151,7 +173,7 @@ final class MasterProcess
             ]);
 
             // pcntl_exec only returns on failure.
-            fwrite(STDERR, "[Torque] pcntl_exec failed: " . pcntl_get_last_error() . "\n");
+            fwrite(STDERR, '[Torque] pcntl_exec failed: '.pcntl_get_last_error()."\n");
             exit(1);
         }
 
@@ -177,20 +199,22 @@ final class MasterProcess
 
         if ($syncSignals) {
             pcntl_async_signals(false);
-            pcntl_sigprocmask(SIG_BLOCK, [SIGTERM, SIGINT, SIGCHLD]);
+            pcntl_sigprocmask(SIG_BLOCK, [SIGTERM, SIGINT, SIGCHLD, SIGUSR2]);
         }
 
         // Evaluate autoscaling every ~10 iterations (~1 second at 100ms wait).
         $autoscaleTick = 0;
 
-        while (!empty($this->workerPids)) {
+        while (! empty($this->workerPids)) {
             if ($syncSignals) {
                 $info = [];
-                $sig = \pcntl_sigtimedwait([SIGTERM, SIGINT, SIGCHLD], $info, 0, 100_000_000);
+                $sig = \pcntl_sigtimedwait([SIGTERM, SIGINT, SIGCHLD, SIGUSR2], $info, 0, 100_000_000);
 
                 if ($sig === SIGTERM || $sig === SIGINT) {
                     $this->shouldStop = true;
                     $this->signalChildren(SIGTERM);
+                } elseif ($sig === SIGUSR2) {
+                    $this->drainRequested = true;
                 }
             } else {
                 // Async signal handlers registered in start() handle SIGTERM
@@ -222,11 +246,15 @@ final class MasterProcess
                 if (isset($this->scalingDownPids[$pid])) {
                     unset($this->scalingDownPids[$pid]);
                     ($this->logger)("Scaled-down worker PID {$pid} drained and exited.");
-                } elseif (!$this->shouldStop) {
+                } elseif (! $this->shouldStop) {
                     ($this->logger)('Respawning replacement worker...');
                     $this->spawnWorker();
                 }
             }
+
+            // Promote a SIGUSR2 drain request into an active drain timer
+            // and fire its watchdog if the grace period has elapsed.
+            $this->handleDrainTick();
 
             // Autoscale evaluation on a throttled tick.
             if ($this->autoScaler !== null && ++$autoscaleTick >= 10) {
@@ -270,7 +298,7 @@ final class MasterProcess
      */
     private function scaleUp(): void
     {
-        ($this->logger)("Autoscaler: scaling up (workers: {$this->workerCount} -> " . ($this->workerCount + 1) . ')');
+        ($this->logger)("Autoscaler: scaling up (workers: {$this->workerCount} -> ".($this->workerCount + 1).')');
         $this->spawnWorker();
         $this->autoScaler->recordAction();
     }
@@ -304,7 +332,7 @@ final class MasterProcess
         $targetPid = array_key_first($pidActivity);
 
         ($this->logger)("Autoscaler: scaling down (workers: {$this->workerCount} -> "
-            . ($this->workerCount - 1) . "), sending SIGTERM to PID {$targetPid}");
+            .($this->workerCount - 1)."), sending SIGTERM to PID {$targetPid}");
 
         $this->scalingDownPids[$targetPid] = true;
         posix_kill($targetPid, SIGTERM);
@@ -319,6 +347,60 @@ final class MasterProcess
         foreach (array_keys($this->workerPids) as $pid) {
             posix_kill($pid, $signal);
         }
+    }
+
+    /**
+     * Drive the drain state machine on each monitor tick.
+     *
+     * On the first tick after a SIGUSR2, write the Redis `paused` key so
+     * workers stop picking up new jobs (they observe the key on their own
+     * 2s poll) and start the grace timer. Once `drain_grace_seconds` has
+     * elapsed, escalate to the same SIGTERM path `torque:stop` uses; the
+     * workers' own `drain_grace_seconds` then caps how long they wait for
+     * their current job before hard-exiting.
+     */
+    public function handleDrainTick(): void
+    {
+        if ($this->drainRequested && ! $this->draining) {
+            $this->draining = true;
+            $this->drainStartedAt = microtime(true);
+            $this->beginDrain();
+        }
+
+        if ($this->draining && ! $this->shouldStop) {
+            $grace = (int) ($this->config['drain_grace_seconds'] ?? 10);
+
+            if ((microtime(true) - $this->drainStartedAt) >= $grace) {
+                ($this->logger)('Drain grace elapsed, signaling workers to stop.');
+                $this->shouldStop = true;
+                $this->signalChildren(SIGTERM);
+                $this->draining = false;
+            }
+        }
+    }
+
+    /**
+     * Mark workers paused via Redis so they stop picking new jobs.
+     *
+     * Best-effort: if Redis is unreachable we still proceed to the timed
+     * SIGTERM in {@see handleDrainTick}; workers may not see the pause flag
+     * but their own SIGTERM grace lets them finish their current job.
+     */
+    private function beginDrain(): void
+    {
+        $grace = (int) ($this->config['drain_grace_seconds'] ?? 10);
+
+        try {
+            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+            $prefix = $this->config['redis']['prefix'] ?? 'torque:';
+
+            createRedisClient($redisUri)
+                ->execute('SET', $prefix.'paused', (string) time());
+        } catch (\Throwable $e) {
+            ($this->logger)("Drain: failed to set Redis paused key ({$e->getMessage()}); proceeding with timed SIGTERM.");
+        }
+
+        ($this->logger)("Draining: pickup paused, waiting up to {$grace}s for in-flight jobs.");
     }
 
     /**
@@ -352,7 +434,7 @@ final class MasterProcess
             throw new \RuntimeException("Failed to write temporary PID file at {$tmpPath}.");
         }
 
-        if (!rename($tmpPath, $path)) {
+        if (! rename($tmpPath, $path)) {
             @unlink($tmpPath);
             throw new \RuntimeException("Failed to move PID file to {$path}.");
         }
@@ -360,13 +442,24 @@ final class MasterProcess
 
     /**
      * Remove the PID file on shutdown.
+     *
+     * After a zero-downtime reload the replacement master has already
+     * rewritten `storage/torque.pid` with its own PID; the draining old
+     * master must not clobber that, so only unlink when the file still
+     * points at our own PID.
      */
     private function removePidFile(): void
     {
         $path = self::pidFilePath();
 
-        if (file_exists($path) && !is_link($path)) {
-            unlink($path);
+        if (! file_exists($path) || is_link($path)) {
+            return;
+        }
+
+        $pidInFile = (int) @file_get_contents($path);
+
+        if ($pidInFile === getmypid()) {
+            @unlink($path);
         }
     }
 
@@ -377,7 +470,7 @@ final class MasterProcess
     {
         $path = self::pidFilePath();
 
-        if (!file_exists($path) || is_link($path)) {
+        if (! file_exists($path) || is_link($path)) {
             return null;
         }
 

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-17
+
+### Added
+- **`torque:reload` command for zero-downtime CI/CD deploys.** Default mode spawns a replacement master via `proc_open`, waits for it to take over `storage/torque.pid`, then signals the old master via SIGUSR2 to drain (pause pickup, wait for in-flight jobs to settle, SIGTERM workers, exit). `--drain` mode skips the spawn step and only signals; use it from systemd `ExecReload=`, a Kubernetes `preStop` hook, or a Supervisor recipe that owns spawning the replacement. Unlike a Reverb-style websocket reload, there is no socket to share: two masters can run briefly during the swap because the Redis queue claims jobs atomically. Static `$spawner` and `$readinessChecker` callables on `TorqueReloadCommand` are swappable in tests so the orchestrator can be exercised without booting real workers
+- **SIGUSR2 drain handler on the master.** Subscribed alongside the existing SIGTERM/SIGINT handlers; wired into both the sync (`pcntl_sigtimedwait`) and async signal paths. On delivery the master sets a `drainRequested` flag; the next monitor tick promotes it to an active drain, writes the same `{prefix}paused` Redis key that `torque:pause` uses (workers see it on their existing 2s poll), and starts the `drain_grace_seconds` timer. When the timer elapses, the master sends SIGTERM to workers and the existing shutdown path takes over. Reuses `drain_grace_seconds` (default 10s, `TORQUE_DRAIN_GRACE`); no new config key
+
+### Changed
+- `MasterProcess::removePidFile()` now only unlinks `storage/torque.pid` when the file still points at our own PID. After a `torque:reload` swap, the replacement master has already rewritten the file; the draining old master must not clobber that. Symmetric with the fix applied to `webpatser/resonate` in its 0.2.0 release
+- **Verified against Laravel 13.9.0** with no code changes required. The only new queue contract, `Illuminate\Contracts\Queue\PreparesForDispatch`, is a dispatch-time hook resolved by `PendingDispatch`, so it works transparently through Torque's standard `Dispatchable` job dispatch. The other 13.9 queue/worker changes target framework subsystems Torque does not use: `Worker::$timedOutExitCode` and the `queue:pause` / `Worker::$pausable` guard belong to the process-per-job `Illuminate\Queue\Worker` (Torque has its own Fiber worker lifecycle), SQS overflow storage is SQS-only (Torque is a Redis Streams driver), and the `Foundation\Cloud` managed-queue wrapper only activates under `LARAVEL_CLOUD_MANAGED_QUEUES=1`. The `illuminate/* ^13.8` constraint already resolves to 13.9.x, so no version bump. Test suite green on `laravel/framework v13.9.0` + `webpatser/fledge-fiber v13.9.0.0`
+
+### Test infrastructure
+- New `tests/Feature/Commands/TorqueReloadCommandTest.php` (5 cases): no PID file, `--drain` signals SIGUSR2 to the live PID, spawner failure, readiness timeout escalation, full reload completes when readiness reports OK and the old PID drains
+- New `tests/Feature/Process/MasterProcessPidFileTest.php` (10 cases) backfilling the PID-file contract: `readPid` missing / stale-with-auto-unlink / live / symlink-guard, `writePidFile` atomic + symlink-refusal, `removePidFile` own-PID-only unlink plus regression test for the reload swap rule
+- New `tests/Feature/Process/MasterProcessDrainTest.php` (5 cases) pinning the drain state machine: drainRequested promotion, grace-still-running, grace-elapsed-triggers-SIGTERM, idle no-op, no re-promotion while already draining
+- Suite grows from 290 to 310 tests
+
 ## [0.9.0] - 2026-05-06
 
 ### Added
