@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-05-20
+
+### Fixed
+- **`MasterProcess::readPid()` now verifies process identity, not just liveness.** It accepted any live process at the recorded PID as the running master via `posix_kill($pid, 0)`. When `storage/torque.pid` survives a container restart on a bind mount or persistent volume, its PID number is routinely recycled to an unrelated process (php-fpm, the test runner, ...); `torque:start` then aborted with "Torque is already running", `torque:status` reported a phantom master, and `torque:reload` / `torque:flush` / `torque:monitor` were misled the same way. `readPid()` now also confirms the process is a Torque master by checking `/proc/<pid>/cmdline` for `torque:start` before trusting the PID file — a recycled or dead PID is treated as stale, unlinked, and startup proceeds (the existing `pgrep`-based orphan sweep in `torque:start` still handles genuine orphans). On platforms without `/proc` (e.g. macOS) the command line cannot be read, so the check is inconclusive and the liveness test stands alone, matching the previous behaviour.
+
+### Test infrastructure
+- `tests/Feature/Process/MasterProcessPidFileTest.php`: the live-PID happy path now forks a child titled `torque:start` so the `/proc` command-line check recognises it; new case `readPid treats a recycled PID running an unrelated process as stale` pins the regression (Linux-only — skips where `/proc` is absent)
+
 ## [0.10.1] - 2026-05-20
 
 ### Fixed

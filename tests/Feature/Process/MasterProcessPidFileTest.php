@@ -79,10 +79,58 @@ it('readPid returns null and unlinks the file when the pid is stale', function (
         ->and(file_exists(MasterProcess::pidFilePath()))->toBeFalse();
 });
 
-it('readPid returns the live pid when the file points at a running process', function () {
-    file_put_contents(MasterProcess::pidFilePath(), (string) getmypid());
+it('readPid returns the live pid when the file points at a running torque master', function () {
+    // Fork a child that titles itself like a torque master so the
+    // /proc/<pid>/cmdline check recognises it on Linux. On platforms
+    // without /proc the liveness check alone carries the test.
+    $child = pcntl_fork();
+    if ($child === 0) {
+        if (function_exists('cli_set_process_title')) {
+            cli_set_process_title('torque:start');
+        }
+        usleep(800_000);
+        exit(0);
+    }
 
-    expect(MasterProcess::readPid())->toBe(getmypid());
+    file_put_contents(MasterProcess::pidFilePath(), (string) $child);
+    usleep(150_000); // let the child apply its process title
+
+    try {
+        expect(MasterProcess::readPid())->toBe($child);
+    } finally {
+        posix_kill($child, SIGKILL);
+        pcntl_waitpid($child, $status);
+    }
+});
+
+it('readPid treats a recycled PID running an unrelated process as stale', function () {
+    // Regression guard: a stale PID file surviving a container restart
+    // on a bind mount can collide with a recycled PID assigned to an
+    // unrelated process. posix_kill alone would mistake it for a live
+    // master; the command-line check must reject it.
+    if (! is_dir('/proc')) {
+        $this->markTestSkipped('Requires /proc to inspect the process command line.');
+    }
+
+    $child = pcntl_fork();
+    if ($child === 0) {
+        if (function_exists('cli_set_process_title')) {
+            cli_set_process_title('recycled-not-torque');
+        }
+        usleep(800_000);
+        exit(0);
+    }
+
+    file_put_contents(MasterProcess::pidFilePath(), (string) $child);
+    usleep(150_000);
+
+    try {
+        expect(MasterProcess::readPid())->toBeNull()
+            ->and(file_exists(MasterProcess::pidFilePath()))->toBeFalse();
+    } finally {
+        posix_kill($child, SIGKILL);
+        pcntl_waitpid($child, $status);
+    }
 });
 
 it('readPid returns null when the path is a symlink', function () {

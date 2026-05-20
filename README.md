@@ -477,6 +477,10 @@ php artisan torque:reload --drain
 
 In-flight jobs finish naturally on the old master while the new one starts taking new work; the Redis queue handles claim-once semantics across both. Tune the drain window with `TORQUE_DRAIN_GRACE` (default `10` seconds).
 
+### Containerized deployment
+
+When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master — on Linux it checks `/proc/<pid>/cmdline` — so a stale PID file left by a previous container is detected and cleared automatically, even when its number has since been recycled by an unrelated process. No manual `rm storage/torque.pid` is needed between restarts.
+
 ## Performance
 
 ### Fair comparison vs Laravel `queue:work` / Horizon

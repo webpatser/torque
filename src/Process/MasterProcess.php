@@ -480,14 +480,40 @@ final class MasterProcess
             return null;
         }
 
-        // Verify the process is still alive.
-        if (posix_kill($pid, 0)) {
+        // The PID must be alive AND actually be a Torque master. The
+        // command-line check guards against a recycled PID: when a stale
+        // PID file survives a container restart on a bind mount, its
+        // number is often reassigned to an unrelated process (php-fpm,
+        // the test runner, ...) which posix_kill alone cannot tell apart
+        // from a real master.
+        if (posix_kill($pid, 0) && self::processIsTorqueMaster($pid)) {
             return $pid;
         }
 
-        // Stale PID file — clean up.
+        // Stale PID file — dead or recycled PID. Clean up.
         @unlink($path);
 
         return null;
+    }
+
+    /**
+     * Whether the process at the given PID is a Torque master.
+     *
+     * Inspects `/proc/<pid>/cmdline` on Linux. On platforms without
+     * `/proc` (e.g. macOS) the command line cannot be read, so the check
+     * is treated as inconclusive and the caller's liveness check stands
+     * on its own — matching the pre-`/proc` behaviour.
+     */
+    private static function processIsTorqueMaster(int $pid): bool
+    {
+        $cmdlinePath = "/proc/{$pid}/cmdline";
+
+        if (! is_readable($cmdlinePath)) {
+            return true;
+        }
+
+        $cmdline = (string) @file_get_contents($cmdlinePath);
+
+        return str_contains($cmdline, 'torque:start');
     }
 }
