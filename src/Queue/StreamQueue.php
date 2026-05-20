@@ -223,7 +223,7 @@ class StreamQueue extends Queue implements QueueContract
     {
         return $this->enqueueUsing(
             $job,
-            $this->createPayload($job, $this->getQueue($queue), $data),
+            $this->createPayload($job, $this->getQueue($queue), $data, $delay),
             $queue,
             $delay,
             fn (string $payload, ?string $queue, $delay) => $this->laterRaw($delay, $payload, $queue),

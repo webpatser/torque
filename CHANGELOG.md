@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-05-20
+
+### Fixed
+- **`StreamQueue::later()` now records the delay in the job payload.** It called `createPayload()` without the `$delay` argument, so every delayed job was dispatched with `delay => null` in its payload (the actual scheduling still worked via the `:delayed` ZSET score, but anything reading `$payload['delay']` saw `null`). Mirrors the fix Laravel Horizon shipped in [#1759](https://github.com/laravel/horizon/pull/1759).
+
 ## [0.10.0] - 2026-05-17
 
 ### Added

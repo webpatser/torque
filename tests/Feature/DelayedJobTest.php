@@ -53,3 +53,29 @@ it('reports zero delayed jobs when sorted set is empty', function () {
         $this->markTestSkipped('Redis not available: ' . $e->getMessage());
     }
 });
+
+it('records the delay in the payload of a job dispatched via later()', function () {
+    /** @var StreamQueue $queue */
+    $queue = app('queue')->connection('torque');
+
+    try {
+        $redis = $queue->getRedisClient();
+        $delayedKey = 'torque-test:default:delayed';
+        $redis->execute('DEL', $delayedKey);
+
+        (void) $queue->later(120, 'Illuminate\\Queue\\CallQueuedHandler@call', [], 'default');
+
+        $members = $redis->execute('ZRANGE', $delayedKey, '0', '-1');
+        expect($members)->toHaveCount(1);
+
+        $payload = json_decode((string) $members[0], true);
+
+        // Before the fix, later() omitted $delay from createPayload(), so the
+        // payload's delay field was always null even for delayed jobs.
+        expect($payload['delay'])->toBe(120);
+
+        $redis->execute('DEL', $delayedKey);
+    } catch (\Fledge\Async\Redis\RedisException $e) {
+        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    }
+});
