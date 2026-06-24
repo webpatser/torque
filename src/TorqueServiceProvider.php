@@ -22,6 +22,12 @@ use Webpatser\Torque\Console\TorqueStatusCommand;
 use Webpatser\Torque\Console\TorqueStopCommand;
 use Webpatser\Torque\Console\TorqueSupervisorCommand;
 use Webpatser\Torque\Console\TorqueWorkerCommand;
+use Webpatser\Torque\Dashboard\Livewire\Dead;
+use Webpatser\Torque\Dashboard\Livewire\Feed;
+use Webpatser\Torque\Dashboard\Livewire\Inspector;
+use Webpatser\Torque\Dashboard\Livewire\Overview;
+use Webpatser\Torque\Dashboard\Livewire\Queues;
+use Webpatser\Torque\Dashboard\Livewire\Workers;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -103,12 +109,11 @@ final class TorqueServiceProvider extends ServiceProvider
             __DIR__.'/Dashboard/resources/views' => resource_path('views/vendor/torque'),
         ], 'torque-views');
 
-        if (config('torque.dashboard.enabled', false) && class_exists(Livewire::class)) {
+        if (config('torque.dashboard.enabled', false)) {
             $this->registerDefaultGate();
 
             TorqueDashboardController::register();
-
-            $this->registerLivewireComponents();
+            $this->registerDashboardComponents();
         }
 
         // Record job lifecycle events to per-job Redis Streams.
@@ -136,6 +141,28 @@ final class TorqueServiceProvider extends ServiceProvider
     }
 
     /**
+     * Register the dashboard's full-page Livewire components.
+     *
+     * The routes reference the component classes directly, but explicit
+     * registration gives them stable names for `<livewire:torque.*>` usage and
+     * keeps resolution predictable. Guarded so the package degrades gracefully
+     * if Livewire is somehow absent.
+     */
+    private function registerDashboardComponents(): void
+    {
+        if (! class_exists(Livewire::class)) {
+            return;
+        }
+
+        Livewire::component('torque.overview', Overview::class);
+        Livewire::component('torque.workers', Workers::class);
+        Livewire::component('torque.queues', Queues::class);
+        Livewire::component('torque.feed', Feed::class);
+        Livewire::component('torque.inspector', Inspector::class);
+        Livewire::component('torque.dead', Dead::class);
+    }
+
+    /**
      * Register a permissive default `viewTorque` gate.
      *
      * Allows access only in the `local` environment when the host application
@@ -149,34 +176,5 @@ final class TorqueServiceProvider extends ServiceProvider
         }
 
         Gate::define('viewTorque', static fn ($user = null): bool => app()->environment('local'));
-    }
-
-    /**
-     * Register Livewire single-file components for the dashboard.
-     */
-    private function registerLivewireComponents(): void
-    {
-        $basePath = __DIR__.'/Dashboard/resources/views/livewire';
-
-        $components = [
-            // Shell
-            'torque.dashboard-shell' => 'dashboard-shell',
-
-            // Pages
-            'torque.overview-page' => 'pages/overview-page',
-            'torque.jobs-page' => 'pages/jobs-page',
-            'torque.job-inspector-page' => 'pages/job-inspector-page',
-            'torque.streams-page' => 'pages/streams-page',
-            'torque.workers-page' => 'pages/workers-page',
-            'torque.failed-jobs-page' => 'pages/failed-jobs-page',
-            'torque.settings-page' => 'pages/settings-page',
-
-            // Shared components (workers table reused on overview page)
-            'torque.workers-table' => 'workers-table',
-        ];
-
-        foreach ($components as $alias => $file) {
-            Livewire::addComponent($alias, viewPath: $basePath.'/'.$file.'.wire.php');
-        }
     }
 }

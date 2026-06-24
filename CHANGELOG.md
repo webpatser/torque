@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-24
+
+### Changed
+- **Dashboard rewritten from a React SPA to Livewire 4 + Blade.** The dashboard at `/torque` is now a set of full-page Livewire components (overview, workers, queues, feed, inspector, dead-letter) sharing one Blade layout, with `wire:poll` driving live refresh and a Tailwind 4 stylesheet compiled to a self-contained `dist/torque.css`. This drops React, Vite-for-JS, and the `/torque/api/*` JSON layer; Livewire (a new hard dependency, `livewire/livewire ^4`) provides the runtime and bundled Alpine, so applications still need no `npm` step. No Flux or any paid UI library is used. The per-controller JSON shaping moved into reusable `Dashboard\Data\*` read-models that the components consume.
+
 ## [0.11.0] - 2026-06-24
 
 ### Added

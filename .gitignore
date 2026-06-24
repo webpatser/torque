@@ -1,5 +1,7 @@
 /vendor/
 /node_modules/
+.vite/
+node_modules/.vite/
 .phpunit.cache/
 composer.lock
 .env

@@ -3,123 +3,87 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Gate;
+use Webpatser\Torque\Dashboard\TorqueDashboardController;
 
 beforeEach(function () {
-    // Enable the dashboard for these tests.
     config()->set('torque.dashboard.enabled', true);
 
-    // Re-register dashboard routes since the service provider boot
-    // already ran before we changed the config.
-    \Webpatser\Torque\Dashboard\TorqueDashboardController::register();
+    // The service provider boots (and registers routes) before the test body
+    // can tweak config, so re-register to pick up the enabled flag / path.
+    TorqueDashboardController::register();
 });
 
-it('defines the viewTorque gate that defaults to deny', function () {
+it('defines the viewTorque gate that defaults to deny outside local', function () {
     expect(Gate::has('viewTorque'))->toBeTrue();
 
-    // The default gate denies all users.
-    $user = new class
-    {
-        public function getAuthIdentifier(): int
-        {
-            return 1;
-        }
-    };
-
-    expect(Gate::forUser($user)->allows('viewTorque'))->toBeFalse();
+    // The default gate only allows the local environment; the test env denies.
+    expect(Gate::forUser(torqueTestUser())->allows('viewTorque'))->toBeFalse();
 });
 
-it('rejects unauthenticated requests to the dashboard', function () {
-    $response = $this->get('/torque');
-
-    // Without auth the request should never succeed — expect a redirect to
-    // login, an auth error, or an internal error from the unconfigured guard.
-    expect($response->status())->not->toBe(200);
-});
-
-it('denies dashboard access when gate returns false', function () {
-    // Create a minimal authenticatable user.
-    $user = new class implements \Illuminate\Contracts\Auth\Authenticatable
-    {
-        public function getAuthIdentifierName(): string
-        {
-            return 'id';
-        }
-
-        public function getAuthIdentifier(): mixed
-        {
-            return 1;
-        }
-
-        public function getAuthPassword(): string
-        {
-            return '';
-        }
-
-        public function getRememberToken(): ?string
-        {
-            return null;
-        }
-
-        public function setRememberToken($value): void {}
-
-        public function getRememberTokenName(): string
-        {
-            return '';
-        }
-
-        public function getAuthPasswordName(): string
-        {
-            return 'password';
-        }
-    };
-
-    // Gate defaults to deny, so even an authenticated user gets 403.
-    $response = $this->actingAs($user)->get('/torque');
-
-    expect($response->status())->toBe(403);
-});
-
-it('allows dashboard access when gate is overridden to permit', function () {
+it('serves the Livewire overview on the dashboard root', function () {
     Gate::define('viewTorque', fn ($user): bool => true);
 
-    $user = new class implements \Illuminate\Contracts\Auth\Authenticatable
-    {
-        public function getAuthIdentifierName(): string
-        {
-            return 'id';
-        }
+    $response = $this->actingAs(torqueTestUser())->get('/torque');
 
-        public function getAuthIdentifier(): mixed
-        {
-            return 1;
-        }
+    $response->assertOk();
 
-        public function getAuthPassword(): string
-        {
-            return '';
-        }
+    // The Overview full-page component rendered inside the Torque layout.
+    expect($response->getContent())
+        ->toContain('keeps spinning')      // brand tag from the shell
+        ->toContain('Cluster throughput')  // overview-specific copy
+        ->toContain('wire:'); // Livewire directives present
+});
 
-        public function getRememberToken(): ?string
-        {
-            return null;
-        }
+it('serves the inspector for a job deep link', function () {
+    Gate::define('viewTorque', fn ($user): bool => true);
 
-        public function setRememberToken($value): void {}
+    $response = $this->actingAs(torqueTestUser())->get('/torque/jobs/abc');
 
-        public function getRememberTokenName(): string
-        {
-            return '';
-        }
+    $response->assertOk();
 
-        public function getAuthPasswordName(): string
-        {
-            return 'password';
-        }
-    };
+    // The Inspector mounts with the uuid and shows the per-job detail chrome.
+    expect($response->getContent())->toContain('Event stream');
+});
 
-    $response = $this->actingAs($user)->get('/torque');
+it('serves the workers screen', function () {
+    Gate::define('viewTorque', fn ($user): bool => true);
 
-    // The view may not exist in the test environment, but the gate passed.
-    // We accept 200 (view rendered) or 500 (view missing in test env).
-    expect($response->status())->toBeIn([200, 500]);
+    $this->actingAs(torqueTestUser())
+        ->get('/torque/workers')
+        ->assertOk()
+        ->assertSee('Active workers');
+});
+
+it('denies the dashboard when the gate denies', function () {
+    Gate::define('viewTorque', fn ($user): bool => false);
+
+    $this->actingAs(torqueTestUser())
+        ->get('/torque')
+        ->assertForbidden();
+});
+
+it('denies a sub-screen when the gate denies', function () {
+    Gate::define('viewTorque', fn ($user): bool => false);
+
+    $this->actingAs(torqueTestUser())
+        ->get('/torque/dead')
+        ->assertForbidden();
+});
+
+it('requires authentication on the dashboard', function () {
+    Gate::define('viewTorque', fn ($user): bool => true);
+
+    // Unauthenticated: the auth middleware blocks before the gate runs.
+    expect($this->get('/torque')->status())->not->toBe(200);
+});
+
+it('honors a configurable dashboard path', function () {
+    config()->set('torque.dashboard.path', 'admin/queues');
+    TorqueDashboardController::register();
+
+    Gate::define('viewTorque', fn ($user): bool => true);
+
+    $this->actingAs(torqueTestUser())
+        ->get('/admin/queues')
+        ->assertOk();
 });

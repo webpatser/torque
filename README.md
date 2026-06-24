@@ -313,36 +313,35 @@ All options are in `config/torque.php`. Key settings:
 
 ## Dashboard
 
-Torque includes a Livewire 4 + Flux UI Pro dashboard at `/torque` (configurable).
+Torque includes a self-contained dashboard at `/torque` (configurable). It is built with **Livewire 4** and plain Blade + Tailwind, served Horizon/Pulse-style: a set of full-page Livewire components share one Blade layout, and the compiled `dist/torque.css` is inlined into it. Livewire (a hard dependency) ships its own runtime and bundled Alpine through your app, so there is **no React, no Flux, no paid UI library, no host Tailwind or Vite build, and no `npm` step in your application**. Enable it in config:
+
+```php
+'dashboard' => [
+    'enabled' => true,
+],
+```
 
 Features:
 - Real-time metrics (throughput, latency, concurrent jobs, memory)
 - Worker table with coroutine slot usage bars
 - Stream/queue overview with pending and delayed counts
 - Failed jobs list with retry and delete actions (cursor-paginated)
-- Per-job inspector with a timeline of lifecycle events, payload, and exception details
+- Per-job inspector with a timeline of lifecycle events and exception details
+- Live feed with a rolling stream tail and status filters
 - Kibana-style configurable poll interval (1s to 30s, or paused)
-- Exception messages and payloads are scrubbed for secrets before rendering
 
-### Styling the dashboard
+### Assets
 
-The dashboard uses Flux UI Pro + Tailwind utilities, which are compiled from your application's own Vite build. Two things must be in place:
+The dashboard ships pre-built. The compiled `dist/torque.css` lives in the package and is inlined into the layout at request time, so there is nothing to publish and no build step in your application. The behaviour comes from Livewire's own runtime (and bundled Alpine), which your app already loads. If you are working on Torque itself, rebuild the stylesheet with:
 
-1. Install Flux Pro in your host app (you almost certainly already have it):
-   ```css
-   @import '../../vendor/livewire/flux/dist/flux.css';
-   ```
-
-2. Add Torque's views to Tailwind's source scan in `resources/css/app.css`:
-   ```css
-   @source '../../vendor/webpatser/torque/src/Dashboard/resources/views/**/*.php';
-   ```
-
-Without the `@source` line, Tailwind won't generate the classes used inside the dashboard and you'll get an unstyled page.
+```bash
+npm install
+npm run build   # writes dist/torque.css (Tailwind 4)
+```
 
 ### Authorization
 
-The gate `viewTorque` is checked on the dashboard route **and** on every Livewire action (retry, purge, navigate), so the action endpoints cannot be reached by users who would fail the gate. Define it in your `AuthServiceProvider`:
+The gate `viewTorque` is checked on every dashboard route (overview, workers, queues, feed, inspector, dead-letter), so no screen or Livewire action is reachable by users who would fail the gate. Define it in your `AuthServiceProvider`:
 
 ```php
 Gate::define('viewTorque', fn (User $user) => $user->isAdmin());
@@ -437,7 +436,7 @@ Redis Streams (not LISTs like Horizon) provide:
 | Job batches              | Yes                     | Yes                                   |
 | Delayed jobs             | Redis sorted set        | Redis sorted set                      |
 | Redis Cluster            | Yes                     | Yes                                   |
-| Dashboard                | Blade + polling         | Livewire 4 + Flux UI                  |
+| Dashboard                | Blade + polling         | Livewire 4 + Blade, `wire:poll` live  |
 | Autoscaling              | Balancing strategies    | Slot-pressure based                   |
 | Per-job event timeline   | Logs + failed-job retry | First-class, live-tailable per UUID   |
 | Live job progress        | Custom code per job     | `$this->emit(...)` via `Streamable`   |
