@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Queue\Events\WorkerPausing;
 use Illuminate\Queue\Events\WorkerResuming;
@@ -202,4 +204,48 @@ it('swallows dispatcher exceptions so the poller keeps running', function () {
     ob_end_clean();
 
     expect($pauseState->paused)->toBeTrue();
+});
+
+describe('shouldStopRetries', function () {
+    // Unit tests do not boot Testbench, so stand up a bare container for the
+    // app(ExceptionHandler::class) resolution and tear it down afterwards.
+    $bindHandler = function (object $handler): WorkerProcess {
+        $container = new Container;
+        $container->instance(ExceptionHandler::class, $handler);
+        Container::setInstance($container);
+
+        return new WorkerProcess(['redis' => ['uri' => 'redis://127.0.0.1:6379']]);
+    };
+
+    $invoke = function (WorkerProcess $worker, Throwable $e): bool {
+        $method = new ReflectionMethod(WorkerProcess::class, 'shouldStopRetries');
+
+        return $method->invoke($worker, $e);
+    };
+
+    afterEach(fn () => Container::setInstance(null));
+
+    it('stops retries when the handler returns true', function () use ($bindHandler, $invoke) {
+        $handler = new class {
+            public function shouldStopRetries(Throwable $e): bool { return true; }
+        };
+
+        expect($invoke($bindHandler($handler), new RuntimeException('nope')))->toBeTrue();
+    });
+
+    it('keeps retrying when the handler returns false', function () use ($bindHandler, $invoke) {
+        $handler = new class {
+            public function shouldStopRetries(Throwable $e): bool { return false; }
+        };
+
+        expect($invoke($bindHandler($handler), new RuntimeException('retry me')))->toBeFalse();
+    });
+
+    it('keeps retrying when the handler predates shouldStopRetries', function () use ($bindHandler, $invoke) {
+        // A legacy handler (pre-Laravel v13.17.0) has no shouldStopRetries();
+        // the method_exists guard must keep attempt-count behaviour.
+        $handler = new class {};
+
+        expect($invoke($bindHandler($handler), new RuntimeException('legacy')))->toBeFalse();
+    });
 });

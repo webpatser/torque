@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-24
+
+### Added
+- **Honor the exception handler's `dontRetry()` / `dontRetryWhen()` directives (Laravel v13.17.0+).** `WorkerProcess::handleFailure()` now asks the application's exception handler `shouldStopRetries($exception)` before scheduling a retry; a positive verdict fails the job immediately through the existing dead-letter path, regardless of remaining attempts, matching `Illuminate\Queue\Worker`. The call is guarded by `method_exists`, so handlers from older framework versions keep the previous attempt-count behaviour unchanged.
+
 ## [0.10.2] - 2026-05-20
 
 ### Fixed

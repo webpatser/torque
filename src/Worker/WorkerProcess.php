@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Worker;
 
 use Fledge\Async\Redis\RedisClient;
+use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Interruptible;
 use Illuminate\Queue\CallQueuedHandler;
@@ -755,7 +756,10 @@ LUA;
         $streamConfig = $streams[$queueName] ?? [];
         $maxRetries = (int) ($streamConfig['max_retries'] ?? 3);
 
-        if ($job->attempts() < $maxRetries) {
+        // A dontRetry()/dontRetryWhen() verdict from the application's exception
+        // handler (Laravel v13.17.0+) forces immediate failure, no matter how
+        // many attempts remain — matching Illuminate\Queue\Worker.
+        if (! $this->shouldStopRetries($exception) && $job->attempts() < $maxRetries) {
             // Exponential backoff: 2^attempts seconds (2, 4, 8, 16, ...).
             $backoffSeconds = (int) (2 ** $job->attempts());
             $job->release($backoffSeconds);
@@ -799,6 +803,21 @@ LUA;
                 failedAt: $failedAt,
             ));
         }
+    }
+
+    /**
+     * Determine if the application's exception handler wants this exception to
+     * stop job retries (Laravel v13.17.0 dontRetry / dontRetryWhen).
+     *
+     * Guarded by method_exists so handlers from older framework versions —
+     * which have no shouldStopRetries() — keep the attempt-count behaviour.
+     */
+    private function shouldStopRetries(\Throwable $exception): bool
+    {
+        $handler = app(ExceptionHandler::class);
+
+        return method_exists($handler, 'shouldStopRetries')
+            && $handler->shouldStopRetries($exception);
     }
 
     /**
