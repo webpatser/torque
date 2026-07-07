@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Verified against Laravel 13.19.0** with no code changes required. The 13.18/13.19 queue changes target subsystems Torque does not use: the `SqsQueue::bulk()` SendMessageBatch rewrite is SQS-only (Torque is a Redis Streams driver and does not override `bulk()`), the `Queue::registerRollbackCallbacksForJobsThatDispatchAfterCommit()` extraction is a behavior-neutral refactor inherited through the base class, and the new `Release` / updated `FailOnException` / `ThrottlesExceptions` middleware run through the standard `CallQueuedHandler` pipeline Torque already uses. Horizon v5.45.6 through v5.47.2 contains only dashboard, CI, and dependency changes, nothing to mirror. Dependencies refreshed to `laravel/framework v13.19.0` + `webpatser/fledge-fiber v13.19.0.1`; test suite green.
+
 ## [0.12.0] - 2026-06-24
 
 ### Changed
