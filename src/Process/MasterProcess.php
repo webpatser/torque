@@ -93,6 +93,8 @@ final class MasterProcess
             $this->drainRequested = true;
         });
 
+        $this->warnIfPaused();
+
         $numWorkers = (int) ($this->config['workers'] ?? 4);
 
         ($this->logger)("Starting {$numWorkers} worker processes...");
@@ -380,11 +382,41 @@ final class MasterProcess
     }
 
     /**
+     * Surface a pre-existing pause at boot: a master starting into a paused
+     * queue (deliberate `torque:pause`, or a not-yet-expired drain flag)
+     * spawns workers that pick up nothing, which otherwise looks like a
+     * silent hang in the supervisor log.
+     */
+    private function warnIfPaused(): void
+    {
+        try {
+            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+            $prefix = $this->config['redis']['prefix'] ?? 'torque:';
+
+            $paused = (int) createRedisClient($redisUri)
+                ->execute('EXISTS', $prefix.'paused');
+
+            if ($paused === 1) {
+                ($this->logger)('Queue is PAUSED (Redis '.$prefix."paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.");
+            }
+        } catch (\Throwable) {
+            // Boot must not depend on Redis being up; workers retry on their own.
+        }
+    }
+
+    /**
      * Mark workers paused via Redis so they stop picking new jobs.
      *
      * Best-effort: if Redis is unreachable we still proceed to the timed
      * SIGTERM in {@see handleDrainTick}; workers may not see the pause flag
      * but their own SIGTERM grace lets them finish their current job.
+     *
+     * The key carries an expiry (grace + 60s): a drain's pause only needs to
+     * outlive the drain window itself. Without one, the key survives the
+     * master handover -- the draining master exits, the replacement starts,
+     * and nothing ever deletes it, so every reload leaves the whole queue
+     * permanently paused until a manual `torque:pause continue`. A deliberate
+     * `torque:pause` still sets the key without a TTL and is unaffected.
      */
     private function beginDrain(): void
     {
@@ -395,7 +427,7 @@ final class MasterProcess
             $prefix = $this->config['redis']['prefix'] ?? 'torque:';
 
             createRedisClient($redisUri)
-                ->execute('SET', $prefix.'paused', (string) time());
+                ->execute('SET', $prefix.'paused', (string) time(), 'EX', (string) ($grace + 60));
         } catch (\Throwable $e) {
             ($this->logger)("Drain: failed to set Redis paused key ({$e->getMessage()}); proceeding with timed SIGTERM.");
         }
