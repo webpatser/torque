@@ -100,3 +100,18 @@ it('does not re-promote drainRequested while a drain is already in progress', fu
     // drainStartedAt must not be reset by the second request.
     expect(getMasterPrivate($master, 'drainStartedAt'))->toBe($startedAt);
 });
+
+it('sets the paused key with an expiry so a drained-away master cannot leave the queue paused forever', function () {
+    $master = makeMasterUnderTest(['drain_grace_seconds' => 2]);
+    setMasterPrivate($master, 'drainRequested', true);
+
+    $master->handleDrainTick();
+
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $ttl = (int) $redis->execute('TTL', 'torque-drain-test:paused');
+
+    // grace (2s) + 60s buffer; TTL counts down, so anything in (0, 62] is correct.
+    expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(62);
+
+    $redis->execute('DEL', 'torque-drain-test:paused');
+});

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-15
+
+### Fixed
+- **A drain no longer leaves the queue paused forever.** `torque:reload --drain` wrote the `{prefix}paused` Redis key without an expiry; the draining master exits, the supervisor respawns a replacement, and nothing ever deletes the key, so every reload left all workers refusing pickup until a manual `torque:pause continue`. The drain now sets the key with a TTL of `drain_grace_seconds + 60`, long enough to cover the drain window and self-healing after it. A deliberate `torque:pause` still sets the key without a TTL and keeps its stop-until-resumed semantics. The master also logs a clear warning at boot when it starts into a paused queue, so a paused state is visible in the supervisor log instead of looking like a silent hang.
+
 ## [0.11.0] - 2026-06-24
 
 ### Added
