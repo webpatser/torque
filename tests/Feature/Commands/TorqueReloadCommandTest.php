@@ -53,8 +53,13 @@ function spawnSleep(int $seconds = 30): int
 {
     $pipes = [];
 
+    // The helper must pass MasterProcess::readPid()'s identity check, which
+    // requires "torque:start" in /proc/<pid>/cmdline on Linux. The -r source
+    // below carries the marker in argv from exec time (no title-set race).
+    // It deliberately does NOT contain "artisan torque:start", so the pgrep
+    // orphan sweeps in torque:start/torque:stop never target these helpers.
     $proc = proc_open(
-        ['sleep', (string) $seconds],
+        [PHP_BINARY, '-r', 'cli_set_process_title("torque:start"); sleep((int) $argv[1]);', (string) $seconds],
         [
             0 => ['file', '/dev/null', 'r'],
             1 => ['file', '/dev/null', 'a'],

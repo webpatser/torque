@@ -164,8 +164,11 @@ final class TorqueStopCommand extends Command
      */
     private function findOrphanMasters(): array
     {
+        // The first pattern character is bracketed so the `sh -c` wrapper PHP
+        // spawns for exec(), whose own argv contains the pattern text, never
+        // matches itself.
         $output = [];
-        exec('pgrep -f ' . escapeshellarg('artisan torque:start'), $output);
+        exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:start'), $output);
 
         return array_values(array_filter(
             array_map('intval', $output),
@@ -181,7 +184,7 @@ final class TorqueStopCommand extends Command
     private function killOrphanWorkers(): void
     {
         $output = [];
-        exec('pgrep -f ' . escapeshellarg('artisan torque:worker'), $output);
+        exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:worker'), $output);
 
         foreach ($output as $line) {
             $pid = (int) trim($line);

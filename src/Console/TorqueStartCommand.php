@@ -39,9 +39,11 @@ final class TorqueStartCommand extends Command
         }
 
         // Check for orphaned master processes whose PID file was lost (e.g. after deploy).
-        // Kill them automatically so Torque can start cleanly.
+        // Kill them automatically so Torque can start cleanly. The first pattern
+        // character is bracketed so the `sh -c` wrapper PHP spawns for exec(),
+        // whose own argv contains the pattern text, never matches itself.
         $output = [];
-        exec('pgrep -f ' . escapeshellarg('artisan torque:start'), $output);
+        exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:start'), $output);
         $otherMasters = array_filter(
             array_map('intval', $output),
             fn (int $pid) => $pid > 0 && $pid !== getmypid(),
@@ -59,7 +61,7 @@ final class TorqueStartCommand extends Command
 
             // Also kill orphaned workers.
             $workerOutput = [];
-            exec('pgrep -f ' . escapeshellarg('artisan torque:worker'), $workerOutput);
+            exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
             foreach ($workerOutput as $line) {
                 $pid = (int) trim($line);
                 if ($pid > 0 && $pid !== getmypid()) {
