@@ -73,8 +73,7 @@ it('dispatches WorkerInterrupted exactly once with the right signal, connection 
     $worker->notifyInterrupted(SIGTERM, [], app(EventDispatcher::class), 'torque', 'default');
 
     Event::assertDispatchedTimes(WorkerInterrupted::class, 1);
-    Event::assertDispatched(WorkerInterrupted::class, fn (WorkerInterrupted $event) =>
-        $event->signal === SIGTERM
+    Event::assertDispatched(WorkerInterrupted::class, fn (WorkerInterrupted $event) => $event->signal === SIGTERM
         && $event->connectionName === 'torque'
         && $event->queue === 'default');
 });
@@ -82,7 +81,7 @@ it('dispatches WorkerInterrupted exactly once with the right signal, connection 
 it('forwards the signal to running Interruptible commands', function () {
     $worker = new WorkerProcess(['redis' => ['uri' => 'redis://127.0.0.1:6379']]);
 
-    $command = new TorqueInterruptibleSpyJob();
+    $command = new TorqueInterruptibleSpyJob;
     $job = torque_make_stream_job_with_command($command);
 
     $worker->notifyInterrupted(SIGINT, [0 => $job], app(EventDispatcher::class), 'torque', 'default');
@@ -93,7 +92,7 @@ it('forwards the signal to running Interruptible commands', function () {
 it('leaves non-Interruptible commands untouched', function () {
     $worker = new WorkerProcess(['redis' => ['uri' => 'redis://127.0.0.1:6379']]);
 
-    $command = new TorquePlainSpyJob();
+    $command = new TorquePlainSpyJob;
     $job = torque_make_stream_job_with_command($command);
 
     $worker->notifyInterrupted(SIGTERM, [0 => $job], app(EventDispatcher::class), 'torque', 'default');
@@ -118,14 +117,15 @@ it('skips slots whose StreamJob has not yet resolved a handler', function () {
 it('forwards to every in-flight Interruptible across slots without stopping on a thrower', function () {
     $worker = new WorkerProcess(['redis' => ['uri' => 'redis://127.0.0.1:6379']]);
 
-    $first = new TorqueInterruptibleSpyJob();
-    $second = new class implements Interruptible {
+    $first = new TorqueInterruptibleSpyJob;
+    $second = new class implements Interruptible
+    {
         public function interrupted(int $signal): void
         {
             throw new RuntimeException('boom');
         }
     };
-    $third = new TorqueInterruptibleSpyJob();
+    $third = new TorqueInterruptibleSpyJob;
 
     $jobs = [
         0 => torque_make_stream_job_with_command($first),

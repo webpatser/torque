@@ -2,11 +2,12 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     /** @var array<string, array<string, string>> */

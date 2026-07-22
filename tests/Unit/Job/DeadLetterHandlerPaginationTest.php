@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Job\DeadLetterHandler;
 
 function createPaginationHandler(string $prefix): DeadLetterHandler
@@ -17,11 +18,11 @@ function cleanupDeadLetterStream(string $prefix): void
     $redis = \Fledge\Async\Redis\createRedisClient(
         env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
     );
-    $redis->execute('DEL', $prefix . 'dead-letter');
+    $redis->execute('DEL', $prefix.'dead-letter');
 }
 
 it('lists entries before a given cursor ID', function () {
-    $prefix = 'torque-dl-page-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-dl-page-'.bin2hex(random_bytes(4)).':';
     $handler = createPaginationHandler($prefix);
 
     try {
@@ -29,9 +30,9 @@ it('lists entries before a given cursor ID', function () {
         for ($i = 1; $i <= 5; $i++) {
             $handler->handle(
                 queue: 'default',
-                payload: '{"uuid":"page-' . $i . '"}',
-                messageId: '1680000000000-' . $i,
-                exception: new RuntimeException('Error ' . $i),
+                payload: '{"uuid":"page-'.$i.'"}',
+                messageId: '1680000000000-'.$i,
+                exception: new RuntimeException('Error '.$i),
             );
         }
 
@@ -62,13 +63,13 @@ it('lists entries before a given cursor ID', function () {
         }
 
         cleanupDeadLetterStream($prefix);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('returns empty when cursor is before all entries', function () {
-    $prefix = 'torque-dl-page-empty-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-dl-page-empty-'.bin2hex(random_bytes(4)).':';
     $handler = createPaginationHandler($prefix);
 
     try {
@@ -87,13 +88,13 @@ it('returns empty when cursor is before all entries', function () {
         expect($result)->toBe([]);
 
         cleanupDeadLetterStream($prefix);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('respects count limit', function () {
-    $prefix = 'torque-dl-page-limit-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-dl-page-limit-'.bin2hex(random_bytes(4)).':';
     $handler = createPaginationHandler($prefix);
 
     try {
@@ -101,9 +102,9 @@ it('respects count limit', function () {
         for ($i = 1; $i <= 10; $i++) {
             $handler->handle(
                 queue: 'default',
-                payload: '{"uuid":"limit-' . $i . '"}',
-                messageId: '1680000000000-' . $i,
-                exception: new RuntimeException('Error ' . $i),
+                payload: '{"uuid":"limit-'.$i.'"}',
+                messageId: '1680000000000-'.$i,
+                exception: new RuntimeException('Error '.$i),
             );
         }
 
@@ -117,22 +118,22 @@ it('respects count limit', function () {
         expect($second)->toHaveCount(2);
 
         cleanupDeadLetterStream($prefix);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('returns entries in newest-first order', function () {
-    $prefix = 'torque-dl-page-order-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-dl-page-order-'.bin2hex(random_bytes(4)).':';
     $handler = createPaginationHandler($prefix);
 
     try {
         for ($i = 1; $i <= 5; $i++) {
             $handler->handle(
                 queue: 'default',
-                payload: '{"uuid":"order-' . $i . '"}',
-                messageId: '1680000000000-' . $i,
-                exception: new RuntimeException('Error ' . $i),
+                payload: '{"uuid":"order-'.$i.'"}',
+                messageId: '1680000000000-'.$i,
+                exception: new RuntimeException('Error '.$i),
             );
         }
 
@@ -146,13 +147,13 @@ it('returns entries in newest-first order', function () {
         }
 
         cleanupDeadLetterStream($prefix);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('preserves entry structure in paginated results', function () {
-    $prefix = 'torque-dl-page-struct-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-dl-page-struct-'.bin2hex(random_bytes(4)).':';
     $handler = createPaginationHandler($prefix);
 
     try {
@@ -167,7 +168,7 @@ it('preserves entry structure in paginated results', function () {
             queue: 'default',
             payload: '{"uuid":"struct-2"}',
             messageId: '1680000000001-0',
-            exception: new \InvalidArgumentException('Second error'),
+            exception: new InvalidArgumentException('Second error'),
         );
 
         // Get latest entry.
@@ -192,7 +193,7 @@ it('preserves entry structure in paginated results', function () {
         expect($entry['exception_message'])->toBe('Structure test');
 
         cleanupDeadLetterStream($prefix);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

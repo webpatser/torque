@@ -12,7 +12,7 @@ declare(strict_types=1);
 
 $cwd = getcwd();
 $base = $cwd;
-while ($base !== '/' && ! (file_exists($base . '/artisan') && file_exists($base . '/vendor/autoload.php'))) {
+while ($base !== '/' && ! (file_exists($base.'/artisan') && file_exists($base.'/vendor/autoload.php'))) {
     $base = dirname($base);
 }
 if ($base === '/') {
@@ -20,11 +20,12 @@ if ($base === '/') {
     exit(10);
 }
 
-require $base . '/vendor/autoload.php';
-$app = require $base . '/bootstrap/app.php';
-$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+require $base.'/vendor/autoload.php';
+$app = require $base.'/bootstrap/app.php';
+$app->make(Kernel::class)->bootstrap();
 
 use App\Jobs\HorizonBenchJob;
+use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Str;
@@ -72,7 +73,10 @@ for ($i = 0; $i < $warmup; $i++) {
 }
 $deadline = microtime(true) + 60;
 while (Queue::size('default') > 0) {
-    if (microtime(true) > $deadline) { fwrite(STDERR, "Warmup drain timeout.\n"); exit(2); }
+    if (microtime(true) > $deadline) {
+        fwrite(STDERR, "Warmup drain timeout.\n");
+        exit(2);
+    }
     usleep(50000);
 }
 // Brief pause for any in-flight handle() calls to finish
@@ -90,7 +94,10 @@ $enqueueEnd = microtime(true);
 
 $deadline = microtime(true) + max(180, $jobs * 0.5);
 while (Queue::size('default') > 0) {
-    if (microtime(true) > $deadline) { fwrite(STDERR, "Drain timeout.\n"); exit(3); }
+    if (microtime(true) > $deadline) {
+        fwrite(STDERR, "Drain timeout.\n");
+        exit(3);
+    }
     usleep(5000);
 }
 $drainEnd = microtime(true);
@@ -122,7 +129,7 @@ if (count($samples) > 0) {
     sort($samples);
     sort($handles);
     $count = count($samples);
-    $p = fn(float $q) => $samples[(int) floor($q * ($count - 1))];
+    $p = fn (float $q) => $samples[(int) floor($q * ($count - 1))];
     printf(
         "workload=%-15s n=%4d  wall=%.3fs  drain=%.3fs  throughput=%.1f/s  p50=%.1fms  p95=%.1fms  p99=%.1fms  handle_med=%.1fµs  samples=%d\n",
         $workload, $jobs, $wall, $drainOnly, $throughput, $p(0.50), $p(0.95), $p(0.99),

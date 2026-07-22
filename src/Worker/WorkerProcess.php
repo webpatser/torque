@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Worker;
 
 use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Interruptible;
@@ -18,12 +19,12 @@ use Illuminate\Queue\Events\WorkerInterrupted;
 use Illuminate\Queue\Events\WorkerPausing;
 use Illuminate\Queue\Events\WorkerResuming;
 use Revolt\EventLoop;
-use Webpatser\Torque\Metrics\MetricsCollector;
-use Webpatser\Torque\Metrics\MetricsPublisher;
-use Webpatser\Torque\Pool\RedisPool;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
 use Webpatser\Torque\Job\CoroutineContext;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Metrics\MetricsCollector;
+use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Pool\RedisPool;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 
@@ -87,7 +88,7 @@ LUA;
     public function __construct(array $config)
     {
         $this->config = $config;
-        $this->consumerId = gethostname() . '-' . getmypid() . '-' . bin2hex(random_bytes(4));
+        $this->consumerId = gethostname().'-'.getmypid().'-'.bin2hex(random_bytes(4));
     }
 
     /**
@@ -149,10 +150,11 @@ LUA;
 
         // Build cluster-safe stream key (matches StreamQueue::getStreamKey).
         $buildStreamKey = static function (string $queue) use ($prefix, $cluster): string {
-            if ($cluster && !str_contains($queue, '{')) {
-                $queue = '{' . $queue . '}';
+            if ($cluster && ! str_contains($queue, '{')) {
+                $queue = '{'.$queue.'}';
             }
-            return $prefix . $queue;
+
+            return $prefix.$queue;
         };
 
         // Ensure consumer groups exist for all configured queues.
@@ -163,7 +165,7 @@ LUA;
         // Set error handler so uncaught Fiber exceptions are logged instead of exit(255).
         EventLoop::setErrorHandler(function (\Throwable $e) {
             fwrite(STDERR, "[torque:worker] Uncaught in event loop: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
-            fwrite(STDERR, $e->getTraceAsString() . "\n");
+            fwrite(STDERR, $e->getTraceAsString()."\n");
         });
 
         fwrite(STDERR, "[torque:worker] Setup complete, entering event loop\n");
@@ -174,7 +176,7 @@ LUA;
         $startTime = $this->startTime;
 
         // Shared pause flag updated by a timer instead of per-Fiber EXISTS calls.
-        $pauseState = new \stdClass();
+        $pauseState = new \stdClass;
         $pauseState->paused = false;
 
         // Per-slot job-start tracker for the stalled-job watchdog. Indexed by
@@ -206,7 +208,7 @@ LUA;
 
         EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue) {
             $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue) {
-                $isPaused = (bool) $redis->execute('EXISTS', $prefix . 'paused');
+                $isPaused = (bool) $redis->execute('EXISTS', $prefix.'paused');
 
                 self::applyPauseTransition($isPaused, $pauseState, $events, $connectionName, $primaryQueue);
             });
@@ -255,6 +257,7 @@ LUA;
 
                     if ($pauseState->paused) {
                         \Fledge\Async\delay(1.0);
+
                         continue;
                     }
 
@@ -301,6 +304,7 @@ LUA;
                                 }
                             }
                         }
+
                         continue;
                     }
 
@@ -310,12 +314,13 @@ LUA;
 
                     $queueName = $this->resolveQueueName($message['stream'], $prefix);
 
-                    if (!StreamQueue::isValidPayload($message['payload'])) {
+                    if (! StreamQueue::isValidPayload($message['payload'])) {
                         // Corrupt payload, unrecognized format: acknowledge and discard.
                         $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
                         unset($slotStarts[$fiberIndex]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
+
                         continue;
                     }
 
@@ -387,7 +392,7 @@ LUA;
         $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
         $drainStartedAt = null;
         EventLoop::repeat(1.0, function () use (&$drainStartedAt, $drainGrace, $metricsPublisher, $metrics) {
-            if (!$this->hasReachedLimits()) {
+            if (! $this->hasReachedLimits()) {
                 return;
             }
 
@@ -415,7 +420,7 @@ LUA;
             EventLoop::run();
         } catch (\Throwable $e) {
             fwrite(STDERR, "[torque:worker] EventLoop crashed: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
-            fwrite(STDERR, $e->getTraceAsString() . "\n");
+            fwrite(STDERR, $e->getTraceAsString()."\n");
         }
 
         // Remove this worker's metrics key from Redis so it doesn't linger as a ghost.
@@ -428,7 +433,7 @@ LUA;
         $this->isRunning = false;
     }
 
-/**
+    /**
      * Parse the nested XREADGROUP response into a flat message array.
      *
      * @return array{stream: string, id: string, payload: string}|null
@@ -583,7 +588,7 @@ LUA;
                     'id' => $messageId,
                     'payload' => $payload,
                 ];
-            } catch (\Fledge\Async\Redis\RedisException) {
+            } catch (RedisException) {
                 continue;
             }
         }
@@ -628,13 +633,13 @@ LUA;
         foreach ($slotJobs as $job) {
             $resolved = $job->getResolvedJob();
 
-            if (!$resolved instanceof CallQueuedHandler) {
+            if (! $resolved instanceof CallQueuedHandler) {
                 continue;
             }
 
             $command = $resolved->getRunningCommand();
 
-            if (!$command instanceof Interruptible) {
+            if (! $command instanceof Interruptible) {
                 continue;
             }
 
@@ -724,7 +729,7 @@ LUA;
 
         // If the job handler did not explicitly delete, release, or fail the job,
         // treat it as successfully completed.
-        if (!$job->isDeleted() && !$job->isReleased() && !$job->hasFailed()) {
+        if (! $job->isDeleted() && ! $job->isReleased() && ! $job->hasFailed()) {
             $job->delete();
         }
 
@@ -839,7 +844,7 @@ LUA;
 
             foreach ($queues as $queue) {
                 $streamKey = $buildStreamKey($queue);
-                $delayedKey = $streamKey . ':delayed';
+                $delayedKey = $streamKey.':delayed';
 
                 /** @var int|null $migrated */
                 $migrated = $redis->execute(

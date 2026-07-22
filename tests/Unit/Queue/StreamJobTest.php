@@ -7,7 +7,7 @@ use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 
 beforeEach(function () {
-    $this->container = new Container();
+    $this->container = new Container;
     $this->streamQueue = Mockery::mock(StreamQueue::class);
 });
 

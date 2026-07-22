@@ -17,7 +17,7 @@ it('exposes the raw connection via property hook', function () {
 });
 
 it('exposes complex objects via the raw property hook', function () {
-    $object = new stdClass();
+    $object = new stdClass;
     $object->name = 'test';
 
     $pool = new ConnectionPool(fn () => $object, maxSize: 1);

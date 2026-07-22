@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
 
@@ -26,10 +27,10 @@ function cleanupRedisKeys(MetricsPublisher $publisher, string $prefix, array $wo
         ->invoke($publisher);
 
     foreach ($workerIds as $id) {
-        $redis->execute('DEL', $prefix . 'worker:' . $id);
+        $redis->execute('DEL', $prefix.'worker:'.$id);
     }
 
-    $redis->execute('DEL', $prefix . 'metrics');
+    $redis->execute('DEL', $prefix.'metrics');
 }
 
 function makeSnapshot(
@@ -83,8 +84,8 @@ it('publishes worker metrics to Redis hash with correct fields', function () {
             ->and($metrics['memory_bytes'])->toBe('1048576');
 
         cleanupRedisKeys($publisher, $prefix, ['worker-1']);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -100,14 +101,14 @@ it('sets TTL on worker metrics key', function () {
             ->getMethod('getRedis')
             ->invoke($publisher);
 
-        $ttl = (int) $redis->execute('TTL', $prefix . 'worker:worker-ttl');
+        $ttl = (int) $redis->execute('TTL', $prefix.'worker:worker-ttl');
 
         // HEARTBEAT_TTL_SECONDS is 60; TTL should be between 1 and 60.
         expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(60);
 
         cleanupRedisKeys($publisher, $prefix, ['worker-ttl']);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -126,8 +127,8 @@ it('reads back published worker metrics', function () {
             ->and($metrics['jobs_failed'])->toBe('5');
 
         cleanupRedisKeys($publisher, $prefix, ['worker-read']);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -152,8 +153,8 @@ it('returns all worker metrics', function () {
         expect($all['w3']['jobs_processed'])->toBe('30');
 
         cleanupRedisKeys($publisher, $prefix, ['w1', 'w2', 'w3']);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -197,9 +198,9 @@ it('publishes aggregated metrics', function () {
         $redis = (new ReflectionClass($publisher))
             ->getMethod('getRedis')
             ->invoke($publisher);
-        $redis->execute('DEL', $prefix . 'metrics');
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+        $redis->execute('DEL', $prefix.'metrics');
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -222,9 +223,9 @@ it('reads back aggregated metrics', function () {
         $redis = (new ReflectionClass($publisher))
             ->getMethod('getRedis')
             ->invoke($publisher);
-        $redis->execute('DEL', $prefix . 'metrics');
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+        $redis->execute('DEL', $prefix.'metrics');
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -236,8 +237,8 @@ it('returns null when no worker metrics exist', function () {
         $metrics = $publisher->getWorkerMetrics('nonexistent-worker');
 
         expect($metrics)->toBeNull();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -249,8 +250,8 @@ it('returns empty array when no aggregated metrics exist', function () {
         $metrics = $publisher->getAggregatedMetrics();
 
         expect($metrics)->toBeArray()->toBeEmpty();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -262,7 +263,7 @@ it('returns empty array from getAllWorkerMetrics when no workers exist', functio
         $all = $publisher->getAllWorkerMetrics();
 
         expect($all)->toBeArray()->toBeEmpty();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

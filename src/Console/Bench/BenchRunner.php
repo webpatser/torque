@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console\Bench;
 
 use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Support\Str;
+use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamQueue;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -20,7 +22,7 @@ use function Fledge\Async\Redis\createRedisClient;
  *     {@see BenchAggregator} until `--jobs` results are observed.
  *  4. Cleanup the per-run streams on exit.
  *
- * Worker spawning is OUT OF SCOPE for v1: {@see \Webpatser\Torque\Process\MasterProcess}
+ * Worker spawning is OUT OF SCOPE for v1: {@see MasterProcess}
  * uses `pcntl_exec` to launch `torque:worker` artisan processes which re-read
  * `config('torque')` from disk, so a child cannot pick up an in-memory config
  * override (e.g. a different consumer group or serializer). v1 therefore
@@ -52,7 +54,7 @@ final class BenchRunner
      */
     public function run(): array
     {
-        $aggregator = new BenchAggregator();
+        $aggregator = new BenchAggregator;
         $redis = $this->resolveRedis();
         $resultsStream = "torque-bench:{$this->runId}:results";
 
@@ -142,7 +144,7 @@ final class BenchRunner
     {
         try {
             $redis->execute('XGROUP', 'CREATE', $stream, $group, '0', 'MKSTREAM');
-        } catch (\Fledge\Async\Redis\RedisException $e) {
+        } catch (RedisException $e) {
             if (! str_contains($e->getMessage(), 'BUSYGROUP')) {
                 throw $e;
             }
@@ -210,7 +212,7 @@ final class BenchRunner
     private function tailResults(RedisClient $redis, string $stream, BenchAggregator $aggregator): void
     {
         $observed = 0;
-        $consumerId = 'bench-' . getmypid();
+        $consumerId = 'bench-'.getmypid();
         $deadlineSeconds = max(60, $this->jobs);
         $started = microtime(true);
 
@@ -218,7 +220,7 @@ final class BenchRunner
             if (microtime(true) - $started > $deadlineSeconds) {
                 throw new \RuntimeException(
                     "Bench timed out: observed {$observed}/{$this->jobs} results in {$deadlineSeconds}s. "
-                    . 'Is `php artisan torque:start` running with the bench-isolated config?',
+                    .'Is `php artisan torque:start` running with the bench-isolated config?',
                 );
             }
 

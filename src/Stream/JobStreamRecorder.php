@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Stream;
 
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
@@ -23,7 +24,7 @@ use function Fledge\Async\Redis\createRedisClient;
  */
 final class JobStreamRecorder
 {
-    private ?\Fledge\Async\Redis\RedisClient $redis = null;
+    private ?RedisClient $redis = null;
 
     public function __construct(
         private readonly string $redisUri,
@@ -58,7 +59,7 @@ final class JobStreamRecorder
         $this->record($uuid, 'started', [
             'queue' => $event->job->getQueue() ?? 'default',
             'attempt' => (string) $event->job->attempts(),
-            'worker' => gethostname() . '-' . getmypid(),
+            'worker' => gethostname().'-'.getmypid(),
         ]);
     }
 
@@ -151,7 +152,7 @@ final class JobStreamRecorder
 
         try {
             $redis = $this->getRedis();
-            $key = $this->prefix . 'job:' . $uuid;
+            $key = $this->prefix.'job:'.$uuid;
             $now = time();
 
             $args = [
@@ -170,8 +171,8 @@ final class JobStreamRecorder
             $redis->execute('XADD', ...$args);
 
             // Indexes: all recent jobs, and active (non-terminal) jobs.
-            $recentKey = $this->prefix . 'jobs:recent';
-            $activeKey = $this->prefix . 'jobs:active';
+            $recentKey = $this->prefix.'jobs:recent';
+            $activeKey = $this->prefix.'jobs:active';
 
             $redis->execute('ZADD', $recentKey, (string) $now, $uuid);
 
@@ -187,8 +188,8 @@ final class JobStreamRecorder
             // unbounded when many short-lived jobs run.
             if (random_int(0, 99) === 0) {
                 $cutoff = (string) ($now - $this->ttl);
-                $redis->execute('ZREMRANGEBYSCORE', $recentKey, '-inf', '(' . $cutoff);
-                $redis->execute('ZREMRANGEBYSCORE', $activeKey, '-inf', '(' . $cutoff);
+                $redis->execute('ZREMRANGEBYSCORE', $recentKey, '-inf', '('.$cutoff);
+                $redis->execute('ZREMRANGEBYSCORE', $activeKey, '-inf', '('.$cutoff);
             }
         } catch (\Throwable) {
             // Never let stream recording break job processing.
@@ -213,7 +214,7 @@ final class JobStreamRecorder
         return null;
     }
 
-    private function getRedis(): \Fledge\Async\Redis\RedisClient
+    private function getRedis(): RedisClient
     {
         return $this->redis ??= createRedisClient($this->redisUri);
     }

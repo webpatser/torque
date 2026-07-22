@@ -22,7 +22,7 @@ final class CoroutineContext
 
     public static function init(): void
     {
-        self::$storage ??= new \WeakMap();
+        self::$storage ??= new \WeakMap;
     }
 
     /**
@@ -31,7 +31,9 @@ final class CoroutineContext
     public static function set(string $key, mixed $value): void
     {
         $fiber = \Fiber::getCurrent();
-        if ($fiber === null) return; // Not in a Fiber — no isolation needed.
+        if ($fiber === null) {
+            return;
+        } // Not in a Fiber — no isolation needed.
 
         self::$storage[$fiber] ??= [];
         $data = self::$storage[$fiber];
@@ -45,7 +47,9 @@ final class CoroutineContext
     public static function get(string $key, mixed $default = null): mixed
     {
         $fiber = \Fiber::getCurrent();
-        if ($fiber === null) return $default;
+        if ($fiber === null) {
+            return $default;
+        }
 
         return self::$storage[$fiber][$key] ?? $default;
     }
@@ -56,7 +60,9 @@ final class CoroutineContext
     public static function has(string $key): bool
     {
         $fiber = \Fiber::getCurrent();
-        if ($fiber === null) return false;
+        if ($fiber === null) {
+            return false;
+        }
 
         return isset(self::$storage[$fiber][$key]);
     }
@@ -67,7 +73,9 @@ final class CoroutineContext
     public static function forget(string $key): void
     {
         $fiber = \Fiber::getCurrent();
-        if ($fiber === null) return;
+        if ($fiber === null) {
+            return;
+        }
 
         if (isset(self::$storage[$fiber])) {
             $data = self::$storage[$fiber];
@@ -82,7 +90,9 @@ final class CoroutineContext
     public static function flush(): void
     {
         $fiber = \Fiber::getCurrent();
-        if ($fiber === null) return;
+        if ($fiber === null) {
+            return;
+        }
 
         unset(self::$storage[$fiber]);
     }

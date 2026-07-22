@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 
@@ -11,7 +12,7 @@ it('increments attempts on release', function () {
 
     try {
         // Use a unique queue to avoid interference from other tests.
-        $testQueue = 'retry-test-' . bin2hex(random_bytes(4));
+        $testQueue = 'retry-test-'.bin2hex(random_bytes(4));
 
         $payload = json_encode([
             'uuid' => 'retry-test-1',
@@ -44,8 +45,8 @@ it('increments attempts on release', function () {
         expect($reEnqueued->attempts())->toBe(2); // 1 + 1
 
         $reEnqueued->delete();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -54,7 +55,7 @@ it('can acknowledge and delete a job', function () {
     $queue = app('queue')->connection('torque');
 
     try {
-        $testQueue = 'delete-test-' . bin2hex(random_bytes(4));
+        $testQueue = 'delete-test-'.bin2hex(random_bytes(4));
 
         $messageId = $queue->pushRaw(json_encode([
             'uuid' => 'delete-test-1',
@@ -70,7 +71,7 @@ it('can acknowledge and delete a job', function () {
 
         $sizeAfter = $queue->size($testQueue);
         expect($sizeAfter)->toBeLessThan($sizeBefore);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

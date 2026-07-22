@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Queue\StreamQueue;
 
 it('dispatches multiple jobs for batch processing', function () {
@@ -33,7 +34,7 @@ it('dispatches multiple jobs for batch processing', function () {
         foreach ($ids as $id) {
             $queue->deleteAndAcknowledge('default', $id);
         }
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Queue\StreamQueue;
 
 it('stores delayed jobs in sorted set', function () {
@@ -34,8 +35,8 @@ it('stores delayed jobs in sorted set', function () {
 
         // Clean up.
         $redis->execute('ZREM', $delayedKey, $payload);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -49,8 +50,8 @@ it('reports zero delayed jobs when sorted set is empty', function () {
 
         $size = $queue->delayedSize('fresh-queue');
         expect($size)->toBe(0);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -75,7 +76,7 @@ it('records the delay in the payload of a job dispatched via later()', function 
         expect($payload['delay'])->toBe(120);
 
         $redis->execute('DEL', $delayedKey);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

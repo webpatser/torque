@@ -24,7 +24,7 @@ it('readPid returns null when no pid file exists', function () {
 
 it('readPid returns null for symlinks', function () {
     $path = MasterProcess::pidFilePath();
-    $tmpFile = $path . '.symlink-test';
+    $tmpFile = $path.'.symlink-test';
 
     // Clean up any previous test artifacts.
     if (is_link($path)) {
@@ -87,7 +87,7 @@ it('writePidFile refuses to start when the PID path is a symlink', function () {
         $reflection->invoke($master);
 
         expect(false)->toBeTrue('writePidFile should have thrown');
-    } catch (\RuntimeException $e) {
+    } catch (RuntimeException $e) {
         expect($e->getMessage())->toContain('symlink');
     } finally {
         if (is_link($path)) {

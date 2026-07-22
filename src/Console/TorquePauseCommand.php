@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -35,7 +36,7 @@ final class TorquePauseCommand extends Command
 
         $redis = createRedisClient($redisUri);
 
-        $pausedKey = $prefix . 'paused';
+        $pausedKey = $prefix.'paused';
         $action = $this->argument('action');
 
         if (! in_array($action, ['pause', 'continue', 'toggle'], true)) {
@@ -79,7 +80,7 @@ final class TorquePauseCommand extends Command
             $result = $redis->execute('EXISTS', $key);
 
             return (int) $result === 1;
-        } catch (\Fledge\Async\Redis\RedisException) {
+        } catch (RedisException) {
             return false;
         }
     }

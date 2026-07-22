@@ -6,7 +6,6 @@ use Webpatser\Torque\Pool\PooledConnection;
 use Webpatser\Torque\Pool\RedisPool;
 
 use function Fledge\Async\async;
-use function Fledge\Async\Future\await;
 
 beforeEach(function () {
     try {
@@ -18,7 +17,7 @@ beforeEach(function () {
         // Verify connectivity by checking out and releasing a connection.
         $conn = $this->pool->checkout();
         $conn->release();
-    } catch (\Throwable) {
+    } catch (Throwable) {
         $this->markTestSkipped('Redis is not available at 127.0.0.1:6379');
     }
 });

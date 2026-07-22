@@ -38,9 +38,9 @@ final class MysqlPool
     private MysqlConnectionPool $inner;
 
     /**
-     * @param string $dsn            DSN string accepted by MysqlConfig::fromString(),
-     *                               e.g. "host=localhost user=root password=secret db=myapp".
-     * @param int    $maxConnections Maximum number of concurrent MySQL connections.
+     * @param  string  $dsn  DSN string accepted by MysqlConfig::fromString(),
+     *                       e.g. "host=localhost user=root password=secret db=myapp".
+     * @param  int  $maxConnections  Maximum number of concurrent MySQL connections.
      */
     public function __construct(
         public private(set) string $dsn,
@@ -106,8 +106,7 @@ final class MysqlPool
      *
      * @template T
      *
-     * @param \Closure(MysqlConnectionPool): T $callback  Receives the inner amphp pool.
-     *
+     * @param  \Closure(MysqlConnectionPool): T  $callback  Receives the inner amphp pool.
      * @return T
      */
     public function use(\Closure $callback): mixed

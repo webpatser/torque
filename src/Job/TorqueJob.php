@@ -9,6 +9,9 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Webpatser\Torque\Pool\HttpPool;
+use Webpatser\Torque\Pool\MysqlPool;
+use Webpatser\Torque\Pool\RedisPool;
 
 /**
  * Base class for jobs that leverage Torque's async I/O pools.
@@ -43,9 +46,9 @@ use Illuminate\Queue\SerializesModels;
  *
  * Available pools (registered as singletons by TorqueServiceProvider):
  *
- * - {@see \Webpatser\Torque\Pool\RedisPool}  — async Redis via amphp/redis
- * - {@see \Webpatser\Torque\Pool\MysqlPool}  — async MySQL via amphp/mysql
- * - {@see \Webpatser\Torque\Pool\HttpPool}   — concurrency-limited HTTP via amphp/http-client
+ * - {@see RedisPool}  — async Redis via amphp/redis
+ * - {@see MysqlPool}  — async MySQL via amphp/mysql
+ * - {@see HttpPool}   — concurrency-limited HTTP via amphp/http-client
  */
 abstract class TorqueJob implements ShouldQueue
 {

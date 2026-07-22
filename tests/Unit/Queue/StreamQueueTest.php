@@ -88,6 +88,6 @@ it('produces correct delayed key in cluster mode', function () {
         cluster: true,
     );
 
-    $delayedKey = $queue->getStreamKey() . ':delayed';
+    $delayedKey = $queue->getStreamKey().':delayed';
     expect($delayedKey)->toBe('app:{default}:delayed');
 });

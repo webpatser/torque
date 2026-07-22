@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 use Webpatser\Torque\Job\DeadLetterHandler;
-use Webpatser\Torque\Support\PayloadSanitizer;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     public int $perPage = 50;
@@ -38,7 +38,7 @@ new class extends Component {
             $this->error = null;
 
             return $handler->list($this->perPage);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             report($e);
             $this->error = 'Failed to load dead-letter entries.';
 
@@ -51,7 +51,7 @@ new class extends Component {
     {
         try {
             return $this->handler()->count();
-        } catch (\Throwable) {
+        } catch (Throwable) {
             return 0;
         }
     }
@@ -66,7 +66,7 @@ new class extends Component {
     {
         $jobs = $this->failedJobs;
 
-        if (!empty($jobs)) {
+        if (! empty($jobs)) {
             $this->cursor = end($jobs)['id'];
         }
 
@@ -89,7 +89,7 @@ new class extends Component {
         try {
             $this->handler()->retry($id);
             $this->successMessage = 'Job retried successfully.';
-        } catch (\RuntimeException $e) {
+        } catch (RuntimeException $e) {
             report($e);
             $this->error = 'Retry failed.';
         }
@@ -118,7 +118,7 @@ new class extends Component {
                 try {
                     $handler->retry($job['id']);
                     $retried++;
-                } catch (\RuntimeException) {
+                } catch (RuntimeException) {
                     $failed++;
                     // Skip this entry on next iteration by purging: we can't
                     // retry it, and leaving it would cause an infinite loop.
@@ -127,7 +127,7 @@ new class extends Component {
             }
         }
 
-        $this->successMessage = "Retried {$retried} jobs." . ($failed > 0 ? " {$failed} failed." : '');
+        $this->successMessage = "Retried {$retried} jobs.".($failed > 0 ? " {$failed} failed." : '');
         $this->confirmingRetryAll = false;
         $this->expandedId = null;
         $this->cursor = null;

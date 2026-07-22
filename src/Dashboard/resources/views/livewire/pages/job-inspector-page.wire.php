@@ -2,12 +2,14 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
+use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Support\PayloadSanitizer;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     public string $uuid;
@@ -98,16 +100,16 @@ new class extends Component {
         $diffMs = $diffNs / 1_000_000;
 
         if ($diffMs < 1000) {
-            return number_format($diffMs, 1) . 'ms';
+            return number_format($diffMs, 1).'ms';
         }
 
         $diffS = $diffMs / 1000;
 
         if ($diffS < 60) {
-            return number_format($diffS, 1) . 's';
+            return number_format($diffS, 1).'s';
         }
 
-        return number_format($diffS / 60, 1) . 'm';
+        return number_format($diffS / 60, 1).'m';
     }
 
     #[Computed]
@@ -129,7 +131,7 @@ new class extends Component {
             if ($event['type'] === 'completed' && isset($event['data']['memory_bytes'])) {
                 $mb = (int) $event['data']['memory_bytes'] / 1_048_576;
 
-                return number_format($mb, 1) . ' MB';
+                return number_format($mb, 1).' MB';
             }
         }
 
@@ -168,11 +170,11 @@ new class extends Component {
     private function loadEvents(): void
     {
         try {
-            $stream = app(\Webpatser\Torque\Stream\JobStream::class);
+            $stream = app(JobStream::class);
             $this->events = $stream->events($this->uuid);
             $this->finished = $stream->isFinished($this->uuid);
             $this->error = null;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             report($e);
             $this->error = 'Failed to load job events.';
         }

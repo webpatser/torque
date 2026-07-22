@@ -35,7 +35,7 @@ final class AutoScaler
      *
      * @param  int  $currentWorkers  Number of active worker processes.
      * @param  array<int, array{active: int, total: int}>  $workerMetrics  Per-worker slot usage.
-     *     Each entry has `active` (slots currently processing a job) and `total` (max slots).
+     *                                                                     Each entry has `active` (slots currently processing a job) and `total` (max slots).
      */
     #[\NoDiscard]
     public function evaluate(int $currentWorkers, array $workerMetrics): ScaleDecision

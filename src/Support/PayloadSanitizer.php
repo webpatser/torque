@@ -85,11 +85,13 @@ final class PayloadSanitizer
         foreach ($payload as $key => $value) {
             if (is_string($key) && self::isSecretKey($key)) {
                 $payload[$key] = self::REDACTION;
+
                 continue;
             }
 
             if (is_array($value)) {
                 $payload[$key] = self::sanitizePayload($value);
+
                 continue;
             }
 

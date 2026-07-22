@@ -1,6 +1,7 @@
 <?php
 
 declare(strict_types=1);
+use Fledge\Async\Redis\RedisException;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -15,7 +16,7 @@ use function Fledge\Async\Redis\createRedisClient;
 |
 */
 
-$testPrefix = 'torque-atomicity-test-' . bin2hex(random_bytes(4)) . ':';
+$testPrefix = 'torque-atomicity-test-'.bin2hex(random_bytes(4)).':';
 
 $luaMigrateDelayed = <<<'LUA'
 local entries = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
@@ -30,17 +31,17 @@ LUA;
 afterEach(function () use ($testPrefix) {
     try {
         $redis = createRedisClient(env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'));
-        $redis->execute('DEL', $testPrefix . 'default');
-        $redis->execute('DEL', $testPrefix . 'default:delayed');
-    } catch (\Fledge\Async\Redis\RedisException) {
+        $redis->execute('DEL', $testPrefix.'default');
+        $redis->execute('DEL', $testPrefix.'default:delayed');
+    } catch (RedisException) {
         // Best-effort cleanup.
     }
 });
 
 it('does not duplicate jobs when multiple workers migrate simultaneously', function () use ($testPrefix, $luaMigrateDelayed) {
     $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
-    $delayedKey = $testPrefix . 'default:delayed';
-    $streamKey = $testPrefix . 'default';
+    $delayedKey = $testPrefix.'default:delayed';
+    $streamKey = $testPrefix.'default';
 
     try {
         $redis = createRedisClient($redisUri);
@@ -79,15 +80,15 @@ it('does not duplicate jobs when multiple workers migrate simultaneously', funct
         // The delayed set should be empty.
         $remaining = (int) $redis->execute('ZCARD', $delayedKey);
         expect($remaining)->toBe(0);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('handles empty delayed set gracefully', function () use ($testPrefix, $luaMigrateDelayed) {
     $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
-    $delayedKey = $testPrefix . 'default:delayed';
-    $streamKey = $testPrefix . 'default';
+    $delayedKey = $testPrefix.'default:delayed';
+    $streamKey = $testPrefix.'default';
 
     try {
         $redis = createRedisClient($redisUri);
@@ -98,15 +99,15 @@ it('handles empty delayed set gracefully', function () use ($testPrefix, $luaMig
         $migrated = $redis->execute('EVAL', $luaMigrateDelayed, '2', $delayedKey, $streamKey, (string) time());
 
         expect((int) $migrated)->toBe(0);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('only migrates jobs with matured timestamps', function () use ($testPrefix, $luaMigrateDelayed) {
     $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
-    $delayedKey = $testPrefix . 'default:delayed';
-    $streamKey = $testPrefix . 'default';
+    $delayedKey = $testPrefix.'default:delayed';
+    $streamKey = $testPrefix.'default';
 
     try {
         $redis = createRedisClient($redisUri);
@@ -131,7 +132,7 @@ it('only migrates jobs with matured timestamps', function () use ($testPrefix, $
         expect($migrated)->toBe(3);
         expect((int) $redis->execute('XLEN', $streamKey))->toBe(3);
         expect((int) $redis->execute('ZCARD', $delayedKey))->toBe(2);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

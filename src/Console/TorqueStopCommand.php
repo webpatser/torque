@@ -67,7 +67,7 @@ final class TorqueStopCommand extends Command
             }
 
             // Kill all orphaned masters and their workers.
-            $this->components->info('Found orphaned Torque process(es): ' . implode(', ', $orphanPids) . '. Killing...');
+            $this->components->info('Found orphaned Torque process(es): '.implode(', ', $orphanPids).'. Killing...');
 
             foreach ($orphanPids as $orphanPid) {
                 posix_kill(-$orphanPid, SIGKILL);
@@ -104,7 +104,7 @@ final class TorqueStopCommand extends Command
         if (! posix_kill(-$pid, SIGTERM)) {
             // Fallback: if process group kill fails, try the master directly.
             if (! posix_kill($pid, SIGTERM)) {
-                $this->components->error("Failed to send SIGTERM to PID {$pid}: " . posix_strerror(posix_get_last_error()));
+                $this->components->error("Failed to send SIGTERM to PID {$pid}: ".posix_strerror(posix_get_last_error()));
 
                 return self::FAILURE;
             }
@@ -132,7 +132,7 @@ final class TorqueStopCommand extends Command
 
         // Graceful shutdown timed out — escalate to SIGKILL on entire process group.
         $this->components->warn(
-            'Graceful shutdown timed out after ' . self::GRACEFUL_TIMEOUT . ' seconds. Sending SIGKILL...',
+            'Graceful shutdown timed out after '.self::GRACEFUL_TIMEOUT.' seconds. Sending SIGKILL...',
         );
 
         $this->killProcessGroup($pid);
@@ -168,7 +168,7 @@ final class TorqueStopCommand extends Command
         // spawns for exec(), whose own argv contains the pattern text, never
         // matches itself.
         $output = [];
-        exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:start'), $output);
+        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:start'), $output);
 
         return array_values(array_filter(
             array_map('intval', $output),
@@ -184,7 +184,7 @@ final class TorqueStopCommand extends Command
     private function killOrphanWorkers(): void
     {
         $output = [];
-        exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:worker'), $output);
+        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $output);
 
         foreach ($output as $line) {
             $pid = (int) trim($line);

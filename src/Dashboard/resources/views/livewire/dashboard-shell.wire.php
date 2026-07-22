@@ -2,14 +2,15 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
 use Livewire\Attributes\On;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     public int $pollInterval = 1000;
@@ -76,7 +77,7 @@ new class extends Component {
     #[On('torque-url-popped')]
     public function syncFromUrl(string $path): void
     {
-        $base = '/' . trim((string) config('torque.dashboard.path', 'torque'), '/');
+        $base = '/'.trim((string) config('torque.dashboard.path', 'torque'), '/');
         $view = ltrim(str_starts_with($path, $base) ? substr($path, strlen($base)) : $path, '/');
 
         if ($view === '') {
@@ -91,14 +92,14 @@ new class extends Component {
 
     private function buildUrl(string $page, ?string $uuid): string
     {
-        $base = '/' . trim((string) config('torque.dashboard.path', 'torque'), '/');
+        $base = '/'.trim((string) config('torque.dashboard.path', 'torque'), '/');
 
         return match ($page) {
             'overview' => $base,
             'job-inspector' => $uuid !== null
-                ? $base . '/jobs/' . rawurlencode($uuid)
-                : $base . '/jobs',
-            'jobs', 'streams', 'workers', 'failed', 'settings' => $base . '/' . $page,
+                ? $base.'/jobs/'.rawurlencode($uuid)
+                : $base.'/jobs',
+            'jobs', 'streams', 'workers', 'failed', 'settings' => $base.'/'.$page,
             default => $base,
         };
     }

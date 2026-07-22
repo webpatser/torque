@@ -6,8 +6,8 @@ use Webpatser\Torque\Stream\JobStreamRecorder;
 
 it('does not record when disabled', function () {
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $uuid = 'test-disabled-' . bin2hex(random_bytes(8));
-    $key = 'torque-test:job:' . $uuid;
+    $uuid = 'test-disabled-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
 
     $recorder = new JobStreamRecorder(
         redisUri: 'redis://127.0.0.1:6379/15',
@@ -36,8 +36,8 @@ it('does not record with empty uuid', function () {
 
 it('records a queued event to redis stream', function () {
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $uuid = 'test-' . bin2hex(random_bytes(8));
-    $key = 'torque-test:job:' . $uuid;
+    $uuid = 'test-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
 
     // Clean up before test.
     $redis->execute('DEL', $key);
@@ -69,8 +69,8 @@ it('records a queued event to redis stream', function () {
 
 it('records custom events via emitCustom', function () {
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $uuid = 'test-' . bin2hex(random_bytes(8));
-    $key = 'torque-test:job:' . $uuid;
+    $uuid = 'test-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
 
     $redis->execute('DEL', $key);
 
@@ -100,8 +100,8 @@ it('records custom events via emitCustom', function () {
 
 it('sets TTL on terminal events', function () {
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $uuid = 'test-' . bin2hex(random_bytes(8));
-    $key = 'torque-test:job:' . $uuid;
+    $uuid = 'test-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
 
     $redis->execute('DEL', $key);
 
@@ -126,8 +126,8 @@ it('sets TTL on terminal events', function () {
 
 it('records multiple lifecycle events in order', function () {
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $uuid = 'test-' . bin2hex(random_bytes(8));
-    $key = 'torque-test:job:' . $uuid;
+    $uuid = 'test-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
 
     $redis->execute('DEL', $key);
 

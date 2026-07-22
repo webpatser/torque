@@ -17,6 +17,7 @@
         "ext-igbinary": "Enables ~2x faster job payload encoding when TORQUE_SERIALIZER=igbinary is set, and globally speeds up PHP serialize() (sessions, cache) when igbinary.compact_strings is on."
     },
     "require-dev": {
+        "laravel/pint": "^1.29",
         "orchestra/testbench": "^10.0|^11.0",
         "pestphp/pest": "^4.0"
     },

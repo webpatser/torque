@@ -70,8 +70,8 @@ it('smoke-runs a tiny bench when redis is available', function () {
         $redisUri = (string) config('queue.connections.torque.redis_uri');
         $client = \Fledge\Async\Redis\createRedisClient($redisUri);
         $client->execute('PING');
-    } catch (\Throwable $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (Throwable $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 
     // Smoke: command exits with a clear timeout error rather than hanging

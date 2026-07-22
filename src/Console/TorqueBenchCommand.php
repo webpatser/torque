@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
+use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Illuminate\Support\Str;
 use Webpatser\Torque\Console\Bench\BenchRunner;
+use Webpatser\Torque\Process\MasterProcess;
 
 /**
  * Drive a closed-loop benchmark against a running Torque master.
@@ -17,7 +19,7 @@ use Webpatser\Torque\Console\Bench\BenchRunner;
  *   php artisan torque:bench --workload=payload-large --serializer=igbinary --use-running-master
  *
  * v1 limitation: requires a separately-started master (--use-running-master).
- * The current {@see \Webpatser\Torque\Process\MasterProcess} spawns workers via
+ * The current {@see MasterProcess} spawns workers via
  * `pcntl_exec` of `torque:worker`, which re-reads `config('torque')` from disk
  * and therefore cannot pick up an in-memory config override (different stream
  * prefix or consumer group). Self-spawning with config isolation is tracked as
@@ -57,7 +59,7 @@ final class TorqueBenchCommand extends Command
         $workload = (string) $this->option('workload');
         if (! in_array($workload, self::VALID_WORKLOADS, true)) {
             $this->components->error(
-                "Invalid --workload={$workload}. Allowed: " . implode(', ', self::VALID_WORKLOADS),
+                "Invalid --workload={$workload}. Allowed: ".implode(', ', self::VALID_WORKLOADS),
             );
 
             return self::FAILURE;
@@ -66,7 +68,7 @@ final class TorqueBenchCommand extends Command
         $serializer = (string) $this->option('serializer');
         if (! in_array($serializer, self::VALID_SERIALIZERS, true)) {
             $this->components->error(
-                "Invalid --serializer={$serializer}. Allowed: " . implode(', ', self::VALID_SERIALIZERS),
+                "Invalid --serializer={$serializer}. Allowed: ".implode(', ', self::VALID_SERIALIZERS),
             );
 
             return self::FAILURE;
@@ -81,8 +83,8 @@ final class TorqueBenchCommand extends Command
         if (! $this->option('use-running-master')) {
             $this->components->error(
                 'v1 of torque:bench requires --use-running-master. Start `php artisan torque:start` '
-                . 'in another terminal before running the bench. Self-spawning workers with config '
-                . 'isolation is a v1.1 follow-up.',
+                .'in another terminal before running the bench. Self-spawning workers with config '
+                .'isolation is a v1.1 follow-up.',
             );
 
             return self::FAILURE;
@@ -112,7 +114,7 @@ final class TorqueBenchCommand extends Command
         if (! $jsonOnStdout) {
             $this->components->info(
                 "Torque Bench  run={$runId}  jobs={$jobs}  workers={$workers}  "
-                . "coroutines={$coroutines}  workload={$workload}  serializer={$serializer}",
+                ."coroutines={$coroutines}  workload={$workload}  serializer={$serializer}",
             );
             $this->newLine();
         }
@@ -131,7 +133,7 @@ final class TorqueBenchCommand extends Command
         try {
             $report = $runner->run();
         } catch (\Throwable $e) {
-            $this->components->error('Bench failed: ' . $e->getMessage());
+            $this->components->error('Bench failed: '.$e->getMessage());
 
             return self::FAILURE;
         }
@@ -156,7 +158,7 @@ final class TorqueBenchCommand extends Command
     private function buildEnvelope(array $report, string $runId): array
     {
         return [
-            'torque_version' => \Composer\InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev',
+            'torque_version' => InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev',
             'php_version' => PHP_VERSION,
             'extensions' => [
                 'igbinary' => extension_loaded('igbinary'),
@@ -181,7 +183,7 @@ final class TorqueBenchCommand extends Command
             return;
         }
 
-        file_put_contents($target, $json . "\n");
+        file_put_contents($target, $json."\n");
         $this->components->info("Wrote JSON report to {$target}");
     }
 
@@ -203,11 +205,11 @@ final class TorqueBenchCommand extends Command
         $this->components->twoColumnDetail('Samples (post-warmup)', number_format($count));
         $this->components->twoColumnDetail(
             'Throughput',
-            number_format($throughput, 1) . ' jobs/sec',
+            number_format($throughput, 1).' jobs/sec',
         );
         $this->components->twoColumnDetail(
             'Wall time',
-            $wall !== null ? number_format((float) $wall, 3) . ' s' : '<fg=gray>--</>',
+            $wall !== null ? number_format((float) $wall, 3).' s' : '<fg=gray>--</>',
         );
         $this->components->twoColumnDetail(
             'Memory peak (bench process)',
@@ -231,7 +233,7 @@ final class TorqueBenchCommand extends Command
         $this->components->twoColumnDetail(
             'handle (median)',
             isset($results['handle_ns_median']) && $results['handle_ns_median'] !== null
-                ? number_format((int) $results['handle_ns_median']) . ' ns'
+                ? number_format((int) $results['handle_ns_median']).' ns'
                 : '<fg=gray>--</>',
         );
         $this->components->twoColumnDetail('xack', '<fg=gray>v1.1 follow-up</>');
@@ -244,19 +246,19 @@ final class TorqueBenchCommand extends Command
             return '<fg=gray>--</>';
         }
 
-        return number_format((float) $value, 2) . ' ms';
+        return number_format((float) $value, 2).' ms';
     }
 
     private function humanBytes(int $bytes): string
     {
         if ($bytes >= 1024 * 1024) {
-            return number_format($bytes / 1024 / 1024, 1) . ' MB';
+            return number_format($bytes / 1024 / 1024, 1).' MB';
         }
 
         if ($bytes >= 1024) {
-            return number_format($bytes / 1024, 1) . ' KB';
+            return number_format($bytes / 1024, 1).' KB';
         }
 
-        return $bytes . ' B';
+        return $bytes.' B';
     }
 }

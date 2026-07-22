@@ -30,9 +30,9 @@ class FakeQueueJob
 }
 
 it('resolves uuid from the underlying queue job', function () {
-    $uuid = 'test-' . bin2hex(random_bytes(8));
+    $uuid = 'test-'.bin2hex(random_bytes(8));
 
-    $fakeJob = new FakeStreamableJob();
+    $fakeJob = new FakeStreamableJob;
     $fakeJob->job = new FakeQueueJob($uuid);
 
     // Use reflection to test the private method.
@@ -42,7 +42,7 @@ it('resolves uuid from the underlying queue job', function () {
 });
 
 it('returns null when no queue job is set', function () {
-    $fakeJob = new FakeStreamableJob();
+    $fakeJob = new FakeStreamableJob;
 
     $method = new ReflectionMethod($fakeJob, 'resolveStreamUuid');
 
@@ -50,8 +50,8 @@ it('returns null when no queue job is set', function () {
 });
 
 it('emits custom events via the recorder', function () {
-    $uuid = 'test-' . bin2hex(random_bytes(8));
-    $key = 'torque-test:job:' . $uuid;
+    $uuid = 'test-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
 
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $redis->execute('DEL', $key);
@@ -63,7 +63,7 @@ it('emits custom events via the recorder', function () {
     );
     app()->instance(JobStreamRecorder::class, $recorder);
 
-    $fakeJob = new FakeStreamableJob();
+    $fakeJob = new FakeStreamableJob;
     $fakeJob->job = new FakeQueueJob($uuid);
     $fakeJob->emit('Processing step 3', progress: 0.75);
 
@@ -87,7 +87,7 @@ it('does not throw when recorder is not bound', function () {
     // Ensure the container doesn't have a recorder.
     app()->forgetInstance(JobStreamRecorder::class);
 
-    $fakeJob = new FakeStreamableJob();
+    $fakeJob = new FakeStreamableJob;
     $fakeJob->job = new FakeQueueJob('some-uuid');
 
     // Should not throw — silently ignored.

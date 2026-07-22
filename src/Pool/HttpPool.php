@@ -49,7 +49,7 @@ final class HttpPool
     private Semaphore $semaphore;
 
     /**
-     * @param int $maxConcurrent Maximum number of in-flight HTTP requests.
+     * @param  int  $maxConcurrent  Maximum number of in-flight HTTP requests.
      */
     public function __construct(
         public private(set) int $maxConcurrent = 15,
@@ -95,9 +95,9 @@ final class HttpPool
      *         json_encode(['event' => 'job.completed']),
      *     );
      *
-     * @param string $uri         Target URI.
-     * @param string $body        Request body content.
-     * @param string $contentType Content-Type header value.
+     * @param  string  $uri  Target URI.
+     * @param  string  $body  Request body content.
+     * @param  string  $contentType  Content-Type header value.
      */
     #[\NoDiscard]
     public function post(string $uri, string $body, string $contentType = 'application/json'): Response
@@ -122,8 +122,7 @@ final class HttpPool
      *
      * @template T
      *
-     * @param \Closure(HttpClient): T $callback  Receives the amphp HttpClient.
-     *
+     * @param  \Closure(HttpClient): T  $callback  Receives the amphp HttpClient.
      * @return T
      */
     public function use(\Closure $callback): mixed

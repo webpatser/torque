@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -75,7 +76,7 @@ final class TorqueStatusCommand extends Command
      */
     private function renderOverallMetrics(RedisClient $redis, string $prefix): void
     {
-        $metricsKey = $prefix . 'metrics';
+        $metricsKey = $prefix.'metrics';
 
         $fields = $this->getHashAll($redis, $metricsKey);
 
@@ -96,7 +97,7 @@ final class TorqueStatusCommand extends Command
      */
     private function renderWorkerTable(RedisClient $redis, string $prefix): void
     {
-        $workerKeys = $this->scanKeys($redis, $prefix . 'worker:*');
+        $workerKeys = $this->scanKeys($redis, $prefix.'worker:*');
 
         if ($workerKeys === []) {
             $this->components->warn('No worker metrics found in Redis.');
@@ -123,7 +124,7 @@ final class TorqueStatusCommand extends Command
                 $pid,
                 "{$activeSlots}/{$totalSlots}",
                 number_format((int) $jobsProcessed),
-                round((float) $avgLatency, 2) . ' ms',
+                round((float) $avgLatency, 2).' ms',
                 $this->formatHeartbeat($lastHeartbeat),
             ];
         }
@@ -144,7 +145,7 @@ final class TorqueStatusCommand extends Command
         try {
             /** @var array|null $result */
             $result = $redis->execute('HGETALL', $key);
-        } catch (\Fledge\Async\Redis\RedisException) {
+        } catch (RedisException) {
             return [];
         }
 
@@ -191,19 +192,19 @@ final class TorqueStatusCommand extends Command
     /**
      * Format a metric value for display, with an optional unit suffix.
      */
-    private function formatMetric(string|null $value, string $suffix = ''): string
+    private function formatMetric(?string $value, string $suffix = ''): string
     {
         if ($value === null || $value === '') {
             return '<fg=gray>--</>';
         }
 
-        return number_format((float) $value, 2) . $suffix;
+        return number_format((float) $value, 2).$suffix;
     }
 
     /**
      * Format a Unix timestamp heartbeat as a human-readable "X seconds ago" string.
      */
-    private function formatHeartbeat(string|null $timestamp): string
+    private function formatHeartbeat(?string $timestamp): string
     {
         if ($timestamp === null || $timestamp === '' || $timestamp === '0') {
             return '<fg=gray>--</>';

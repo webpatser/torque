@@ -7,13 +7,13 @@ use Webpatser\Torque\Pool\PooledConnection;
 
 use function Fledge\Async\async;
 use function Fledge\Async\delay;
-use function Fledge\Async\Future\await;
 
 it('creates connections lazily via factory', function () {
     $created = 0;
     $pool = new ConnectionPool(
         factory: function () use (&$created) {
             $created++;
+
             return "connection-{$created}";
         },
         maxSize: 3,
@@ -33,6 +33,7 @@ it('reuses idle connections', function () {
     $pool = new ConnectionPool(
         factory: function () use (&$created) {
             $created++;
+
             return "connection-{$created}";
         },
         maxSize: 3,
@@ -52,7 +53,7 @@ it('reuses idle connections', function () {
 
 it('tracks idle count correctly', function () {
     $pool = new ConnectionPool(
-        factory: fn () => new stdClass(),
+        factory: fn () => new stdClass,
         maxSize: 5,
     );
 
@@ -91,7 +92,7 @@ it('allows multiple release calls without error', function () {
 });
 
 it('suspends fibers when pool is exhausted', function () {
-    $pool = new ConnectionPool(fn () => new stdClass(), maxSize: 1);
+    $pool = new ConnectionPool(fn () => new stdClass, maxSize: 1);
 
     $conn1 = $pool->checkout();
     $order = [];

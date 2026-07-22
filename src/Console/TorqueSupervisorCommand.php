@@ -38,8 +38,9 @@ final class TorqueSupervisorCommand extends Command
         $realStorage = realpath(storage_path());
 
         if ($realParent === false || $realStorage === false
-            || !str_starts_with($realParent.DIRECTORY_SEPARATOR, $realStorage.DIRECTORY_SEPARATOR)) {
+            || ! str_starts_with($realParent.DIRECTORY_SEPARATOR, $realStorage.DIRECTORY_SEPARATOR)) {
             $this->components->error('Output path must be within storage_path().');
+
             return self::FAILURE;
         }
 

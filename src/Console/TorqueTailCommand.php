@@ -87,12 +87,12 @@ final class TorqueTailCommand extends Command
             : date('H:i:s');
 
         $detail = match ($type) {
-            'queued' => ($data['displayName'] ?? '') . ' → ' . ($data['queue'] ?? 'default'),
-            'started' => 'worker=' . ($data['worker'] ?? '?') . ' attempt=' . ($data['attempt'] ?? '1'),
-            'progress' => ($data['message'] ?? '') . (isset($data['progress']) ? ' [' . round((float) $data['progress'] * 100) . '%]' : ''),
-            'completed' => 'memory=' . (isset($data['memory_bytes']) ? round((int) $data['memory_bytes'] / 1024 / 1024, 1) . 'MB' : '?'),
-            'failed' => ($data['exception_class'] ?? 'Exception') . ': ' . ($data['exception_message'] ?? ''),
-            'exception' => 'attempt=' . ($data['attempt'] ?? '?') . ' ' . ($data['exception_message'] ?? ''),
+            'queued' => ($data['displayName'] ?? '').' → '.($data['queue'] ?? 'default'),
+            'started' => 'worker='.($data['worker'] ?? '?').' attempt='.($data['attempt'] ?? '1'),
+            'progress' => ($data['message'] ?? '').(isset($data['progress']) ? ' ['.round((float) $data['progress'] * 100).'%]' : ''),
+            'completed' => 'memory='.(isset($data['memory_bytes']) ? round((int) $data['memory_bytes'] / 1024 / 1024, 1).'MB' : '?'),
+            'failed' => ($data['exception_class'] ?? 'Exception').': '.($data['exception_message'] ?? ''),
+            'exception' => 'attempt='.($data['attempt'] ?? '?').' '.($data['exception_message'] ?? ''),
             default => json_encode(array_diff_key($data, array_flip(['type', 'timestamp']))),
         };
 
@@ -111,7 +111,7 @@ final class TorqueTailCommand extends Command
             $latestTime = 0;
 
             do {
-                $result = $redis->execute('SCAN', $cursor, 'MATCH', $prefix . 'job:*', 'COUNT', '100');
+                $result = $redis->execute('SCAN', $cursor, 'MATCH', $prefix.'job:*', 'COUNT', '100');
                 $cursor = (string) ($result[0] ?? '0');
                 $keys = is_array($result[1] ?? null) ? $result[1] : [];
 
@@ -125,7 +125,7 @@ final class TorqueTailCommand extends Command
 
                         if ($ts > $latestTime) {
                             $latestTime = $ts;
-                            $latest = str_replace($prefix . 'job:', '', (string) $key);
+                            $latest = str_replace($prefix.'job:', '', (string) $key);
                         }
                     }
                 }

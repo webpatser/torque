@@ -66,8 +66,8 @@ final class TorqueFlushCommand extends Command
         $totalDelayed = 0;
 
         foreach ($queues as $queue) {
-            $streamKey = $prefix . $queue;
-            $delayedKey = $streamKey . ':delayed';
+            $streamKey = $prefix.$queue;
+            $delayedKey = $streamKey.':delayed';
 
             // Count before flushing.
             $streamSize = (int) $redis->execute('XLEN', $streamKey);
@@ -108,7 +108,7 @@ final class TorqueFlushCommand extends Command
     {
         $deleted = 0;
         $cursor = '0';
-        $pattern = $prefix . 'job:*';
+        $pattern = $prefix.'job:*';
 
         do {
             $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '200');

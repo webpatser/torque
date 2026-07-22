@@ -28,7 +28,7 @@ final class TorqueWorkerCommand extends Command
 
     public function handle(): int
     {
-        fwrite(STDERR, "[torque:worker] PID " . getmypid() . " starting\n");
+        fwrite(STDERR, '[torque:worker] PID '.getmypid()." starting\n");
 
         register_shutdown_function(function () {
             $error = error_get_last();

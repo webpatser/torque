@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console\Bench;
 
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -117,7 +118,7 @@ final class BenchJob implements ShouldQueue
      * fall back to a direct connection if the bound queue is not the torque
      * driver in this context.
      */
-    private function resolveRedisClient(): \Fledge\Async\Redis\RedisClient
+    private function resolveRedisClient(): RedisClient
     {
         try {
             $queue = app(StreamQueue::class);

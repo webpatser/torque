@@ -39,7 +39,7 @@ final class MetricsPublisher
     public function publishWorkerMetrics(string $workerId, WorkerSnapshot $snapshot): void
     {
         $redis = $this->getRedis();
-        $key = $this->prefix . 'worker:' . $workerId;
+        $key = $this->prefix.'worker:'.$workerId;
 
         $redis->execute('HSET', $key,
             'jobs_processed', (string) $snapshot->jobsProcessed,
@@ -67,7 +67,7 @@ final class MetricsPublisher
     public function publishAggregatedMetrics(array $workerSnapshots): void
     {
         $redis = $this->getRedis();
-        $key = $this->prefix . 'metrics';
+        $key = $this->prefix.'metrics';
 
         $totalProcessed = 0;
         $totalFailed = 0;
@@ -131,7 +131,7 @@ final class MetricsPublisher
      */
     public function removeWorkerMetrics(string $workerId): void
     {
-        $this->getRedis()->execute('DEL', $this->prefix . 'worker:' . $workerId);
+        $this->getRedis()->execute('DEL', $this->prefix.'worker:'.$workerId);
     }
 
     /**
@@ -143,13 +143,13 @@ final class MetricsPublisher
     public function removeAllWorkerMetrics(): void
     {
         $redis = $this->getRedis();
-        $pattern = $this->prefix . 'worker:*';
+        $pattern = $this->prefix.'worker:*';
         $cursor = '0';
 
         do {
             $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '100');
 
-            if (!is_array($result) || count($result) < 2) {
+            if (! is_array($result) || count($result) < 2) {
                 break;
             }
 
@@ -165,17 +165,17 @@ final class MetricsPublisher
     /**
      * Read a single worker's metrics from Redis.
      *
-     * @return array<string, string>|null  Null if the key does not exist (worker expired).
+     * @return array<string, string>|null Null if the key does not exist (worker expired).
      */
     #[\NoDiscard]
     public function getWorkerMetrics(string $workerId): ?array
     {
         $redis = $this->getRedis();
-        $key = $this->prefix . 'worker:' . $workerId;
+        $key = $this->prefix.'worker:'.$workerId;
 
         $result = $redis->execute('HGETALL', $key);
 
-        if (!is_array($result) || $result === []) {
+        if (! is_array($result) || $result === []) {
             return null;
         }
 
@@ -187,21 +187,21 @@ final class MetricsPublisher
      *
      * Uses SCAN to iterate `{prefix}worker:*` keys without blocking Redis.
      *
-     * @return array<string, array<string, string>>  Keyed by worker ID.
+     * @return array<string, array<string, string>> Keyed by worker ID.
      */
     #[\NoDiscard]
     public function getAllWorkerMetrics(): array
     {
         $redis = $this->getRedis();
-        $pattern = $this->prefix . 'worker:*';
-        $prefixLen = strlen($this->prefix . 'worker:');
+        $pattern = $this->prefix.'worker:*';
+        $prefixLen = strlen($this->prefix.'worker:');
         $workers = [];
         $cursor = '0';
 
         do {
             $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '100');
 
-            if (!is_array($result) || count($result) < 2) {
+            if (! is_array($result) || count($result) < 2) {
                 break;
             }
 
@@ -225,17 +225,17 @@ final class MetricsPublisher
     /**
      * Read the aggregated metrics hash.
      *
-     * @return array<string, string>  Empty array if no aggregated metrics have been published yet.
+     * @return array<string, string> Empty array if no aggregated metrics have been published yet.
      */
     #[\NoDiscard]
     public function getAggregatedMetrics(): array
     {
         $redis = $this->getRedis();
-        $key = $this->prefix . 'metrics';
+        $key = $this->prefix.'metrics';
 
         $result = $redis->execute('HGETALL', $key);
 
-        if (!is_array($result) || $result === []) {
+        if (! is_array($result) || $result === []) {
             return [];
         }
 

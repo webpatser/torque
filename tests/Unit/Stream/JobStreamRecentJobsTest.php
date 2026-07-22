@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 
@@ -28,18 +29,18 @@ function cleanupRecentKeys(string $prefix, array $uuids): void
     );
 
     foreach ($uuids as $uuid) {
-        $redis->execute('DEL', $prefix . 'job:' . $uuid);
+        $redis->execute('DEL', $prefix.'job:'.$uuid);
     }
 }
 
 it('returns all recent jobs when no status filter', function () {
-    $prefix = 'torque-recent-all-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-recent-all-'.bin2hex(random_bytes(4)).':';
     $recorder = createRecentRecorder($prefix);
     $stream = createRecentStream($prefix);
 
-    $uuid1 = 'recent-1-' . bin2hex(random_bytes(4));
-    $uuid2 = 'recent-2-' . bin2hex(random_bytes(4));
-    $uuid3 = 'recent-3-' . bin2hex(random_bytes(4));
+    $uuid1 = 'recent-1-'.bin2hex(random_bytes(4));
+    $uuid2 = 'recent-2-'.bin2hex(random_bytes(4));
+    $uuid3 = 'recent-3-'.bin2hex(random_bytes(4));
 
     try {
         // Active job.
@@ -62,18 +63,18 @@ it('returns all recent jobs when no status filter', function () {
             ->toContain($uuid3);
 
         cleanupRecentKeys($prefix, [$uuid1, $uuid2, $uuid3]);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('filters by active status', function () {
-    $prefix = 'torque-recent-active-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-recent-active-'.bin2hex(random_bytes(4)).':';
     $recorder = createRecentRecorder($prefix);
     $stream = createRecentStream($prefix);
 
-    $uuidActive = 'active-' . bin2hex(random_bytes(4));
-    $uuidDone = 'done-' . bin2hex(random_bytes(4));
+    $uuidActive = 'active-'.bin2hex(random_bytes(4));
+    $uuidDone = 'done-'.bin2hex(random_bytes(4));
 
     try {
         $recorder->record($uuidActive, 'queued', []);
@@ -89,19 +90,19 @@ it('filters by active status', function () {
             ->not->toContain($uuidDone);
 
         cleanupRecentKeys($prefix, [$uuidActive, $uuidDone]);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('filters by completed status', function () {
-    $prefix = 'torque-recent-completed-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-recent-completed-'.bin2hex(random_bytes(4)).':';
     $recorder = createRecentRecorder($prefix);
     $stream = createRecentStream($prefix);
 
-    $uuidActive = 'active-' . bin2hex(random_bytes(4));
-    $uuidDone = 'done-' . bin2hex(random_bytes(4));
-    $uuidFailed = 'failed-' . bin2hex(random_bytes(4));
+    $uuidActive = 'active-'.bin2hex(random_bytes(4));
+    $uuidDone = 'done-'.bin2hex(random_bytes(4));
+    $uuidFailed = 'failed-'.bin2hex(random_bytes(4));
 
     try {
         $recorder->record($uuidActive, 'queued', []);
@@ -121,19 +122,19 @@ it('filters by completed status', function () {
             ->not->toContain($uuidFailed);
 
         cleanupRecentKeys($prefix, [$uuidActive, $uuidDone, $uuidFailed]);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('filters by failed status including dead-lettered', function () {
-    $prefix = 'torque-recent-failed-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-recent-failed-'.bin2hex(random_bytes(4)).':';
     $recorder = createRecentRecorder($prefix);
     $stream = createRecentStream($prefix);
 
-    $uuidFailed = 'fail-' . bin2hex(random_bytes(4));
-    $uuidDead = 'dead-' . bin2hex(random_bytes(4));
-    $uuidDone = 'done-' . bin2hex(random_bytes(4));
+    $uuidFailed = 'fail-'.bin2hex(random_bytes(4));
+    $uuidDead = 'dead-'.bin2hex(random_bytes(4));
+    $uuidDone = 'done-'.bin2hex(random_bytes(4));
 
     try {
         $recorder->record($uuidFailed, 'queued', []);
@@ -153,17 +154,17 @@ it('filters by failed status including dead-lettered', function () {
             ->not->toContain($uuidDone);
 
         cleanupRecentKeys($prefix, [$uuidFailed, $uuidDead, $uuidDone]);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('returns first and last event for each job', function () {
-    $prefix = 'torque-recent-events-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-recent-events-'.bin2hex(random_bytes(4)).':';
     $recorder = createRecentRecorder($prefix);
     $stream = createRecentStream($prefix);
 
-    $uuid = 'events-' . bin2hex(random_bytes(4));
+    $uuid = 'events-'.bin2hex(random_bytes(4));
 
     try {
         $recorder->record($uuid, 'queued', ['queue' => 'high', 'displayName' => 'App\\Jobs\\ImportData']);
@@ -180,17 +181,17 @@ it('returns first and last event for each job', function () {
         expect($job['last_event']['data']['progress'])->toBe('0.75');
 
         cleanupRecentKeys($prefix, [$uuid]);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 it('returns empty when no jobs match status filter', function () {
-    $prefix = 'torque-recent-nomatch-' . bin2hex(random_bytes(4)) . ':';
+    $prefix = 'torque-recent-nomatch-'.bin2hex(random_bytes(4)).':';
     $recorder = createRecentRecorder($prefix);
     $stream = createRecentStream($prefix);
 
-    $uuid = 'running-' . bin2hex(random_bytes(4));
+    $uuid = 'running-'.bin2hex(random_bytes(4));
 
     try {
         $recorder->record($uuid, 'queued', []);
@@ -200,7 +201,7 @@ it('returns empty when no jobs match status filter', function () {
         expect($jobs)->toBe([]);
 
         cleanupRecentKeys($prefix, [$uuid]);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

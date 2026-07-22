@@ -36,14 +36,14 @@ final class ConnectionPool
     }
 
     /**
-     * @param \Closure(): mixed $factory  Creates a new connection when the pool needs to grow.
-     * @param int                $maxSize  Maximum number of concurrent connections.
+     * @param  \Closure(): mixed  $factory  Creates a new connection when the pool needs to grow.
+     * @param  int  $maxSize  Maximum number of concurrent connections.
      */
     public function __construct(
         private readonly \Closure $factory,
         public private(set) int $maxSize = 10,
     ) {
-        $this->idle = new SplQueue();
+        $this->idle = new SplQueue;
         $this->semaphore = new LocalSemaphore($maxSize);
     }
 
@@ -59,7 +59,7 @@ final class ConnectionPool
     {
         $lock = $this->semaphore->acquire();
 
-        $connection = !$this->idle->isEmpty()
+        $connection = ! $this->idle->isEmpty()
             ? $this->idle->dequeue()
             : $this->createConnection();
 

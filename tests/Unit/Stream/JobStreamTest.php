@@ -7,8 +7,8 @@ use Webpatser\Torque\Stream\JobStreamRecorder;
 
 beforeEach(function () {
     $this->redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $this->uuid = 'test-' . bin2hex(random_bytes(8));
-    $this->key = 'torque-test:job:' . $this->uuid;
+    $this->uuid = 'test-'.bin2hex(random_bytes(8));
+    $this->key = 'torque-test:job:'.$this->uuid;
     $this->redis->execute('DEL', $this->key);
 });
 

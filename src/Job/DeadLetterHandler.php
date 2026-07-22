@@ -30,7 +30,7 @@ final class DeadLetterHandler
         private readonly string $prefix = 'torque:',
         private readonly array $allowedQueues = [],
     ) {
-        $this->deadLetterStream = $this->prefix . 'dead-letter';
+        $this->deadLetterStream = $this->prefix.'dead-letter';
         $this->redis = createRedisClient($this->redisUri);
     }
 
@@ -72,7 +72,7 @@ final class DeadLetterHandler
     {
         $entries = $this->redis->execute('XRANGE', $this->deadLetterStream, $deadLetterId, $deadLetterId);
 
-        if (!is_array($entries) || $entries === []) {
+        if (! is_array($entries) || $entries === []) {
             throw new \RuntimeException("Dead-letter entry [{$deadLetterId}] not found.");
         }
 
@@ -95,7 +95,7 @@ final class DeadLetterHandler
             throw new \RuntimeException("Queue [{$queue}] is not a configured Torque stream.");
         }
 
-        $streamKey = $this->prefix . $queue;
+        $streamKey = $this->prefix.$queue;
 
         $this->redis->execute(
             'XADD',
@@ -146,7 +146,7 @@ final class DeadLetterHandler
             (string) $count,
         );
 
-        if (!is_array($entries) || $entries === []) {
+        if (! is_array($entries) || $entries === []) {
             return [];
         }
 
@@ -191,7 +191,7 @@ final class DeadLetterHandler
             (string) ($count + 1),
         );
 
-        if (!is_array($entries) || $entries === []) {
+        if (! is_array($entries) || $entries === []) {
             return [];
         }
 

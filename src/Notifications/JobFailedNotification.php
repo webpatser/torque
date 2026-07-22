@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Notifications;
 
 use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Notifications\Notification;
+use Webpatser\Torque\Events\JobPermanentlyFailed;
 use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
@@ -13,7 +14,7 @@ use Webpatser\Torque\Support\PayloadSanitizer;
  *
  * Supports mail and array (database) channels out of the box. Users can extend
  * or replace this with their own notification by listening to the
- * {@see \Webpatser\Torque\Events\JobPermanentlyFailed} event.
+ * {@see JobPermanentlyFailed} event.
  */
 final class JobFailedNotification extends Notification
 {
@@ -36,7 +37,7 @@ final class JobFailedNotification extends Notification
     {
         return (new MailMessage)
             ->subject("Torque: Job Failed on {$this->queue}")
-            ->line("A job has permanently failed after exhausting all retries.")
+            ->line('A job has permanently failed after exhausting all retries.')
             ->line("**Job:** {$this->jobName}")
             ->line("**Queue:** {$this->queue}")
             ->line("**Error:** {$this->sanitizedMessage()}")

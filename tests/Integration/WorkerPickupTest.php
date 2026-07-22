@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Queue\StreamQueue;
 
 /*
@@ -19,7 +20,7 @@ use Webpatser\Torque\Queue\StreamQueue;
 |
 */
 
-$testPrefix = 'torque-pickup-' . bin2hex(random_bytes(4)) . ':';
+$testPrefix = 'torque-pickup-'.bin2hex(random_bytes(4)).':';
 
 beforeEach(function () use ($testPrefix) {
     $this->redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
@@ -40,8 +41,8 @@ beforeEach(function () use ($testPrefix) {
 
         // Verify Redis is reachable.
         $this->streamQueue->size();
-    } catch (\Throwable $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (Throwable $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -58,7 +59,7 @@ afterEach(function () use ($testPrefix) {
     }
 
     // Clean up all test keys.
-    if (!isset($this->streamQueue)) {
+    if (! isset($this->streamQueue)) {
         return;
     }
 
@@ -66,14 +67,14 @@ afterEach(function () use ($testPrefix) {
         $redis = $this->streamQueue->getRedisClient();
         $cursor = '0';
         do {
-            $result = $redis->execute('SCAN', $cursor, 'MATCH', $testPrefix . '*', 'COUNT', '100');
+            $result = $redis->execute('SCAN', $cursor, 'MATCH', $testPrefix.'*', 'COUNT', '100');
             $cursor = (string) $result[0];
             $keys = $result[1] ?? [];
             foreach ($keys as $key) {
                 $redis->execute('DEL', (string) $key);
             }
         } while ($cursor !== '0');
-    } catch (\Throwable) {
+    } catch (Throwable) {
         // Best-effort cleanup.
     }
 });
@@ -94,13 +95,13 @@ function startWorker(string $redisUri, string $prefix): mixed
         'TORQUE_COROUTINES' => '2',
         'TORQUE_MAX_JOBS' => '100',
         'TORQUE_MAX_LIFETIME' => '30',
-        'APP_KEY' => 'base64:' . base64_encode(str_repeat('a', 32)),
+        'APP_KEY' => 'base64:'.base64_encode(str_repeat('a', 32)),
     ];
 
     // Build env string for the subprocess.
     $envString = '';
     foreach ($env as $key => $value) {
-        $envString .= "{$key}=" . escapeshellarg($value) . ' ';
+        $envString .= "{$key}=".escapeshellarg($value).' ';
     }
 
     $cmd = "{$envString}php {$artisan} torque:worker --queues=default --concurrency=2";
@@ -113,8 +114,8 @@ function startWorker(string $redisUri, string $prefix): mixed
 
     $process = proc_open($cmd, $descriptors, $pipes);
 
-    if (!is_resource($process)) {
-        throw new \RuntimeException('Failed to start worker process');
+    if (! is_resource($process)) {
+        throw new RuntimeException('Failed to start worker process');
     }
 
     // Close stdin, we don't need it.
@@ -162,7 +163,7 @@ it('picks up an immediate job dispatched while the worker is running', function 
 
         // Verify worker is running.
         $status = proc_get_status($this->workerProcess);
-        if (!$status['running']) {
+        if (! $status['running']) {
             $this->markTestSkipped('Worker process failed to start');
         }
 
@@ -171,7 +172,7 @@ it('picks up an immediate job dispatched while the worker is running', function 
             'uuid' => 'pickup-immediate-1',
             'displayName' => 'App\\Jobs\\TestJob',
             'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
-            'data' => ['command' => base64_encode(serialize(new \stdClass()))],
+            'data' => ['command' => base64_encode(serialize(new stdClass))],
             'attempts' => 0,
             'maxTries' => null,
             'timeout' => null,
@@ -186,8 +187,8 @@ it('picks up an immediate job dispatched while the worker is running', function 
         $consumed = pollUntil(fn () => $this->streamQueue->size() === 0, timeoutSeconds: 10.0);
 
         expect($consumed)->toBeTrue('Worker did not pick up the immediate job within 10 seconds');
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -198,7 +199,7 @@ it('picks up an immediate job dispatched while the worker is running', function 
 it('picks up a delayed job after migration', function () {
     try {
         $streamKey = $this->streamQueue->getStreamKey();
-        $delayedKey = $streamKey . ':delayed';
+        $delayedKey = $streamKey.':delayed';
         $this->streamQueue->ensureConsumerGroup($streamKey, 'pickup-test');
 
         // Start the worker.
@@ -208,7 +209,7 @@ it('picks up a delayed job after migration', function () {
         usleep(2_000_000);
 
         $status = proc_get_status($this->workerProcess);
-        if (!$status['running']) {
+        if (! $status['running']) {
             $this->markTestSkipped('Worker process failed to start');
         }
 
@@ -217,7 +218,7 @@ it('picks up a delayed job after migration', function () {
             'uuid' => 'pickup-delayed-1',
             'displayName' => 'App\\Jobs\\TestJob',
             'job' => 'Illuminate\\Queue\\CallQueuedHandler@call',
-            'data' => ['command' => base64_encode(serialize(new \stdClass()))],
+            'data' => ['command' => base64_encode(serialize(new stdClass))],
             'attempts' => 0,
             'maxTries' => null,
             'timeout' => null,
@@ -235,7 +236,7 @@ it('picks up a delayed job after migration', function () {
         }, timeoutSeconds: 15.0);
 
         expect($consumed)->toBeTrue('Worker did not pick up the delayed job within 15 seconds');
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

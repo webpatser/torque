@@ -6,7 +6,7 @@ use Webpatser\Torque\Queue\StreamConnector;
 use Webpatser\Torque\Queue\StreamQueue;
 
 it('returns a StreamQueue instance', function () {
-    $connector = new StreamConnector();
+    $connector = new StreamConnector;
 
     $queue = $connector->connect([
         'redis_uri' => 'redis://127.0.0.1:6379',
@@ -20,7 +20,7 @@ it('passes config values through to the queue', function () {
     config()->set('torque.redis.prefix', null);
     config()->set('torque.consumer_group', null);
 
-    $connector = new StreamConnector();
+    $connector = new StreamConnector;
 
     $queue = $connector->connect([
         'redis_uri' => 'redis://10.0.0.1:6380',
@@ -41,7 +41,7 @@ it('uses torque config as source of truth for prefix and consumer group', functi
     config()->set('torque.redis.prefix', 'torque-test:');
     config()->set('torque.consumer_group', 'torque-test');
 
-    $connector = new StreamConnector();
+    $connector = new StreamConnector;
 
     $queue = $connector->connect([
         'prefix' => 'ignored:',
@@ -56,7 +56,7 @@ it('uses defaults for missing config keys', function () {
     config()->set('torque.redis.prefix', null);
     config()->set('torque.consumer_group', null);
 
-    $connector = new StreamConnector();
+    $connector = new StreamConnector;
 
     $queue = $connector->connect([]);
 
@@ -68,7 +68,7 @@ it('uses defaults for missing config keys', function () {
 });
 
 it('casts retry_after and block_for to integers', function () {
-    $connector = new StreamConnector();
+    $connector = new StreamConnector;
 
     $queue = $connector->connect([
         'retry_after' => '120',

@@ -10,9 +10,10 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Redis;
+use Webpatser\Torque\Console\Bench\BenchJob;
 
 /**
- * Mirror of {@see \Webpatser\Torque\Console\Bench\BenchJob} for plain Laravel /
+ * Mirror of {@see BenchJob} for plain Laravel /
  * Horizon, used to produce apples-to-apples throughput comparisons.
  *
  * Drop this file in your Laravel app's `app/Jobs/` and dispatch via

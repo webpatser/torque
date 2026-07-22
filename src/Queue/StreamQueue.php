@@ -4,14 +4,17 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Queue;
 
-use Fledge\Async\Redis\RedisClient;
 use DateInterval;
 use DateTimeInterface;
+use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Jobs\InspectedJob;
 use Illuminate\Queue\Queue;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
+use Webpatser\Torque\Stream\JobStreamRecorder;
+use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -38,7 +41,7 @@ class StreamQueue extends Queue implements QueueContract
         private readonly string $serializer = 'json',
     ) {
         $this->redis = createRedisClient($this->redisUri);
-        $this->consumerId = gethostname() . '-' . getmypid();
+        $this->consumerId = gethostname().'-'.getmypid();
     }
 
     // -------------------------------------------------------------------------
@@ -86,7 +89,7 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Decode a raw payload string by sniffing the format header.
      *
-     * Static so that {@see \Webpatser\Torque\Worker\WorkerProcess} can call it
+     * Static so that {@see WorkerProcess} can call it
      * without holding a StreamQueue instance.
      *
      * @return array<string, mixed>
@@ -109,7 +112,7 @@ class StreamQueue extends Queue implements QueueContract
         if (str_starts_with($raw, "\x00\x00\x00\x02")) {
             $decoded = igbinary_unserialize($raw);
 
-            if (!is_array($decoded)) {
+            if (! is_array($decoded)) {
                 throw new \InvalidArgumentException('igbinary payload did not decode to an array');
             }
 
@@ -122,7 +125,7 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Cheap pre-flight check: does this raw payload look like a payload we can decode?
      *
-     * Used by {@see \Webpatser\Torque\Worker\WorkerProcess} as a replacement for
+     * Used by {@see WorkerProcess} as a replacement for
      * the old json_validate() gate, so igbinary blobs are not dropped as corrupt.
      */
     public static function isValidPayload(string $raw): bool
@@ -170,7 +173,6 @@ class StreamQueue extends Queue implements QueueContract
      *
      * @param  string  $payload  JSON-encoded job payload.
      * @param  string|null  $queue
-     * @param  array  $options
      * @return string The stream message ID.
      */
     #[\NoDiscard]
@@ -195,7 +197,7 @@ class StreamQueue extends Queue implements QueueContract
             $decoded = self::decodePayload($payload);
 
             if (isset($decoded['uuid'])) {
-                app(\Webpatser\Torque\Stream\JobStreamRecorder::class)->onQueued(
+                app(JobStreamRecorder::class)->onQueued(
                     $decoded['uuid'],
                     $this->getQueue($queue),
                     $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
@@ -242,7 +244,7 @@ class StreamQueue extends Queue implements QueueContract
 
         $this->redis->execute(
             'ZADD',
-            $this->getStreamKey($queue) . ':delayed',
+            $this->getStreamKey($queue).':delayed',
             (string) $score,
             $payload,
         );
@@ -267,7 +269,6 @@ class StreamQueue extends Queue implements QueueContract
      * available within the block window.
      *
      * @param  string|null  $queue
-     * @return StreamJob|null
      */
     #[\Override]
     public function pop($queue = null): ?StreamJob
@@ -313,6 +314,7 @@ class StreamQueue extends Queue implements QueueContract
         if ($payload === null) {
             // Corrupt message — acknowledge and skip.
             $this->deleteAndAcknowledge($this->getQueue($queue), $messageId);
+
             return null;
         }
 
@@ -363,7 +365,7 @@ class StreamQueue extends Queue implements QueueContract
     {
         return (int) $this->redis->execute(
             'ZCARD',
-            $this->getStreamKey($queue) . ':delayed',
+            $this->getStreamKey($queue).':delayed',
         );
     }
 
@@ -471,7 +473,7 @@ class StreamQueue extends Queue implements QueueContract
     private function allQueueNames(): Collection
     {
         /** @var list<string> $keys */
-        $keys = $this->redis->execute('KEYS', $this->prefix . '*') ?: [];
+        $keys = $this->redis->execute('KEYS', $this->prefix.'*') ?: [];
 
         return (new Collection($keys))
             ->map(fn (string $key) => Str::after($key, $this->prefix))
@@ -593,7 +595,7 @@ class StreamQueue extends Queue implements QueueContract
      */
     private function delayedJobsForQueue(string $queue): Collection
     {
-        $delayedKey = $this->getStreamKey($queue) . ':delayed';
+        $delayedKey = $this->getStreamKey($queue).':delayed';
 
         /** @var list<string>|null $payloads */
         $payloads = $this->redis->execute('ZRANGE', $delayedKey, '0', '-1') ?: [];
@@ -629,7 +631,7 @@ class StreamQueue extends Queue implements QueueContract
      */
     public function deleteAndAcknowledge(string $queue, string $messageId): void
     {
-        $streamKey = $this->prefix . $queue;
+        $streamKey = $this->prefix.$queue;
 
         $this->redis->execute('XACK', $streamKey, $this->consumerGroup, $messageId);
         $this->redis->execute('XDEL', $streamKey, $messageId);
@@ -643,7 +645,7 @@ class StreamQueue extends Queue implements QueueContract
      */
     public function release(string $queue, StreamJob $job, int $delay = 0): void
     {
-        $streamKey = $this->prefix . $queue;
+        $streamKey = $this->prefix.$queue;
 
         // Acknowledge the original message so it leaves the PEL.
         $this->redis->execute('XACK', $streamKey, $this->consumerGroup, $job->messageId);
@@ -682,9 +684,9 @@ class StreamQueue extends Queue implements QueueContract
                 '0',
                 'MKSTREAM',
             );
-        } catch (\Fledge\Async\Redis\RedisException $e) {
+        } catch (RedisException $e) {
             // "BUSYGROUP Consumer Group name already exists" is expected.
-            if (!str_contains($e->getMessage(), 'BUSYGROUP')) {
+            if (! str_contains($e->getMessage(), 'BUSYGROUP')) {
                 throw $e;
             }
         }
@@ -712,11 +714,11 @@ class StreamQueue extends Queue implements QueueContract
     {
         $queue = $this->getQueue($queue);
 
-        if ($this->cluster && !str_contains($queue, '{')) {
-            $queue = '{' . $queue . '}';
+        if ($this->cluster && ! str_contains($queue, '{')) {
+            $queue = '{'.$queue.'}';
         }
 
-        return $this->prefix . $queue;
+        return $this->prefix.$queue;
     }
 
     /**

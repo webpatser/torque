@@ -397,7 +397,7 @@ final class MasterProcess
                 ->execute('EXISTS', $prefix.'paused');
 
             if ($paused === 1) {
-                ($this->logger)('Queue is PAUSED (Redis '.$prefix."paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.");
+                ($this->logger)('Queue is PAUSED (Redis '.$prefix.'paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.');
             }
         } catch (\Throwable) {
             // Boot must not depend on Redis being up; workers retry on their own.

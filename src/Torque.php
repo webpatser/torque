@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque;
 
+use Illuminate\Foundation\DevCommands;
 use Illuminate\Support\Facades\Vite;
 use Illuminate\Support\HtmlString;
 use RuntimeException;
@@ -51,8 +52,8 @@ final class Torque
      */
     public static function registerDevCommands(): void
     {
-        if (class_exists(\Illuminate\Foundation\DevCommands::class)) {
-            \Illuminate\Foundation\DevCommands::artisan('torque:start', 'torque');
+        if (class_exists(DevCommands::class)) {
+            DevCommands::artisan('torque:start', 'torque');
         }
     }
 

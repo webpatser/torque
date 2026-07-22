@@ -2,12 +2,13 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 use Webpatser\Torque\Queue\StreamQueue;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     /** @var array<string, string> */
@@ -24,7 +25,7 @@ new class extends Component {
         $queue = app('queue')->connection('torque');
 
         foreach ($streams as $name => $config) {
-            $streamKey = $config['stream'] ?? ('torque:stream:' . $name);
+            $streamKey = $config['stream'] ?? ('torque:stream:'.$name);
 
             try {
                 $size = (int) $queue->getRedisClient()->execute('XLEN', $streamKey);
@@ -33,7 +34,7 @@ new class extends Component {
 
                 $oldestPending = $queue->creationTimeOfOldestPendingJob($name);
                 $oldestAge = $oldestPending !== null ? time() - (int) $oldestPending : null;
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 report($e);
                 $errors[$name] = 'Stream unavailable.';
                 $size = 0;
@@ -67,14 +68,14 @@ new class extends Component {
         }
 
         if ($seconds < 60) {
-            return $seconds . 's';
+            return $seconds.'s';
         }
 
         if ($seconds < 3600) {
-            return (int) ($seconds / 60) . 'm ' . ($seconds % 60) . 's';
+            return (int) ($seconds / 60).'m '.($seconds % 60).'s';
         }
 
-        return (int) ($seconds / 3600) . 'h ' . (int) (($seconds % 3600) / 60) . 'm';
+        return (int) ($seconds / 3600).'h '.(int) (($seconds % 3600) / 60).'m';
     }
 };
 ?>

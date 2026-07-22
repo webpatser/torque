@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Stream;
 
+use Fledge\Async\Redis\RedisClient;
+
 use function Fledge\Async\Redis\createRedisClient;
 
 /**
@@ -14,7 +16,7 @@ use function Fledge\Async\Redis\createRedisClient;
  */
 final class JobStream
 {
-    private ?\Fledge\Async\Redis\RedisClient $redis = null;
+    private ?RedisClient $redis = null;
 
     public function __construct(
         private readonly string $redisUri,
@@ -29,7 +31,7 @@ final class JobStream
     public function events(string $uuid): array
     {
         $redis = $this->getRedis();
-        $key = $this->prefix . 'job:' . $uuid;
+        $key = $this->prefix.'job:'.$uuid;
 
         $result = $redis->execute('XRANGE', $key, '-', '+');
 
@@ -50,7 +52,7 @@ final class JobStream
     public function tail(string $uuid, float $timeout = 30.0): \Generator
     {
         $redis = $this->getRedis();
-        $key = $this->prefix . 'job:' . $uuid;
+        $key = $this->prefix.'job:'.$uuid;
         $lastId = '0-0';
         $deadline = microtime(true) + $timeout;
         $blockMs = 1000;
@@ -96,7 +98,7 @@ final class JobStream
     public function activeJobs(int $limit = 100): array
     {
         $redis = $this->getRedis();
-        $indexKey = $this->prefix . 'jobs:active';
+        $indexKey = $this->prefix.'jobs:active';
 
         $uuids = $redis->execute('ZREVRANGE', $indexKey, '0', (string) ($limit - 1));
 
@@ -108,7 +110,7 @@ final class JobStream
 
         foreach ($uuids as $uuid) {
             $uuid = (string) $uuid;
-            $key = $this->prefix . 'job:' . $uuid;
+            $key = $this->prefix.'job:'.$uuid;
             $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
 
             if (! is_array($last) || $last === []) {
@@ -156,7 +158,7 @@ final class JobStream
     public function recentJobs(?string $status = null, int $limit = 100): array
     {
         $redis = $this->getRedis();
-        $indexKey = $this->prefix . 'jobs:recent';
+        $indexKey = $this->prefix.'jobs:recent';
 
         // Pull an oversized window so post-filtering by status can still
         // produce a full page for statuses that match only some of the jobs.
@@ -172,7 +174,7 @@ final class JobStream
 
         foreach ($uuids as $uuid) {
             $uuid = (string) $uuid;
-            $key = $this->prefix . 'job:' . $uuid;
+            $key = $this->prefix.'job:'.$uuid;
 
             $first = $redis->execute('XRANGE', $key, '-', '+', 'COUNT', '1');
             $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
@@ -240,8 +242,8 @@ final class JobStream
     private function scanActiveJobs(int $limit): array
     {
         $redis = $this->getRedis();
-        $pattern = $this->prefix . 'job:*';
-        $prefixLen = strlen($this->prefix . 'job:');
+        $pattern = $this->prefix.'job:*';
+        $prefixLen = strlen($this->prefix.'job:');
         $active = [];
         $cursor = '0';
 
@@ -297,8 +299,8 @@ final class JobStream
     private function scanRecentJobs(?string $status, int $limit): array
     {
         $redis = $this->getRedis();
-        $pattern = $this->prefix . 'job:*';
-        $prefixLen = strlen($this->prefix . 'job:');
+        $pattern = $this->prefix.'job:*';
+        $prefixLen = strlen($this->prefix.'job:');
         $jobs = [];
         $cursor = '0';
         $terminalTypes = ['completed', 'failed', 'dead_lettered'];
@@ -389,7 +391,7 @@ final class JobStream
         return $entries;
     }
 
-    private function getRedis(): \Fledge\Async\Redis\RedisClient
+    private function getRedis(): RedisClient
     {
         return $this->redis ??= createRedisClient($this->redisUri);
     }

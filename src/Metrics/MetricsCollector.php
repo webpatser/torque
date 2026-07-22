@@ -45,8 +45,8 @@ final class MetricsCollector
     private int $latencySamplesRecorded = 0;
 
     /**
-     * @param  int  $totalSlots          Coroutine concurrency limit from config.
-     * @param  int  $latencyWindowSize   Number of recent samples to keep for the rolling average.
+     * @param  int  $totalSlots  Coroutine concurrency limit from config.
+     * @param  int  $latencyWindowSize  Number of recent samples to keep for the rolling average.
      */
     public function __construct(
         int $totalSlots,

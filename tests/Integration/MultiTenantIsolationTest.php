@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
@@ -26,8 +27,8 @@ use function Fledge\Async\Redis\createRedisClient;
 |
 */
 
-$prefixA = 'torque-iso-a-' . bin2hex(random_bytes(4)) . ':';
-$prefixB = 'torque-iso-b-' . bin2hex(random_bytes(4)) . ':';
+$prefixA = 'torque-iso-a-'.bin2hex(random_bytes(4)).':';
+$prefixB = 'torque-iso-b-'.bin2hex(random_bytes(4)).':';
 
 beforeEach(function () use ($prefixA, $prefixB) {
     $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
@@ -61,8 +62,8 @@ beforeEach(function () use ($prefixA, $prefixB) {
 
         // Verify Redis is reachable.
         $this->queueA->size();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -77,7 +78,7 @@ afterEach(function () use ($prefixA, $prefixB) {
         foreach ([$prefixA, $prefixB] as $prefix) {
             $cursor = '0';
             do {
-                $result = $redis->execute('SCAN', $cursor, 'MATCH', $prefix . '*', 'COUNT', '100');
+                $result = $redis->execute('SCAN', $cursor, 'MATCH', $prefix.'*', 'COUNT', '100');
                 $cursor = (string) $result[0];
                 $keys = $result[1] ?? [];
 
@@ -86,7 +87,7 @@ afterEach(function () use ($prefixA, $prefixB) {
                 }
             } while ($cursor !== '0');
         }
-    } catch (\Fledge\Async\Redis\RedisException) {
+    } catch (RedisException) {
         // Cleanup is best-effort.
     }
 });
@@ -118,13 +119,13 @@ it('keeps delayed jobs scoped to their prefix', function () {
 
     $redis->execute(
         'ZADD',
-        $this->prefixA . 'default:delayed',
+        $this->prefixA.'default:delayed',
         $matureScore,
         json_encode(['uuid' => 'iso-delayed-1']),
     );
 
-    $sizeA = (int) $redis->execute('ZCARD', $this->prefixA . 'default:delayed');
-    $sizeB = (int) $redis->execute('ZCARD', $this->prefixB . 'default:delayed');
+    $sizeA = (int) $redis->execute('ZCARD', $this->prefixA.'default:delayed');
+    $sizeB = (int) $redis->execute('ZCARD', $this->prefixB.'default:delayed');
 
     expect($sizeA)->toBe(1)->and($sizeB)->toBe(0);
 });
@@ -188,10 +189,10 @@ it('aggregates only its own workers when summarizing metrics', function () {
 it('does not share the pause flag across prefixes', function () {
     $redis = createRedisClient($this->redisUri);
 
-    $redis->execute('SET', $this->prefixA . 'paused', (string) time());
+    $redis->execute('SET', $this->prefixA.'paused', (string) time());
 
-    $pausedA = (bool) $redis->execute('EXISTS', $this->prefixA . 'paused');
-    $pausedB = (bool) $redis->execute('EXISTS', $this->prefixB . 'paused');
+    $pausedA = (bool) $redis->execute('EXISTS', $this->prefixA.'paused');
+    $pausedB = (bool) $redis->execute('EXISTS', $this->prefixB.'paused');
 
     expect($pausedA)->toBeTrue()->and($pausedB)->toBeFalse();
 });
@@ -208,7 +209,7 @@ it('keeps dead-letter entries scoped to their prefix', function () {
         queue: 'default',
         payload: json_encode(['uuid' => 'iso-dlq-1']),
         messageId: '1-0',
-        exception: new \RuntimeException('project A boom'),
+        exception: new RuntimeException('project A boom'),
     );
 
     $listA = $handlerA->list();

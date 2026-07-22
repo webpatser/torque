@@ -1,6 +1,7 @@
 <?php
 
 declare(strict_types=1);
+use Fledge\Async\Redis\RedisException;
 
 it('is registered as an artisan command', function () {
     $commands = collect($this->app->make('Illuminate\Contracts\Console\Kernel')->all());
@@ -14,8 +15,8 @@ it('runs without error even with no metrics in Redis', function () {
     try {
         $this->artisan('torque:status')
             ->assertSuccessful();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -30,7 +31,7 @@ it('shows master status as stopped when no PID file exists', function () {
         $this->artisan('torque:status')
             ->assertSuccessful()
             ->expectsOutputToContain('STOPPED');
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

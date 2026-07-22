@@ -2,10 +2,12 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
+use Illuminate\Queue\QueueManager;
 use Webpatser\Torque\Queue\StreamQueue;
 
 it('registers the torque queue connector', function () {
-    /** @var \Illuminate\Queue\QueueManager $manager */
+    /** @var QueueManager $manager */
     $manager = app('queue');
     $queue = $manager->connection('torque');
 
@@ -56,8 +58,8 @@ it('pushes a job to Redis stream', function () {
 
         // Clean up: delete the message.
         $queue->deleteAndAcknowledge('default', $messageId);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -77,7 +79,7 @@ it('pushes a delayed job to sorted set', function () {
         // Check delayed size is initially 0.
         $delayedSize = $queue->delayedSize('default');
         expect($delayedSize)->toBeGreaterThanOrEqual(0);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });

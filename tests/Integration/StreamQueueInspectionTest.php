@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Queue\Jobs\InspectedJob;
+use Illuminate\Support\Collection;
 use Webpatser\Torque\Queue\StreamQueue;
 
 /*
@@ -16,7 +18,7 @@ use Webpatser\Torque\Queue\StreamQueue;
 |
 */
 
-$testPrefix = 'torque-inspect-' . bin2hex(random_bytes(4)) . ':';
+$testPrefix = 'torque-inspect-'.bin2hex(random_bytes(4)).':';
 
 beforeEach(function () use ($testPrefix) {
     $redisUri = env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
@@ -37,8 +39,8 @@ beforeEach(function () use ($testPrefix) {
         $this->streamQueue->setConnectionName('torque');
 
         $this->streamQueue->size();
-    } catch (\Fledge\Async\Redis\RedisException $e) {
-        $this->markTestSkipped('Redis not available: ' . $e->getMessage());
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
@@ -52,7 +54,7 @@ afterEach(function () use ($testPrefix) {
 
         $cursor = '0';
         do {
-            $result = $redis->execute('SCAN', $cursor, 'MATCH', $testPrefix . '*', 'COUNT', '100');
+            $result = $redis->execute('SCAN', $cursor, 'MATCH', $testPrefix.'*', 'COUNT', '100');
             $cursor = (string) $result[0];
             $keys = $result[1] ?? [];
 
@@ -60,7 +62,7 @@ afterEach(function () use ($testPrefix) {
                 $redis->execute('DEL', (string) $key);
             }
         } while ($cursor !== '0');
-    } catch (\Fledge\Async\Redis\RedisException) {
+    } catch (RedisException) {
         // Cleanup best-effort.
     }
 });
@@ -72,7 +74,7 @@ afterEach(function () use ($testPrefix) {
 it('returns an empty pending collection when no jobs have been pushed', function () {
     $jobs = $this->streamQueue->allPendingJobs();
 
-    expect($jobs)->toBeInstanceOf(\Illuminate\Support\Collection::class);
+    expect($jobs)->toBeInstanceOf(Collection::class);
     expect($jobs)->toBeEmpty();
 });
 
@@ -122,7 +124,7 @@ it('moves a job from pending to reserved when it is popped', function () {
 it('returns an empty reserved collection when nothing is in the PEL', function () {
     $jobs = $this->streamQueue->allReservedJobs();
 
-    expect($jobs)->toBeInstanceOf(\Illuminate\Support\Collection::class);
+    expect($jobs)->toBeInstanceOf(Collection::class);
     expect($jobs)->toBeEmpty();
 });
 
@@ -187,7 +189,7 @@ it('aggregates reserved jobs across multiple queue names', function () {
 it('returns an empty delayed collection when nothing is delayed', function () {
     $jobs = $this->streamQueue->allDelayedJobs();
 
-    expect($jobs)->toBeInstanceOf(\Illuminate\Support\Collection::class);
+    expect($jobs)->toBeInstanceOf(Collection::class);
     expect($jobs)->toBeEmpty();
 });
 
@@ -214,7 +216,7 @@ it('excludes auxiliary keys (paused, :delayed) from queue enumeration', function
 
     // Inject auxiliary keys that should be ignored by allQueueNames().
     $redis = $this->streamQueue->getRedisClient();
-    $redis->execute('SET', $this->testPrefix . 'paused', '1');
+    $redis->execute('SET', $this->testPrefix.'paused', '1');
     (void) $this->streamQueue->later(60, 'JobLater', '', 'default'); // creates :delayed
 
     $pending = $this->streamQueue->allPendingJobs();

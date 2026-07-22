@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
+use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
@@ -43,7 +44,7 @@ final class TorqueStartCommand extends Command
         // character is bracketed so the `sh -c` wrapper PHP spawns for exec(),
         // whose own argv contains the pattern text, never matches itself.
         $output = [];
-        exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:start'), $output);
+        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:start'), $output);
         $otherMasters = array_filter(
             array_map('intval', $output),
             fn (int $pid) => $pid > 0 && $pid !== getmypid(),
@@ -51,7 +52,7 @@ final class TorqueStartCommand extends Command
 
         if ($otherMasters !== []) {
             $this->components->warn(
-                'Killing orphaned torque:start process(es): ' . implode(', ', $otherMasters),
+                'Killing orphaned torque:start process(es): '.implode(', ', $otherMasters),
             );
 
             foreach ($otherMasters as $orphanPid) {
@@ -61,7 +62,7 @@ final class TorqueStartCommand extends Command
 
             // Also kill orphaned workers.
             $workerOutput = [];
-            exec('pgrep -f ' . escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
+            exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
             foreach ($workerOutput as $line) {
                 $pid = (int) trim($line);
                 if ($pid > 0 && $pid !== getmypid()) {
@@ -92,8 +93,9 @@ final class TorqueStartCommand extends Command
             $config['queues'] = array_map('trim', explode(',', $this->option('queues')));
 
             foreach ($config['queues'] as $queue) {
-                if (!preg_match('/^[a-zA-Z0-9_\-.:]+$/', $queue)) {
+                if (! preg_match('/^[a-zA-Z0-9_\-.:]+$/', $queue)) {
                     $this->components->error("Invalid queue name: {$queue}");
+
                     return self::FAILURE;
                 }
             }
@@ -107,11 +109,11 @@ final class TorqueStartCommand extends Command
         $concurrency = (int) ($config['coroutines_per_worker'] ?? 50);
         $queues = implode(', ', $config['queues']);
 
-        $version = \Composer\InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev';
+        $version = InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev';
         $this->components->info("Torque {$version} starting with {$workers} workers x {$concurrency} coroutines");
         $this->components->info("Queues: {$queues}");
         $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-        $this->components->info('Redis: ' . preg_replace('/:([^@]+)@/', ':***@', $redisUri));
+        $this->components->info('Redis: '.preg_replace('/:([^@]+)@/', ':***@', $redisUri));
 
         // Serializer detection: hard error when igbinary is configured but the
         // extension is missing, gentle nudge when ext is missing under json,
@@ -119,7 +121,7 @@ final class TorqueStartCommand extends Command
         $serializer = (string) ($config['serializer'] ?? 'json');
         $hasIgbinary = extension_loaded('igbinary');
 
-        if ($serializer === 'igbinary' && !$hasIgbinary) {
+        if ($serializer === 'igbinary' && ! $hasIgbinary) {
             $this->components->error('TORQUE_SERIALIZER=igbinary but ext-igbinary is not loaded. Install with: pecl install igbinary');
 
             return self::FAILURE;
@@ -127,7 +129,7 @@ final class TorqueStartCommand extends Command
 
         if ($serializer === 'igbinary' && $hasIgbinary) {
             $this->components->info('Serializer: igbinary');
-        } elseif ($serializer === 'json' && !$hasIgbinary) {
+        } elseif ($serializer === 'json' && ! $hasIgbinary) {
             $this->components->info('Tip: install ext-igbinary for ~2x faster payload encoding (set TORQUE_SERIALIZER=igbinary).');
         }
 

@@ -2,12 +2,14 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Stream\JobStream;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     /** @var array<string, mixed> */
@@ -22,11 +24,11 @@ new class extends Component {
     public function activeJobs(): array
     {
         try {
-            $jobs = app(\Webpatser\Torque\Stream\JobStream::class)->activeJobs();
+            $jobs = app(JobStream::class)->activeJobs();
             $this->activeJobsError = null;
 
             return $jobs;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             report($e);
             // Mutating a public property from within a computed is technically
             // an anti-pattern, but only a terminal error path — Livewire won't
@@ -48,7 +50,7 @@ new class extends Component {
 
         foreach ($streams as $name => $config) {
             try {
-                $streamKey = $config['stream'] ?? ('torque:stream:' . $name);
+                $streamKey = $config['stream'] ?? ('torque:stream:'.$name);
                 $size = (int) $queue->getRedisClient()->execute('XLEN', $streamKey);
                 $pending = $queue->pendingSize($name);
                 $delayed = $queue->delayedSize($name);
@@ -60,7 +62,7 @@ new class extends Component {
                     'delayed' => $delayed,
                     'processing' => max(0, $size - $pending - $delayed),
                 ];
-            } catch (\Throwable) {
+            } catch (Throwable) {
                 $rows[] = [
                     'name' => $name,
                     'size' => 0,
@@ -102,7 +104,7 @@ new class extends Component {
             ],
             [
                 'label' => 'Concurrent',
-                'value' => $concurrent . '/' . $totalSlots,
+                'value' => $concurrent.'/'.$totalSlots,
                 'suffix' => 'slots',
                 'color' => match (true) {
                     $slotUsage >= 0.85 => 'red',

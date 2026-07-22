@@ -73,14 +73,15 @@ it('consumerId is unique across instances', function () {
 /**
  * Build a minimal Dispatcher fake that records every dispatched event.
  *
- * @return array{0: Dispatcher, 1: \ArrayObject<int, object>}
+ * @return array{0: Dispatcher, 1: ArrayObject<int, object>}
  */
 function pauseEventRecorder(): array
 {
-    $log = new \ArrayObject;
+    $log = new ArrayObject;
 
-    $dispatcher = new class ($log) implements Dispatcher {
-        public function __construct(private \ArrayObject $log) {}
+    $dispatcher = new class($log) implements Dispatcher
+    {
+        public function __construct(private ArrayObject $log) {}
 
         public function dispatch($event, $payload = [], $halt = false)
         {
@@ -90,12 +91,25 @@ function pauseEventRecorder(): array
         }
 
         public function listen($events, $listener = null) {}
-        public function hasListeners($eventName): bool { return false; }
+
+        public function hasListeners($eventName): bool
+        {
+            return false;
+        }
+
         public function subscribe($subscriber) {}
-        public function until($event, $payload = []) { return null; }
+
+        public function until($event, $payload = [])
+        {
+            return null;
+        }
+
         public function push($event, $payload = []) {}
+
         public function flush($event) {}
+
         public function forget($event) {}
+
         public function forgetPushed() {}
     };
 
@@ -104,7 +118,7 @@ function pauseEventRecorder(): array
 
 it('dispatches WorkerPausing on a false to true transition', function () {
     [$events, $log] = pauseEventRecorder();
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = false;
 
     WorkerProcess::applyPauseTransition(true, $pauseState, $events, 'torque', 'default');
@@ -118,7 +132,7 @@ it('dispatches WorkerPausing on a false to true transition', function () {
 
 it('dispatches WorkerResuming on a true to false transition', function () {
     [$events, $log] = pauseEventRecorder();
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = true;
 
     WorkerProcess::applyPauseTransition(false, $pauseState, $events, 'torque', 'default');
@@ -132,7 +146,7 @@ it('dispatches WorkerResuming on a true to false transition', function () {
 
 it('does not dispatch when the pause state is unchanged', function () {
     [$events, $log] = pauseEventRecorder();
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = false;
 
     WorkerProcess::applyPauseTransition(false, $pauseState, $events, 'torque', 'default');
@@ -143,7 +157,7 @@ it('does not dispatch when the pause state is unchanged', function () {
 
 it('only dispatches once per flip while the worker stays paused', function () {
     [$events, $log] = pauseEventRecorder();
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = false;
 
     WorkerProcess::applyPauseTransition(true, $pauseState, $events, 'torque', 'default');
@@ -156,7 +170,7 @@ it('only dispatches once per flip while the worker stays paused', function () {
 
 it('dispatches both events when the worker pauses then resumes', function () {
     [$events, $log] = pauseEventRecorder();
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = false;
 
     WorkerProcess::applyPauseTransition(true, $pauseState, $events, 'torque', 'default');
@@ -169,7 +183,7 @@ it('dispatches both events when the worker pauses then resumes', function () {
 
 it('forwards the configured connection name and primary queue', function () {
     [$events, $log] = pauseEventRecorder();
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = false;
 
     WorkerProcess::applyPauseTransition(true, $pauseState, $events, 'reverb', 'high');
@@ -180,22 +194,36 @@ it('forwards the configured connection name and primary queue', function () {
 });
 
 it('swallows dispatcher exceptions so the poller keeps running', function () {
-    $pauseState = new \stdClass;
+    $pauseState = new stdClass;
     $pauseState->paused = false;
 
-    $events = new class implements Dispatcher {
+    $events = new class implements Dispatcher
+    {
         public function dispatch($event, $payload = [], $halt = false)
         {
             throw new RuntimeException('listener exploded');
         }
 
         public function listen($events, $listener = null) {}
-        public function hasListeners($eventName): bool { return false; }
+
+        public function hasListeners($eventName): bool
+        {
+            return false;
+        }
+
         public function subscribe($subscriber) {}
-        public function until($event, $payload = []) { return null; }
+
+        public function until($event, $payload = [])
+        {
+            return null;
+        }
+
         public function push($event, $payload = []) {}
+
         public function flush($event) {}
+
         public function forget($event) {}
+
         public function forgetPushed() {}
     };
 
@@ -226,16 +254,24 @@ describe('shouldStopRetries', function () {
     afterEach(fn () => Container::setInstance(null));
 
     it('stops retries when the handler returns true', function () use ($bindHandler, $invoke) {
-        $handler = new class {
-            public function shouldStopRetries(Throwable $e): bool { return true; }
+        $handler = new class
+        {
+            public function shouldStopRetries(Throwable $e): bool
+            {
+                return true;
+            }
         };
 
         expect($invoke($bindHandler($handler), new RuntimeException('nope')))->toBeTrue();
     });
 
     it('keeps retrying when the handler returns false', function () use ($bindHandler, $invoke) {
-        $handler = new class {
-            public function shouldStopRetries(Throwable $e): bool { return false; }
+        $handler = new class
+        {
+            public function shouldStopRetries(Throwable $e): bool
+            {
+                return false;
+            }
         };
 
         expect($invoke($bindHandler($handler), new RuntimeException('retry me')))->toBeFalse();

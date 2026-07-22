@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Database\Mysql\MysqlConnectionPool;
 use Webpatser\Torque\Pool\MysqlPool;
 
 it('accepts a DSN and exposes it via asymmetric visibility', function () {
@@ -10,7 +11,7 @@ it('accepts a DSN and exposes it via asymmetric visibility', function () {
             dsn: 'host=localhost user=root password= db=test',
             maxConnections: 5,
         );
-    } catch (\Throwable) {
+    } catch (Throwable) {
         $this->markTestSkipped('MySQL is not available or DSN is invalid');
     }
 
@@ -25,7 +26,7 @@ it('exposes maxConnections via asymmetric visibility', function () {
         $pool = new MysqlPool(
             dsn: 'host=localhost user=root password= db=test',
         );
-    } catch (\Throwable) {
+    } catch (Throwable) {
         $this->markTestSkipped('MySQL is not available or DSN is invalid');
     }
 
@@ -39,11 +40,11 @@ it('passes callback to the inner pool via use()', function () {
         $pool = new MysqlPool(
             dsn: 'host=localhost user=root password= db=test',
         );
-    } catch (\Throwable) {
+    } catch (Throwable) {
         $this->markTestSkipped('MySQL is not available or DSN is invalid');
     }
 
-    $result = $pool->use(fn ($inner) => $inner instanceof \Fledge\Async\Database\Mysql\MysqlConnectionPool);
+    $result = $pool->use(fn ($inner) => $inner instanceof MysqlConnectionPool);
 
     expect($result)->toBeTrue();
 

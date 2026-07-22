@@ -57,8 +57,7 @@ final class RedisPool
      *
      * @template T
      *
-     * @param \Closure(mixed): T $callback  Receives the raw Redis client.
-     *
+     * @param  \Closure(mixed): T  $callback  Receives the raw Redis client.
      * @return T
      */
     public function use(\Closure $callback): mixed

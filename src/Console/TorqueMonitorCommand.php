@@ -56,7 +56,7 @@ final class TorqueMonitorCommand extends Command
         $this->output->write("\033[?1049h\033[?25l");
 
         try {
-            while (!$this->shouldStop) {
+            while (! $this->shouldStop) {
                 $this->render($publisher, $config, $prefix, $redisUri);
                 usleep($refreshMs * 1000);
             }
@@ -83,7 +83,7 @@ final class TorqueMonitorCommand extends Command
         $paused = false;
         try {
             $redis = createRedisClient($redisUri);
-            $paused = (bool) $redis->execute('EXISTS', $prefix . 'paused');
+            $paused = (bool) $redis->execute('EXISTS', $prefix.'paused');
         } catch (\Throwable) {
         }
 
@@ -97,7 +97,7 @@ final class TorqueMonitorCommand extends Command
         $frame = "\033[H";
 
         foreach ($this->lines as $line) {
-            $frame .= $line . "\033[K\n";
+            $frame .= $line."\033[K\n";
         }
 
         // Clear any leftover lines from the previous (longer) frame.
@@ -136,7 +136,7 @@ final class TorqueMonitorCommand extends Command
         };
 
         $this->bufferLine(" \033[1m⚙ Torque Monitor\033[0m                        {$status}  {$workerCount} workers │ {$totalSlots} slots │ {$age}s ago");
-        $this->bufferLine(' ' . str_repeat('─', 78));
+        $this->bufferLine(' '.str_repeat('─', 78));
     }
 
     private function renderMetrics(array $m): void
@@ -191,17 +191,18 @@ final class TorqueMonitorCommand extends Command
 
         if ($workers === []) {
             $this->bufferLine("  \033[2mNo workers reporting\033[0m");
+
             return;
         }
 
         $barWidth = 20;
 
-        $this->bufferLine('  ┌' . str_repeat('─', 24) . '┬' . str_repeat('─', 8) . '┬' . str_repeat('─', $barWidth + 10) . '┬' . str_repeat('─', 10) . '┬' . str_repeat('─', 8) . '┐');
+        $this->bufferLine('  ┌'.str_repeat('─', 24).'┬'.str_repeat('─', 8).'┬'.str_repeat('─', $barWidth + 10).'┬'.str_repeat('─', 10).'┬'.str_repeat('─', 8).'┐');
         $this->bufferLine(sprintf(
-            '  │ %-22s │ %-6s │ %-' . ($barWidth + 8) . 's │ %-8s │ %-6s │',
+            '  │ %-22s │ %-6s │ %-'.($barWidth + 8).'s │ %-8s │ %-6s │',
             'ID', 'Status', 'Slots', 'Jobs', 'Latency',
         ));
-        $this->bufferLine('  ├' . str_repeat('─', 24) . '┼' . str_repeat('─', 8) . '┼' . str_repeat('─', $barWidth + 10) . '┼' . str_repeat('─', 10) . '┼' . str_repeat('─', 8) . '┤');
+        $this->bufferLine('  ├'.str_repeat('─', 24).'┼'.str_repeat('─', 8).'┼'.str_repeat('─', $barWidth + 10).'┼'.str_repeat('─', 10).'┼'.str_repeat('─', 8).'┤');
 
         foreach ($workers as $id => $w) {
             $active = (int) ($w['active_slots'] ?? 0);
@@ -223,11 +224,11 @@ final class TorqueMonitorCommand extends Command
                 $usage >= 0.60 => "\033[33m",
                 default => "\033[32m",
             };
-            $bar = $barColor . str_repeat('█', $filled) . "\033[0m" . str_repeat('░', $empty);
+            $bar = $barColor.str_repeat('█', $filled)."\033[0m".str_repeat('░', $empty);
             $slotLabel = sprintf('%d/%d', $active, $total);
 
             // Truncate ID to 22 chars.
-            $shortId = strlen($id) > 22 ? substr($id, 0, 19) . '...' : $id;
+            $shortId = strlen($id) > 22 ? substr($id, 0, 19).'...' : $id;
 
             $this->bufferLine(sprintf(
                 '  │ %-22s │ %s │ %s %-7s │ %8s │ %4dms │',
@@ -240,7 +241,7 @@ final class TorqueMonitorCommand extends Command
             ));
         }
 
-        $this->bufferLine('  └' . str_repeat('─', 24) . '┴' . str_repeat('─', 8) . '┴' . str_repeat('─', $barWidth + 10) . '┴' . str_repeat('─', 10) . '┴' . str_repeat('─', 8) . '┘');
+        $this->bufferLine('  └'.str_repeat('─', 24).'┴'.str_repeat('─', 8).'┴'.str_repeat('─', $barWidth + 10).'┴'.str_repeat('─', 10).'┴'.str_repeat('─', 8).'┘');
     }
 
     private function renderQueues(array $config, string $redisUri, string $prefix): void
@@ -253,22 +254,22 @@ final class TorqueMonitorCommand extends Command
         $this->bufferLine();
         $this->bufferLine("  \033[1mQueues\033[0m");
 
-        $this->bufferLine('  ┌' . str_repeat('─', 20) . '┬' . str_repeat('─', 8) . '┬' . str_repeat('─', 9) . '┬' . str_repeat('─', 9) . '┐');
+        $this->bufferLine('  ┌'.str_repeat('─', 20).'┬'.str_repeat('─', 8).'┬'.str_repeat('─', 9).'┬'.str_repeat('─', 9).'┐');
         $this->bufferLine(sprintf(
             '  │ %-18s │ %6s │ %7s │ %7s │',
             'Queue', 'Size', 'Pending', 'Delayed',
         ));
-        $this->bufferLine('  ├' . str_repeat('─', 20) . '┼' . str_repeat('─', 8) . '┼' . str_repeat('─', 9) . '┼' . str_repeat('─', 9) . '┤');
+        $this->bufferLine('  ├'.str_repeat('─', 20).'┼'.str_repeat('─', 8).'┼'.str_repeat('─', 9).'┼'.str_repeat('─', 9).'┤');
 
         try {
             $redis = createRedisClient($redisUri);
 
             foreach (array_keys($streams) as $queue) {
-                $streamKey = $prefix . $queue;
+                $streamKey = $prefix.$queue;
                 $consumerGroup = $config['consumer_group'] ?? 'torque';
 
                 $size = (int) $redis->execute('XLEN', $streamKey);
-                $delayed = (int) $redis->execute('ZCARD', $streamKey . ':delayed');
+                $delayed = (int) $redis->execute('ZCARD', $streamKey.':delayed');
 
                 $pending = 0;
                 try {
@@ -286,10 +287,10 @@ final class TorqueMonitorCommand extends Command
                 ));
             }
         } catch (\Throwable) {
-            $this->bufferLine("  │ \033[2mRedis unavailable\033[0m" . str_repeat(' ', 27) . '│');
+            $this->bufferLine("  │ \033[2mRedis unavailable\033[0m".str_repeat(' ', 27).'│');
         }
 
-        $this->bufferLine('  └' . str_repeat('─', 20) . '┴' . str_repeat('─', 8) . '┴' . str_repeat('─', 9) . '┴' . str_repeat('─', 9) . '┘');
+        $this->bufferLine('  └'.str_repeat('─', 20).'┴'.str_repeat('─', 8).'┴'.str_repeat('─', 9).'┴'.str_repeat('─', 9).'┘');
     }
 
     private function renderFooter(array $metrics, bool $paused, int $refreshMs): void
@@ -317,11 +318,13 @@ final class TorqueMonitorCommand extends Command
         if ($seconds < 3600) {
             $m = intdiv($seconds, 60);
             $s = $seconds % 60;
+
             return "{$m}m {$s}s";
         }
 
         $h = intdiv($seconds, 3600);
         $m = intdiv($seconds % 3600, 60);
+
         return "{$h}h {$m}m";
     }
 

@@ -2,11 +2,13 @@
 
 declare(strict_types=1);
 
-use Livewire\Component;
 use Livewire\Attributes\Computed;
+use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
+use Webpatser\Torque\Stream\JobStream;
 
-new class extends Component {
+new class extends Component
+{
     use AuthorizesTorqueAccess;
 
     public string $status = 'active';
@@ -17,11 +19,11 @@ new class extends Component {
     public function jobs(): array
     {
         try {
-            $jobs = app(\Webpatser\Torque\Stream\JobStream::class)->recentJobs($this->status);
+            $jobs = app(JobStream::class)->recentJobs($this->status);
             $this->error = null;
 
             return $jobs;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             report($e);
             $this->error = 'Failed to fetch jobs.';
 

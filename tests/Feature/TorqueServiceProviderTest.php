@@ -2,8 +2,12 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisException;
+use Illuminate\Foundation\DevCommands;
+use Illuminate\Queue\QueueManager;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Queue\StreamQueue;
 
 it('merges the torque config', function () {
     $config = config('torque');
@@ -21,7 +25,7 @@ it('merges the torque config', function () {
 });
 
 it('registers the torque queue connector', function () {
-    /** @var \Illuminate\Queue\QueueManager $manager */
+    /** @var QueueManager $manager */
     $manager = app('queue');
 
     // The connector is registered — attempting to resolve it should not throw
@@ -29,7 +33,7 @@ it('registers the torque queue connector', function () {
     // instead, which proves the connector itself is wired up.
     try {
         $manager->connection('torque');
-    } catch (\Fledge\Async\Redis\RedisException $e) {
+    } catch (RedisException $e) {
         // Expected — Redis isn't running in CI. The connector resolved.
         expect(true)->toBeTrue();
 
@@ -38,7 +42,7 @@ it('registers the torque queue connector', function () {
 
     // If Redis IS available, we get a StreamQueue instance.
     expect($manager->connection('torque'))->toBeInstanceOf(
-        \Webpatser\Torque\Queue\StreamQueue::class,
+        StreamQueue::class,
     );
 });
 
@@ -48,7 +52,7 @@ it('registers MetricsPublisher as a singleton', function () {
         $instanceB = app(MetricsPublisher::class);
 
         expect($instanceA)->toBe($instanceB);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
+    } catch (RedisException $e) {
         // If Redis connect happens eagerly, the binding still exists.
         expect(app()->bound(MetricsPublisher::class))->toBeTrue();
     }
@@ -60,7 +64,7 @@ it('registers DeadLetterHandler as a singleton', function () {
         $instanceB = app(DeadLetterHandler::class);
 
         expect($instanceA)->toBe($instanceB);
-    } catch (\Fledge\Async\Redis\RedisException $e) {
+    } catch (RedisException $e) {
         expect(app()->bound(DeadLetterHandler::class))->toBeTrue();
     }
 });
@@ -78,7 +82,7 @@ it('registers artisan commands', function (string $command) {
 ]);
 
 it('registers torque:start as a dev command', function () {
-    $commands = collect(\Illuminate\Foundation\DevCommands::commands());
+    $commands = collect(DevCommands::commands());
 
     $torque = $commands->firstWhere('name', 'torque');
 

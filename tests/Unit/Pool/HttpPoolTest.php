@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\DeferredFuture;
 use Webpatser\Torque\Pool\HttpPool;
 
 it('exposes maxConcurrent via asymmetric visibility', function () {
@@ -11,7 +12,7 @@ it('exposes maxConcurrent via asymmetric visibility', function () {
 });
 
 it('uses default maxConcurrent of 15', function () {
-    $pool = new HttpPool();
+    $pool = new HttpPool;
 
     expect($pool->maxConcurrent)->toBe(15);
 });
@@ -25,8 +26,8 @@ it('limits concurrency via the semaphore', function () {
     // the same way ConnectionPoolTest does.
 
     $order = [];
-    $suspension1 = new \Fledge\Async\DeferredFuture();
-    $suspension2 = new \Fledge\Async\DeferredFuture();
+    $suspension1 = new DeferredFuture;
+    $suspension2 = new DeferredFuture;
 
     // Occupy both slots.
     $future1 = \Fledge\Async\async(function () use ($pool, &$order, $suspension1) {
