@@ -14,13 +14,13 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     {{ \Webpatser\Torque\Torque::css() }}
-    @livewireStyles
+    @livewireStyles(['nonce' => \Webpatser\Torque\Torque::cspNonceValue()])
 </head>
 <body>
     {{-- Theme + nav state live in a persisted Alpine store so the chrome (inside
          the Livewire component) and <html data-theme> stay in sync and survive
          Livewire morphs. Alpine ships with Livewire 4, so this needs no build. --}}
-    <script>
+    <script{!! \Webpatser\Torque\Torque::cspNonceAttribute() !!}>
         document.addEventListener('alpine:init', () => {
             Alpine.store('torque', {
                 theme: Alpine.$persist('dark').as('tq.theme'),
@@ -33,6 +33,6 @@
 
     {{ $slot }}
 
-    @livewireScripts
+    @livewireScripts(['nonce' => \Webpatser\Torque\Torque::cspNonceValue()])
 </body>
 </html>

@@ -88,6 +88,8 @@ final class TorqueServiceProvider extends ServiceProvider
                 allowedQueues: array_keys($config['streams'] ?? []),
             );
         });
+
+        Torque::registerDevCommands();
     }
 
     /**

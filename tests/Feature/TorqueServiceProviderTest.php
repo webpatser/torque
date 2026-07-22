@@ -76,3 +76,12 @@ it('registers artisan commands', function (string $command) {
     'torque:pause',
     'torque:supervisor',
 ]);
+
+it('registers torque:start as a dev command', function () {
+    $commands = collect(\Illuminate\Foundation\DevCommands::commands());
+
+    $torque = $commands->firstWhere('name', 'torque');
+
+    expect($torque)->not->toBeNull()
+        ->and($torque['command'])->toBe('php artisan torque:start');
+});

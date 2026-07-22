@@ -14,7 +14,7 @@
     @livewireScripts
     @fluxScripts
 
-    <script>
+    <script{!! \Webpatser\Torque\Torque::cspNonceAttribute() !!}>
         // Keep the browser URL in sync with the active dashboard page so that
         // refreshes and bookmarks land on the right view, and back/forward
         // traverse the user's navigation history.

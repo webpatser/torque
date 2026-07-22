@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-22
+
+### Added
+- **Dev command registration for `php artisan dev` (Laravel 13.18+).** `Torque::registerDevCommands()` calls `Illuminate\Foundation\DevCommands::artisan('torque:start', 'torque')` from `TorqueServiceProvider::register()`, so `torque:start` shows up alongside `serve`, `queue:listen`, and `vite` in the `dev` command's multiplexed output on frameworks new enough to have `DevCommands`. Guarded with `class_exists`, so older frameworks (or the split `illuminate/*` packages without `illuminate/foundation`) simply skip registration. Parity with Horizon v5.48.0 (upstream PRs [#1786](https://github.com/laravel/horizon/pull/1786) and [#1789](https://github.com/laravel/horizon/pull/1789)).
+- **CSP nonce support for the dashboard.** `Torque::cspNonce($nonce)` sets an explicit nonce; `Torque::cspNonceValue()` resolves it, falling back to `Vite::cspNonce()` when unset (so apps that call `Vite::useCspNonce()` are covered automatically, the same convention Livewire follows); `Torque::cspNonceAttribute()` renders the escaped ` nonce="..."` HTML attribute or an empty string. `Torque::css()` stamps the attribute onto its inline `<style>` tag, the dashboard layout's inline Alpine-store `<script>` tag gets it too, and `@livewireStyles`/`@livewireScripts` in the layout are passed `Torque::cspNonceValue()` so an explicitly set Torque nonce reaches Livewire's own assets while an unset one still lets Livewire fall back to `Vite::cspNonce()` itself. Parity with Horizon v5.48.0 (upstream PR [#1792](https://github.com/laravel/horizon/pull/1792)), adapted for Torque's Livewire 4 dashboard and self-contained `Torque::css()` stylesheet.
+
 ### Fixed
 - **A drain no longer leaves the queue paused forever.** `torque:reload --drain` wrote the `{prefix}paused` Redis key without an expiry; the draining master exits, the supervisor respawns a replacement, and nothing ever deletes the key, so every reload left all workers refusing pickup until a manual `torque:pause continue`. The drain now sets the key with a TTL of `drain_grace_seconds + 60`, long enough to cover the drain window and self-healing after it. A deliberate `torque:pause` still sets the key without a TTL and keeps its stop-until-resumed semantics. The master also logs a clear warning at boot when it starts into a paused queue, so a paused state is visible in the supervisor log instead of looking like a silent hang.
 - Guard the `torque:start` and `torque:stop` pgrep orphan sweeps against shell-wrapper self-match. PHP's `exec()` runs pgrep through `sh -c`, whose argv contains the pattern; on Linux the sweep matched that transient PID and SIGKILLed whatever process had recycled it. All four patterns now bracket the first character (`[a]rtisan ...`). macOS execs the wrapper away before the scan and was unaffected.
@@ -15,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add a Redis 8 service container and a 15-minute timeout to the tests workflow; integration tests hung on runners without Redis.
 
 ### Changed
+- Verify against Laravel v13.21.1, no code changes required beyond the two features above. Horizon v5.48.0's dashboard max-runtime/max-throughput ZRANGE fix does not apply: Torque's `MetricsPublisher` computes throughput directly from elapsed time and processed counts, it never reads a ZSET range for it. Dependencies refreshed to `laravel/framework v13.21.1` and `webpatser/fledge-fiber v13.21.1.0`; suite green.
 - Verify against Laravel 13.20.0, no code changes required. The 13.20 queue changes miss Torque's surface: `WorkerStopping` (new optional `memoryUsage`) is never constructed or listened to, `Worker::currentMemoryUsage()` lives in the loop `WorkerProcess` replaces, the `SqsQueue` precedence fix is SQS-only, and `WithoutOverlapping` enum keys are backward compatible. Horizon has no releases since v5.47.2. Dependencies refreshed to `laravel/framework v13.20.0` and `webpatser/fledge-fiber v13.20.0.0`; suite green.
 - Verify against Laravel 13.19.0, no code changes required. The 13.18/13.19 queue changes miss Torque's surface: the `SqsQueue::bulk()` rewrite is SQS-only, the after-commit rollback extraction is behavior-neutral, and the new `Release` middleware runs through the `CallQueuedHandler` pipeline Torque already uses. Horizon v5.45.6 through v5.47.2 contains only dashboard, CI, and dependency changes. Dependencies refreshed to `laravel/framework v13.19.0` and `webpatser/fledge-fiber v13.19.0.1`; suite green.
 
@@ -287,7 +294,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/webpatser/torque/compare/v0.12.0...v0.13.0
 [0.6.0]: https://github.com/webpatser/torque/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/webpatser/torque/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/webpatser/torque/compare/v0.5.0...v0.5.1

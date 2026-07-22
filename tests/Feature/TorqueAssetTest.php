@@ -42,3 +42,31 @@ it('throws when the stylesheet bundle is missing', function () {
         rename($backup, $path);
     }
 });
+
+afterEach(function () {
+    Torque::cspNonce(null);
+});
+
+it('has no CSP nonce by default', function () {
+    expect(Torque::cspNonceValue())->toBeNull()
+        ->and(Torque::cspNonceAttribute())->toBe('');
+});
+
+it('exposes an explicitly set CSP nonce', function () {
+    Torque::cspNonce('abc123');
+
+    expect(Torque::cspNonceValue())->toBe('abc123')
+        ->and(Torque::cspNonceAttribute())->toBe(' nonce="abc123"');
+});
+
+it('escapes the CSP nonce attribute value', function () {
+    Torque::cspNonce('"><script>');
+
+    expect(Torque::cspNonceAttribute())->not->toContain('<script>');
+});
+
+it('stamps the inlined stylesheet with the CSP nonce when one is set', function () {
+    Torque::cspNonce('abc123');
+
+    expect((string) Torque::css())->toStartWith('<style nonce="abc123">');
+});
