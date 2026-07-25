@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Queue\Events\JobProcessing;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 
 it('does not record when disabled', function () {
@@ -154,6 +155,63 @@ it('records multiple lifecycle events in order', function () {
     }
 
     expect($types)->toBe(['queued', 'started', 'completed']);
+
+    $redis->execute('DEL', $key);
+});
+
+it('records the display name on the started event for jobs from other drivers', function () {
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $uuid = 'test-'.bin2hex(random_bytes(8));
+    $key = 'torque-test:job:'.$uuid;
+
+    $redis->execute('DEL', $key);
+
+    $recorder = new JobStreamRecorder(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: 'torque-test:',
+    );
+
+    // A job that never got a torque "queued" event, as when a classic
+    // queue:work drains a legacy redis list during a migration: the started
+    // event is the first (and name-carrying) event in its stream.
+    $job = new class($uuid)
+    {
+        public function __construct(private string $uuid) {}
+
+        public function uuid(): string
+        {
+            return $this->uuid;
+        }
+
+        public function getQueue(): ?string
+        {
+            return 'default';
+        }
+
+        public function attempts(): int
+        {
+            return 1;
+        }
+
+        public function resolveName(): string
+        {
+            return 'App\\Jobs\\LegacyDrainedJob';
+        }
+    };
+
+    $recorder->onProcessing(new JobProcessing('redis', $job));
+
+    $entries = $redis->execute('XRANGE', $key, '-', '+');
+
+    expect($entries)->toBeArray()->not->toBeEmpty();
+
+    $fields = [];
+    for ($i = 0, $c = count($entries[0][1]); $i < $c; $i += 2) {
+        $fields[(string) $entries[0][1][$i]] = (string) $entries[0][1][$i + 1];
+    }
+
+    expect($fields['type'])->toBe('started');
+    expect($fields['displayName'])->toBe('App\\Jobs\\LegacyDrainedJob');
 
     $redis->execute('DEL', $key);
 });
