@@ -16,6 +16,7 @@ use Webpatser\Torque\Support\ProcessInspector;
  *   php artisan torque:start
  *   php artisan torque:start --workers=8 --concurrency=100
  *   php artisan torque:start --queues=emails,notifications
+ *   php artisan torque:start --replace   (supervisor entrypoint, see below)
  */
 final class TorqueStartCommand extends Command
 {
@@ -24,6 +25,7 @@ final class TorqueStartCommand extends Command
         {--workers= : Number of worker processes}
         {--concurrency= : Coroutine slots per worker}
         {--queues= : Comma-separated queue names}
+        {--replace : Absorb a running master via the takeover handshake instead of refusing to start (use as the supervisor program command)}
         {--takeover= : Internal: replace the running master with this PID (used by torque:reload)}';
 
     /** @var string */
@@ -33,17 +35,36 @@ final class TorqueStartCommand extends Command
     {
         $takeoverPid = $this->option('takeover') !== null ? (int) $this->option('takeover') : null;
 
+        if ($this->option('replace') && $takeoverPid !== null) {
+            $this->components->error('--replace and --takeover are mutually exclusive.');
+
+            return self::FAILURE;
+        }
+
         // Refuse to start if a master is already running, unless this is the
-        // takeover half of a reload replacing exactly that master.
+        // takeover half of a reload replacing exactly that master, or an
+        // explicit --replace start absorbing whatever master is live.
         $existingPid = MasterProcess::readPid();
 
-        if ($existingPid !== null && $existingPid !== $takeoverPid) {
+        if ($existingPid !== null && $existingPid !== $takeoverPid && ! $this->option('replace')) {
             $this->components->error("Torque is already running (master PID {$existingPid}). Run torque:stop first, or torque:reload to replace it.");
 
             return self::FAILURE;
         }
 
-        if ($takeoverPid !== null) {
+        if ($this->option('replace') && $existingPid !== null) {
+            // Supervisor convergence: a live master that is not ours (a stray
+            // takeover master, a manual start) is absorbed via the same
+            // handshake torque:reload uses, but WITHOUT the setsid detach:
+            // this process must remain the supervisor's child so exactly one
+            // supervised master exists once the old one has drained. If the
+            // new fleet never becomes ready the takeover aborts, the old
+            // master keeps running, and the supervisor retries.
+            $this->components->warn("Live master (PID {$existingPid}) found; absorbing it via takeover handshake.");
+            $takeoverPid = $existingPid;
+        }
+
+        if ($takeoverPid !== null && ! $this->option('replace')) {
             if ($existingPid === null) {
                 // The old master is already gone; proceed as a normal start.
                 $takeoverPid = null;

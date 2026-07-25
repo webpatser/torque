@@ -146,6 +146,7 @@ it('returns failure when the spawner reports a failure to spawn', function () {
 
     try {
         $exit = Artisan::call('torque:reload', [
+            '--force' => true,
             '--health-timeout' => 1,
             '--timeout' => 1,
         ]);
@@ -170,6 +171,7 @@ it('fails when readiness never reports OK within the health timeout', function (
 
     try {
         $exit = Artisan::call('torque:reload', [
+            '--force' => true,
             '--health-timeout' => 1,
             '--timeout' => 1,
         ]);
@@ -199,6 +201,7 @@ it('completes the full reload when readiness reports OK and the old PID drains',
 
     try {
         $exit = Artisan::call('torque:reload', [
+            '--force' => true,
             '--health-timeout' => 5,
             '--timeout' => 3,
         ]);
@@ -229,7 +232,7 @@ it('passes the old master pid to the spawner for the takeover flag', function ()
     };
 
     try {
-        $exit = Artisan::call('torque:reload');
+        $exit = Artisan::call('torque:reload', ['--force' => true]);
 
         expect($exit)->toBe(1)
             ->and($received)->toBe($master);
@@ -254,7 +257,57 @@ it('treats an old master that already exited at drain time as success', function
         return true;
     };
 
-    $exit = Artisan::call('torque:reload');
+    $exit = Artisan::call('torque:reload', ['--force' => true]);
 
     expect($exit)->toBe(0);
+});
+
+it('refuses the default mode against a supervised master', function () {
+    // The helper master is a child of this test process, so its parent PID
+    // is not 1: exactly the shape of a supervisord/systemd child.
+    $master = spawnSleep(10);
+    writeMasterPidFile($master);
+
+    $spawnerConsulted = false;
+    TorqueReloadCommand::$spawner = function () use (&$spawnerConsulted): ?int {
+        $spawnerConsulted = true;
+
+        return null;
+    };
+
+    try {
+        $exit = Artisan::call('torque:reload');
+
+        expect($exit)->not->toBe(0)
+            ->and(Artisan::output())->toContain('process supervisor')
+            // Refusal must happen before any takeover master is spawned.
+            ->and($spawnerConsulted)->toBeFalse()
+            ->and(torqueProcessIsAlive($master))->toBeTrue();
+    } finally {
+        posix_kill($master, SIGKILL);
+        pcntl_waitpid($master, $status);
+    }
+});
+
+it('succeeds quietly with --if-running when no PID file is present', function () {
+    $exit = Artisan::call('torque:reload', ['--drain' => true, '--if-running' => true]);
+
+    expect($exit)->toBe(0)
+        ->and(Artisan::output())->toContain('nothing to reload');
+});
+
+it('succeeds quietly with --if-running when the PID file is stale', function () {
+    // A PID whose process is gone fails readPid's identity check the same
+    // way a recycled PID does; --if-running must treat that as "not running".
+    $dead = spawnSleep(1);
+    if (! waitForTorqueExit($dead, 3)) {
+        posix_kill($dead, SIGKILL);
+        pcntl_waitpid($dead, $status);
+    }
+    writeMasterPidFile($dead);
+
+    $exit = Artisan::call('torque:reload', ['--drain' => true, '--if-running' => true]);
+
+    expect($exit)->toBe(0)
+        ->and(Artisan::output())->toContain('nothing to reload');
 });

@@ -33,6 +33,8 @@ final class TorqueReloadCommand extends Command
     /** @var string */
     protected $signature = 'torque:reload
         {--drain : Only signal the running master to drain; do not spawn a replacement}
+        {--if-running : Exit successfully when no master is running instead of failing (for deploy scripts)}
+        {--force : Spawn a takeover master even when the running master is supervised}
         {--timeout=30 : Seconds to wait for the old master to exit after the drain signal}
         {--health-timeout=45 : Seconds to wait for the new master to take over the PID file (covers its worker-heartbeat readiness gate)}';
 
@@ -100,6 +102,12 @@ final class TorqueReloadCommand extends Command
         $oldPid = MasterProcess::readPid();
 
         if ($oldPid === null) {
+            if ($this->option('if-running')) {
+                $this->components->warn('No running Torque master found (storage/torque.pid missing or stale); nothing to reload.');
+
+                return self::SUCCESS;
+            }
+
             $this->components->error('No running Torque master found (storage/torque.pid missing or stale).');
 
             return self::FAILURE;
@@ -114,17 +122,25 @@ final class TorqueReloadCommand extends Command
             return $this->signalDrain($oldPid, $drainTimeout);
         }
 
-        // A supervised master (supervisord, systemd) should be reloaded with
-        // --drain: the supervisor owns the respawn, and a self-spawned
-        // takeover master would run unsupervised from then on.
+        // A supervised master (supervisord, systemd) must be reloaded with
+        // --drain: the supervisor owns the respawn, while a self-spawned
+        // takeover master would run unsupervised from then on. Worse, once
+        // the old master drains, the supervisor's respawns collide with the
+        // unsupervised takeover master until startretries exhaust and the
+        // program goes FATAL, so the next drain leaves no queue at all.
+        // Refusing (instead of warning) turns that outage into a hard stop;
+        // --force remains for deliberately pulling a master out from under a
+        // supervisor.
         $masterParent = ProcessInspector::parentPid($oldPid);
 
-        if ($masterParent !== null && $masterParent !== 1) {
-            $this->components->warn(
+        if ($masterParent !== null && $masterParent !== 1 && ! $this->option('force')) {
+            $this->components->error(
                 "Master PID {$oldPid} appears to run under a process supervisor (parent PID {$masterParent}). "
-                .'Prefer `torque:reload --drain` there: the supervisor respawns the master, while a spawned '
-                .'takeover master would escape supervision.',
+                .'Use `torque:reload --drain` there: the supervisor respawns the master, while a spawned '
+                .'takeover master would escape supervision. Pass --force to spawn one anyway.',
             );
+
+            return self::FAILURE;
         }
 
         $this->components->info("Spawning replacement master (current PID: {$oldPid}).");

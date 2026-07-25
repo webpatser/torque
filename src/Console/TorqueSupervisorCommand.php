@@ -50,12 +50,18 @@ final class TorqueSupervisorCommand extends Command
         $artisanPath = base_path('artisan');
         $logPath = storage_path('logs/torque.log');
 
+        // --replace makes the supervised start converge: a live master that
+        // is not supervised (stray takeover master, manual start) is absorbed
+        // via the takeover handshake instead of the start failing until the
+        // program goes FATAL. startretries covers the window where an
+        // absorbed master is still draining.
         $config = <<<INI
         [program:torque]
         process_name=%(program_name)s
-        command=php "{$artisanPath}" torque:start --workers={$workers}
+        command=php "{$artisanPath}" torque:start --replace --workers={$workers}
         autostart=true
         autorestart=true
+        startretries=10
         stopwaitsecs=60
         user={$user}
         redirect_stderr=true

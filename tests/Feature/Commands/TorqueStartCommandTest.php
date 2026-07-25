@@ -100,3 +100,68 @@ it('refuses a takeover whose pid does not match the live master', function () {
         @unlink(MasterProcess::pidFilePath());
     }
 });
+
+it('rejects --replace combined with --takeover', function () {
+    $exit = Artisan::call('torque:start', ['--replace' => true, '--takeover' => 12345]);
+
+    expect($exit)->toBe(1)
+        ->and(Artisan::output())->toContain('mutually exclusive');
+});
+
+/*
+ * The --replace proceed-paths are pinned via the queue-name validation that
+ * runs after the replace/takeover gate but before any fork: an invalid
+ * queue makes the command exit early while the output proves which branch
+ * the gate took.
+ */
+
+it('absorbs a live master with --replace instead of refusing', function () {
+    if (PHP_OS_FAMILY === 'Windows' || ! function_exists('posix_kill')) {
+        $this->markTestSkipped('Requires posix.');
+    }
+
+    $master = spawnFakeTorqueMaster();
+    file_put_contents(MasterProcess::pidFilePath(), (string) $master);
+    usleep(150_000);
+
+    try {
+        $exit = Artisan::call('torque:start', ['--replace' => true, '--queues' => 'in valid']);
+        $output = Artisan::output();
+
+        expect($output)->toContain('absorbing it via takeover handshake')
+            ->and($output)->not->toContain('already running')
+            ->and($output)->toContain('Invalid queue name')
+            ->and($exit)->toBe(1)
+            // The gate must not have touched the live master.
+            ->and(posix_kill($master, 0))->toBeTrue();
+    } finally {
+        posix_kill($master, SIGKILL);
+        pcntl_waitpid($master, $status);
+        @unlink(MasterProcess::pidFilePath());
+    }
+});
+
+it('starts normally with --replace when the PID file is stale', function () {
+    if (PHP_OS_FAMILY === 'Windows' || ! function_exists('posix_kill')) {
+        $this->markTestSkipped('Requires posix.');
+    }
+
+    // A dead PID fails readPid's identity check: --replace must fall through
+    // to a normal start, not a takeover.
+    $master = spawnFakeTorqueMaster(1);
+    posix_kill($master, SIGKILL);
+    pcntl_waitpid($master, $status);
+    file_put_contents(MasterProcess::pidFilePath(), (string) $master);
+
+    try {
+        $exit = Artisan::call('torque:start', ['--replace' => true, '--queues' => 'in valid']);
+        $output = Artisan::output();
+
+        expect($output)->not->toContain('absorbing it via takeover handshake')
+            ->and($output)->not->toContain('already running')
+            ->and($output)->toContain('Invalid queue name')
+            ->and($exit)->toBe(1);
+    } finally {
+        @unlink(MasterProcess::pidFilePath());
+    }
+});
