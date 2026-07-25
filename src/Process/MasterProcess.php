@@ -97,7 +97,9 @@ final class MasterProcess
             // Normal start: mutual exclusion up front. The lock, not a pgrep
             // sweep, decides whether another master is running.
             if (! $this->tryAcquireMasterLock()) {
-                ($this->logger)('Another Torque master holds the lock; refusing to start.');
+                // Either a live master holds the flock, or the lock file is
+                // unopenable (tryAcquireMasterLock logged the specifics).
+                ($this->logger)('Could not acquire the master lock (is another master running?); refusing to start.');
 
                 return 1;
             }
@@ -566,9 +568,22 @@ final class MasterProcess
      */
     private function tryAcquireMasterLock(): bool
     {
-        $handle = @fopen(self::lockFilePath(), 'c');
+        $path = self::lockFilePath();
+        $existed = file_exists($path);
+        $handle = @fopen($path, 'c');
 
         if ($handle === false) {
+            // Not "lock held": the file cannot even be opened. Seen in the
+            // wild when deploy tooling chowns storage to the web user and the
+            // supervised master (a different user) loses write access; saying
+            // "another master holds the lock" sent the operator hunting a
+            // ghost process. Report the real failure.
+            ($this->logger)(sprintf(
+                'Cannot open master lock file %s (%s); fix ownership/permissions of the storage directory.',
+                $path,
+                error_get_last()['message'] ?? 'unknown error',
+            ));
+
             return false;
         }
 
@@ -576,6 +591,12 @@ final class MasterProcess
             fclose($handle);
 
             return false;
+        }
+
+        if (! $existed) {
+            // Group-writable from birth: survives a deploy-time chown to the
+            // web user (see writePidFile).
+            @chmod($path, 0664);
         }
 
         $this->lockHandle = $handle;
@@ -779,6 +800,11 @@ final class MasterProcess
         if (file_put_contents($tmpPath, (string) getmypid(), LOCK_EX) === false) {
             throw new \RuntimeException("Failed to write temporary PID file at {$tmpPath}.");
         }
+
+        // Group-writable: deploy tooling that chowns storage to the web user
+        // (Deployer writable_mode=chown with a different http_user) must not
+        // lock the supervised master's own runtime files away from it.
+        @chmod($tmpPath, 0664);
 
         if (! rename($tmpPath, $path)) {
             @unlink($tmpPath);

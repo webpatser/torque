@@ -290,10 +290,18 @@ final class TorqueReloadCommand extends Command
      */
     private function acquireReloadLock(): bool
     {
-        $handle = @fopen(storage_path('torque.reload.lock'), 'c');
+        $path = storage_path('torque.reload.lock');
+        $existed = file_exists($path);
+        $handle = @fopen($path, 'c');
 
         if ($handle === false) {
             return false;
+        }
+
+        if (! $existed) {
+            // Group-writable from birth: survives a deploy-time chown to the
+            // web user (see MasterProcess::writePidFile).
+            @chmod($path, 0664);
         }
 
         if (! flock($handle, LOCK_EX | LOCK_NB)) {
