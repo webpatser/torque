@@ -63,7 +63,11 @@ it('readPid returns null when the pid file is missing', function () {
     expect(MasterProcess::readPid())->toBeNull();
 });
 
-it('readPid returns null and unlinks the file when the pid is stale', function () {
+it('readPid returns null but leaves a stale pid file in place', function () {
+    // Readers must never unlink: during a takeover the old master's death
+    // races the new master's atomic rename, and an unlinking reader could
+    // delete the NEW master's freshly written entry. The owning master's
+    // lease maintenance reclaims the file instead.
     $child = pcntl_fork();
     if ($child === 0) {
         usleep(50_000);
@@ -76,7 +80,7 @@ it('readPid returns null and unlinks the file when the pid is stale', function (
     file_put_contents(MasterProcess::pidFilePath(), (string) $child);
 
     expect(MasterProcess::readPid())->toBeNull()
-        ->and(file_exists(MasterProcess::pidFilePath()))->toBeFalse();
+        ->and(file_exists(MasterProcess::pidFilePath()))->toBeTrue();
 });
 
 it('readPid returns the live pid when the file points at a running torque master', function () {
@@ -126,7 +130,7 @@ it('readPid treats a recycled PID running an unrelated process as stale', functi
 
     try {
         expect(MasterProcess::readPid())->toBeNull()
-            ->and(file_exists(MasterProcess::pidFilePath()))->toBeFalse();
+            ->and(file_exists(MasterProcess::pidFilePath()))->toBeTrue();
     } finally {
         posix_kill($child, SIGKILL);
         pcntl_waitpid($child, $status);

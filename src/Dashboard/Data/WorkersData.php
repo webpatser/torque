@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Dashboard\Data;
 
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\WorkerId;
 
 /**
  * Per-worker read-model for the workers screen.
@@ -25,7 +26,11 @@ final class WorkersData
         $workers = [];
 
         foreach ($this->metrics->getAllWorkerMetrics() as $id => $w) {
-            [$host, $pid] = self::splitId((string) $id);
+            // Prefer the published pid/host fields; fall back to parsing the
+            // `{host}-{pid}-{hex}` worker id for rows written by older code.
+            $parsed = WorkerId::parse((string) $id);
+            $pid = isset($w['pid']) ? (int) $w['pid'] : $parsed->pid;
+            $host = $w['host'] ?? $parsed->host;
 
             $workers[] = [
                 'id' => (string) $id,
@@ -48,24 +53,5 @@ final class WorkersData
         }
 
         return ['workers' => $workers];
-    }
-
-    /**
-     * Split a `{host}-{pid}` worker id on the LAST dash (hostnames may contain
-     * dashes). Returns a null pid when the tail is not numeric.
-     *
-     * @return array{0: string, 1: int|null}
-     */
-    private static function splitId(string $id): array
-    {
-        $pos = strrpos($id, '-');
-
-        if ($pos === false) {
-            return [$id, null];
-        }
-
-        $tail = substr($id, $pos + 1);
-
-        return [substr($id, 0, $pos), ctype_digit($tail) ? (int) $tail : null];
     }
 }

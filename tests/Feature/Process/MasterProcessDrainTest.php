@@ -109,9 +109,14 @@ it('sets the paused key with an expiry so a drained-away master cannot leave the
 
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
     $ttl = (int) $redis->execute('TTL', 'torque-drain-test:paused');
+    $value = (string) $redis->execute('GET', 'torque-drain-test:paused');
 
     // grace (2s) + 60s buffer; TTL counts down, so anything in (0, 62] is correct.
-    expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(62);
+    expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(62)
+        // The value scopes the pause to this master's own fleet: workers
+        // compare the embedded PID against their parent and ignore a drain
+        // that is not theirs (see WorkerProcess::shouldPauseFor()).
+        ->and($value)->toBe('drain:'.getmypid());
 
     $redis->execute('DEL', 'torque-drain-test:paused');
 });

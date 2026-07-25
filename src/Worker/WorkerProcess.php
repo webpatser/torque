@@ -141,6 +141,24 @@ LUA;
 
         $events = app(Dispatcher::class);
 
+        // Mirror queue:work's failed-job bookkeeping (WorkCommand::listenForEvents):
+        // the failed-jobs provider write is a listener concern of the worker command
+        // in Laravel, not of Job::fail() itself, so without this listener every
+        // failure lands in the dead-letter stream but queue:failed and queue:retry
+        // stay empty. Guarded so a broken failer write is loud but never fatal.
+        $events->listen(JobFailed::class, static function (JobFailed $event): void {
+            try {
+                app('queue.failer')->log(
+                    $event->connectionName,
+                    $event->job->getQueue(),
+                    $event->job->getRawBody(),
+                    $event->exception,
+                );
+            } catch (\Throwable $e) {
+                fwrite(STDERR, "[torque:worker] failed-jobs log threw: {$e->getMessage()}\n");
+            }
+        });
+
         $deadLetterConfig = $this->config['dead_letter'] ?? [];
         $deadLetterHandler = new DeadLetterHandler(
             redisUri: $redisUri,
@@ -206,12 +224,32 @@ LUA;
         EventLoop::onSignal(SIGTERM, fn () => $shutdownHandler(SIGTERM));
         EventLoop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
 
-        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue) {
-            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue) {
-                $isPaused = (bool) $redis->execute('EXISTS', $prefix.'paused');
+        $masterPidForPause = posix_getppid();
+        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause) {
+            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause) {
+                $value = $redis->execute('GET', $prefix.'paused');
+                $ttl = (int) $redis->execute('TTL', $prefix.'paused');
+
+                $isPaused = self::shouldPauseFor(
+                    $value === null ? null : (string) $value,
+                    $ttl,
+                    $masterPidForPause,
+                );
 
                 self::applyPauseTransition($isPaused, $pauseState, $events, $connectionName, $primaryQueue);
             });
+        });
+
+        // Parent-death watchdog: the master exec'd this process, so at boot the
+        // parent IS the master. When the master dies without SIGTERMing us (kill -9,
+        // OOM), we get reparented and would otherwise keep consuming as an orphan
+        // forever. Detect the reparenting and drain out through the normal stop path.
+        $masterPid = posix_getppid();
+        EventLoop::repeat(2.0, function () use ($masterPid) {
+            if (! $this->stopRequested && posix_getppid() !== $masterPid) {
+                fwrite(STDERR, "[torque:worker] Master (PID {$masterPid}) is gone, shutting down orphaned worker\n");
+                $this->stopRequested = true;
+            }
         });
 
         // Spawn N reader Fibers (one per concurrency slot).
@@ -652,6 +690,34 @@ LUA;
     }
 
     /**
+     * Decide whether this worker should pause for the current pause key.
+     *
+     * The key's TTL discriminates the two pause kinds:
+     * - A TTL'd key is a drain-scoped pause written by a draining master as
+     *   `drain:<masterPid>`. It only applies to that master's own workers,
+     *   so a takeover's old fleet drains without pausing the replacement.
+     *   Legacy-format drain values (timestamps) also carry a TTL and are
+     *   ignored the same way: under an old-code master its drain degrades to
+     *   the plain SIGTERM-after-grace stop, which is safe.
+     * - A TTL-less key is a deliberate `torque:pause` and pauses every fleet.
+     *
+     * Static and pure for unit testing. `$ttl` uses Redis semantics: -2 key
+     * missing, -1 no expiry, >0 seconds remaining.
+     */
+    public static function shouldPauseFor(?string $value, int $ttl, int $masterPid): bool
+    {
+        if ($value === null || $ttl === -2) {
+            return false;
+        }
+
+        if ($ttl === -1) {
+            return true;
+        }
+
+        return $value === 'drain:'.$masterPid;
+    }
+
+    /**
      * Reconcile the pause flag with the latest Redis state and dispatch the
      * matching Laravel event when it transitions.
      *
@@ -783,13 +849,18 @@ LUA;
             // stream message and calls the job's failed() callback.
             try {
                 $job->fail($exception);
-            } catch (\Throwable) {
+            } catch (\Throwable $failError) {
                 // fail() already deleted the message from the stream.
                 // If it throws after that (e.g. failed() callback or DB),
-                // the job is already in dead-letter — safe to swallow.
+                // the job is already in dead-letter — safe to swallow, but
+                // never silently: a broken failed_jobs write would otherwise
+                // hide every failure from queue:failed and retry tooling.
+                fwrite(STDERR, "[torque:worker] job->fail() threw: {$failError->getMessage()} in {$failError->getFile()}:{$failError->getLine()}\n");
             }
 
-            $events->dispatch(new JobFailed($connectionName, $job, $exception));
+            // No manual JobFailed dispatch here: Job::fail() already dispatches it
+            // in its finally block, and a second event would double-write the
+            // failed-jobs row now that the worker registers the logging listener.
 
             // Fire a domain event so users can hook in custom notification logic.
             try {

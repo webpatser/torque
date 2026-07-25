@@ -215,3 +215,46 @@ it('completes the full reload when readiness reports OK and the old PID drains',
         }
     }
 });
+
+it('passes the old master pid to the spawner for the takeover flag', function () {
+    $master = spawnSleep(10);
+    writeMasterPidFile($master);
+
+    $received = null;
+
+    TorqueReloadCommand::$spawner = function (int $oldPid) use (&$received): ?int {
+        $received = $oldPid;
+
+        return null;
+    };
+
+    try {
+        $exit = Artisan::call('torque:reload');
+
+        expect($exit)->toBe(1)
+            ->and($received)->toBe($master);
+    } finally {
+        posix_kill($master, SIGKILL);
+    }
+});
+
+it('treats an old master that already exited at drain time as success', function () {
+    $master = spawnSleep(10);
+    writeMasterPidFile($master);
+
+    TorqueReloadCommand::$spawner = fn (): ?int => 999999;
+
+    // Readiness "succeeds" and the old master dies in the same window, as
+    // happens when the takeover master signalled the drain itself and the
+    // old master exited before this command got to its own signal.
+    TorqueReloadCommand::$readinessChecker = function () use ($master): bool {
+        posix_kill($master, SIGKILL);
+        pcntl_waitpid($master, $status);
+
+        return true;
+    };
+
+    $exit = Artisan::call('torque:reload');
+
+    expect($exit)->toBe(0);
+});

@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
-use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\ProcessInspector;
 
 /**
  * Stop the running Torque master process.
@@ -54,30 +54,16 @@ final class TorqueStopCommand extends Command
             }
         }
 
-        // No valid PID from file — try to find orphaned master processes via pgrep.
+        // No valid PID from file: nothing to stop. This command is scoped to
+        // the master this storage dir describes; it never pgrep-hunts other
+        // masters (that would kill a mid-takeover replacement, another
+        // release, or another app on the same host). A live master with a
+        // lost PID file rewrites it within a second via its lease
+        // maintenance, so hunting is also unnecessary. Reparented workers
+        // whose master died are still swept.
         if ($pid === null) {
-            $orphanPids = $this->findOrphanMasters();
-
-            if ($orphanPids === []) {
-                $this->killOrphanWorkers();
-                $this->cleanupWorkerMetrics();
-                $this->components->info('No running Torque processes found.');
-
-                return self::SUCCESS;
-            }
-
-            // Kill all orphaned masters and their workers.
-            $this->components->info('Found orphaned Torque process(es): '.implode(', ', $orphanPids).'. Killing...');
-
-            foreach ($orphanPids as $orphanPid) {
-                posix_kill(-$orphanPid, SIGKILL);
-                posix_kill($orphanPid, SIGKILL);
-            }
-
             $this->killOrphanWorkers();
-            $this->removePidFile($pidFile);
-            $this->cleanupWorkerMetrics();
-            $this->components->info('Orphaned Torque processes killed.');
+            $this->components->info('No running Torque processes found.');
 
             return self::SUCCESS;
         }
@@ -91,7 +77,6 @@ final class TorqueStopCommand extends Command
 
             usleep(self::POLL_INTERVAL);
             $this->removePidFile($pidFile);
-            $this->cleanupWorkerMetrics();
             $this->components->info('Torque master and workers killed.');
 
             return self::SUCCESS;
@@ -120,7 +105,6 @@ final class TorqueStopCommand extends Command
             // posix_kill with signal 0 returns false when the process no longer exists.
             if (! posix_kill($pid, 0)) {
                 $this->removePidFile($pidFile);
-                $this->cleanupWorkerMetrics();
                 $this->components->info('Torque master stopped gracefully.');
 
                 return self::SUCCESS;
@@ -138,7 +122,6 @@ final class TorqueStopCommand extends Command
         $this->killProcessGroup($pid);
         usleep(self::POLL_INTERVAL);
         $this->removePidFile($pidFile);
-        $this->cleanupWorkerMetrics();
         $this->components->info('Torque master and workers killed.');
 
         return self::SUCCESS;
@@ -155,31 +138,12 @@ final class TorqueStopCommand extends Command
     }
 
     /**
-     * Find orphaned torque:start master processes via pgrep.
-     *
-     * Uses the deploy base directory (without release-specific path) to match
-     * processes from any release, which is essential for Deployer setups.
-     *
-     * @return list<int>
-     */
-    private function findOrphanMasters(): array
-    {
-        // The first pattern character is bracketed so the `sh -c` wrapper PHP
-        // spawns for exec(), whose own argv contains the pattern text, never
-        // matches itself.
-        $output = [];
-        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:start'), $output);
-
-        return array_values(array_filter(
-            array_map('intval', $output),
-            fn (int $pid) => $pid > 0 && $pid !== getmypid(),
-        ));
-    }
-
-    /**
-     * Kill any orphaned torque:worker processes.
-     *
-     * Uses a broad pattern to match workers from any release path.
+     * Kill orphaned torque:worker processes: workers whose parent is no
+     * longer a live torque master. Parentage-filtered so a fleet whose
+     * master is alive (a takeover in progress, another release on the same
+     * host) is never touched. The first pattern character is bracketed so
+     * the `sh -c` wrapper PHP spawns for exec(), whose own argv contains
+     * the pattern text, never matches itself.
      */
     private function killOrphanWorkers(): void
     {
@@ -188,7 +152,14 @@ final class TorqueStopCommand extends Command
 
         foreach ($output as $line) {
             $pid = (int) trim($line);
-            if ($pid > 0 && $pid !== getmypid()) {
+
+            if ($pid <= 0 || $pid === getmypid()) {
+                continue;
+            }
+
+            $parent = ProcessInspector::parentPid($pid);
+
+            if ($parent !== null && ! ProcessInspector::isTorqueMaster($parent)) {
                 posix_kill($pid, SIGKILL);
             }
         }
@@ -204,17 +175,5 @@ final class TorqueStopCommand extends Command
     {
         // Negative PID = send signal to entire process group.
         posix_kill(-$pid, SIGKILL);
-    }
-
-    /**
-     * Remove all worker metrics keys from Redis so they don't linger as ghosts.
-     */
-    private function cleanupWorkerMetrics(): void
-    {
-        try {
-            app(MetricsPublisher::class)->removeAllWorkerMetrics();
-        } catch (\Throwable) {
-            // Best-effort — Redis may be unavailable.
-        }
     }
 }

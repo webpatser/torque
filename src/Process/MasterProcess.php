@@ -8,6 +8,8 @@ use Closure;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\ProcessInspector;
+use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -43,6 +45,26 @@ final class MasterProcess
 
     private ?MetricsPublisher $metricsPublisher = null;
 
+    /**
+     * The exclusive master lock (flock on storage/torque.lock), held for the
+     * process lifetime. Mutual exclusion between masters lives here, not in
+     * pgrep sweeps: the kernel releases the lock on any exit, including
+     * SIGKILL. During a takeover the old master still holds it, so the
+     * replacement acquires it lazily from the monitor loop once the old
+     * master exits.
+     *
+     * @var resource|null
+     */
+    private $lockHandle = null;
+
+    /** Whether this master has written (and thus owns) the PID file. */
+    private bool $ownsPidFile = false;
+
+    /** Rolling throughput state for the aggregate metrics publisher. */
+    private ?int $lastAggregateJobsTotal = null;
+
+    private ?float $lastAggregateAt = null;
+
     /** Current number of running worker processes. */
     public int $workerCount {
         get => count($this->workerPids);
@@ -57,6 +79,7 @@ final class MasterProcess
     public function __construct(
         private readonly array $config,
         private readonly Closure $logger,
+        private readonly ?int $takeoverPid = null,
     ) {
         $this->artisanPath = base_path('artisan');
     }
@@ -70,8 +93,24 @@ final class MasterProcess
     {
         pcntl_async_signals(true);
 
-        // Write PID file so torque:stop/status can find us.
-        $this->writePidFile();
+        if ($this->takeoverPid === null) {
+            // Normal start: mutual exclusion up front. The lock, not a pgrep
+            // sweep, decides whether another master is running.
+            if (! $this->tryAcquireMasterLock()) {
+                ($this->logger)('Another Torque master holds the lock; refusing to start.');
+
+                return 1;
+            }
+
+            // Write PID file so torque:stop/status can find us.
+            $this->writePidFile();
+            $this->ownsPidFile = true;
+        }
+        // Takeover: the old master still holds the lock and the PID file.
+        // Both are claimed later: the lock lazily once the old master exits,
+        // the PID file only after this master's own fleet proves healthy
+        // (see the takeover block below), so a broken deploy aborts the
+        // reload instead of draining a healthy fleet into an outage.
 
         // Graceful shutdown: forward signal to all children.
         pcntl_signal(SIGTERM, function () {
@@ -103,6 +142,33 @@ final class MasterProcess
             $this->spawnWorker();
         }
 
+        if ($this->takeoverPid !== null) {
+            // Takeover handshake: only a demonstrably live fleet may take the
+            // PID file. The flip is the readiness signal torque:reload polls,
+            // so it must mean "the new fleet is processing", not "forks ran".
+            if (! $this->waitForOwnFleetReady()) {
+                ($this->logger)('Takeover aborted: no worker heartbeat within the readiness window. Old master left untouched.');
+                $this->shouldStop = true;
+                $this->signalChildren(SIGTERM);
+                $this->monitor();
+
+                return 1;
+            }
+
+            $this->writePidFile();
+            $this->ownsPidFile = true;
+            $this->signalOldMaster();
+        }
+
+        // The aggregate metrics publisher runs for every master when metrics
+        // are enabled; autoscale additionally builds its scaler on top of it.
+        if ($this->config['metrics']['enabled'] ?? true) {
+            $this->metricsPublisher = new MetricsPublisher(
+                redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+                prefix: $this->config['redis']['prefix'] ?? 'torque:',
+            );
+        }
+
         if ($this->config['autoscale']['enabled'] ?? false) {
             $autoscaleConfig = $this->config['autoscale'];
             $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
@@ -116,7 +182,9 @@ final class MasterProcess
                 cooldownSeconds: (int) ($autoscaleConfig['cooldown'] ?? 30),
             );
 
-            $this->metricsPublisher = new MetricsPublisher(
+            // Autoscale reads worker metrics, so it needs the publisher even
+            // when the aggregate publishing itself was disabled.
+            $this->metricsPublisher ??= new MetricsPublisher(
                 redisUri: $redisUri,
                 prefix: $this->config['redis']['prefix'] ?? 'torque:',
             );
@@ -128,18 +196,11 @@ final class MasterProcess
 
         $exitCode = $this->monitor();
 
-        // Clean up all worker metrics keys from Redis after all workers have exited.
-        // This is the safety net — individual workers clean up on graceful exit, but
-        // SIGKILL or crashes may leave ghost entries.
-        try {
-            $publisher = new MetricsPublisher(
-                redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                prefix: $this->config['redis']['prefix'] ?? 'torque:',
-            );
-            $publisher->removeAllWorkerMetrics();
-        } catch (\Throwable) {
-            // Best-effort — don't prevent shutdown.
-        }
+        // No global worker-metrics wipe here: workers delete their own key on
+        // graceful exit and every hash carries a heartbeat TTL, so crash
+        // ghosts self-expire within a minute. A wipe would also delete the
+        // replacement fleet's metrics when a drained-away master exits after
+        // a takeover.
 
         $this->removePidFile();
 
@@ -204,8 +265,9 @@ final class MasterProcess
             pcntl_sigprocmask(SIG_BLOCK, [SIGTERM, SIGINT, SIGCHLD, SIGUSR2]);
         }
 
-        // Evaluate autoscaling every ~10 iterations (~1 second at 100ms wait).
-        $autoscaleTick = 0;
+        // Run maintenance (lease self-heal, aggregate metrics, autoscale)
+        // every ~10 iterations (~1 second at 100ms wait).
+        $maintenanceTick = 0;
 
         while (! empty($this->workerPids)) {
             if ($syncSignals) {
@@ -258,10 +320,15 @@ final class MasterProcess
             // and fire its watchdog if the grace period has elapsed.
             $this->handleDrainTick();
 
-            // Autoscale evaluation on a throttled tick.
-            if ($this->autoScaler !== null && ++$autoscaleTick >= 10) {
-                $autoscaleTick = 0;
-                $this->evaluateAutoscale();
+            if (++$maintenanceTick >= 10) {
+                $maintenanceTick = 0;
+
+                $this->maintainLease();
+                $this->publishAggregateMetrics();
+
+                if ($this->autoScaler !== null) {
+                    $this->evaluateAutoscale();
+                }
             }
         }
 
@@ -275,15 +342,26 @@ final class MasterProcess
      */
     private function evaluateAutoscale(): void
     {
-        $rawMetrics = $this->metricsPublisher->getAllWorkerMetrics();
+        // Never scale during a drain: the fleet is shutting down or handing
+        // over, and scaling up mid-drain would fork workers just to kill them.
+        if ($this->draining || $this->drainRequested) {
+            return;
+        }
 
-        // Build the format AutoScaler expects: ['active' => int, 'total' => int] per worker.
+        $rawMetrics = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
+
+        // Build the format AutoScaler expects, keyed by the worker's PID so
+        // scale-down can match against our child PID set.
         $workerMetrics = [];
         foreach ($rawMetrics as $workerId => $data) {
-            $workerMetrics[$workerId] = [
-                'active' => (int) ($data['active_slots'] ?? 0),
-                'total' => (int) ($data['total_slots'] ?? 0),
-            ];
+            $pid = (int) ($data['pid'] ?? (WorkerId::parse($workerId)->pid ?? 0));
+
+            if ($pid > 0) {
+                $workerMetrics[$pid] = [
+                    'active' => (int) ($data['active_slots'] ?? 0),
+                    'total' => (int) ($data['total_slots'] ?? 0),
+                ];
+            }
         }
 
         $decision = $this->autoScaler->evaluate($this->workerCount, $workerMetrics);
@@ -293,6 +371,28 @@ final class MasterProcess
             ScaleDecision::ScaleDown => $this->scaleDown($workerMetrics),
             ScaleDecision::NoChange => null,
         };
+    }
+
+    /**
+     * Filter a worker-metrics map down to this master's own children.
+     *
+     * During a takeover two fleets publish side by side; autoscaling and the
+     * aggregate metrics must only ever describe our own.
+     *
+     * @param  array<string, array<string, string>>  $workers
+     * @return array<string, array<string, string>>
+     */
+    private function ownWorkerMetrics(array $workers): array
+    {
+        return array_filter(
+            $workers,
+            function (array $data, string $workerId): bool {
+                $pid = (int) ($data['pid'] ?? (WorkerId::parse($workerId)->pid ?? 0));
+
+                return isset($this->workerPids[$pid]);
+            },
+            ARRAY_FILTER_USE_BOTH,
+        );
     }
 
     /**
@@ -315,14 +415,14 @@ final class MasterProcess
      */
     private function scaleDown(array $workerMetrics): void
     {
-        // Build a PID-to-active-slots map for workers we currently own.
-        // Worker IDs in Redis may be PID-based or arbitrary — match against our PID set.
+        // Build a PID-to-active-slots map for workers we currently own; the
+        // metrics map is keyed by PID (see evaluateAutoscale). A child with
+        // no metrics row yet sorts last so a just-forked worker is never the
+        // scale-down victim.
         $pidActivity = [];
 
         foreach (array_keys($this->workerPids) as $pid) {
-            // Try both the raw PID and string variants as the worker ID.
-            $pidStr = (string) $pid;
-            $pidActivity[$pid] = (int) ($workerMetrics[$pidStr]['active'] ?? PHP_INT_MAX);
+            $pidActivity[$pid] = (int) ($workerMetrics[$pid]['active'] ?? PHP_INT_MAX);
         }
 
         if ($pidActivity === []) {
@@ -426,8 +526,14 @@ final class MasterProcess
             $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
             $prefix = $this->config['redis']['prefix'] ?? 'torque:';
 
+            // The value scopes the pause to THIS master's fleet: workers
+            // compare the embedded PID against their own parent and ignore a
+            // drain that is not theirs, so a draining old master never pauses
+            // the replacement fleet during a takeover. A deliberate
+            // `torque:pause` writes a TTL-less generic value that pauses
+            // every fleet (see WorkerProcess::shouldPauseFor()).
             createRedisClient($redisUri)
-                ->execute('SET', $prefix.'paused', (string) time(), 'EX', (string) ($grace + 60));
+                ->execute('SET', $prefix.'paused', 'drain:'.getmypid(), 'EX', (string) ($grace + 60));
         } catch (\Throwable $e) {
             ($this->logger)("Drain: failed to set Redis paused key ({$e->getMessage()}); proceeding with timed SIGTERM.");
         }
@@ -441,6 +547,214 @@ final class MasterProcess
     public static function pidFilePath(): string
     {
         return storage_path('torque.pid');
+    }
+
+    /**
+     * Get the path to the master lock file.
+     */
+    public static function lockFilePath(): string
+    {
+        return storage_path('torque.lock');
+    }
+
+    /**
+     * Try to take the exclusive master lock without blocking.
+     *
+     * The lock is held for the process lifetime; the kernel releases it on
+     * any exit (including SIGKILL), which makes it the reliable mutual
+     * exclusion between masters where pgrep sweeps and PID files are racy.
+     */
+    private function tryAcquireMasterLock(): bool
+    {
+        $handle = @fopen(self::lockFilePath(), 'c');
+
+        if ($handle === false) {
+            return false;
+        }
+
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return false;
+        }
+
+        $this->lockHandle = $handle;
+
+        return true;
+    }
+
+    /**
+     * Per-second lease maintenance from the monitor loop.
+     *
+     * - A takeover master acquires the master lock lazily, the moment the
+     *   drained old master exits and the kernel releases it.
+     * - The PID file self-heals: rewritten when missing, reclaimed when it
+     *   holds a dead or foreign PID, and — the losing side of a clobber
+     *   race — this master self-demotes into a drain when another LIVE
+     *   torque master owns the file.
+     */
+    private function maintainLease(): void
+    {
+        if ($this->lockHandle === null && $this->tryAcquireMasterLock()) {
+            ($this->logger)('Master lock acquired.');
+        }
+
+        if (! $this->ownsPidFile || $this->shouldStop) {
+            return;
+        }
+
+        $path = self::pidFilePath();
+
+        if (is_link($path)) {
+            return;
+        }
+
+        $raw = @file_get_contents($path);
+        $pidInFile = $raw === false ? null : (int) $raw;
+
+        if ($pidInFile === getmypid()) {
+            return;
+        }
+
+        if ($pidInFile !== null && $pidInFile > 0 && ProcessInspector::isTorqueMaster($pidInFile)) {
+            ($this->logger)("PID file is owned by live master {$pidInFile}; self-demoting into a drain.");
+            $this->ownsPidFile = false;
+            $this->drainRequested = true;
+
+            return;
+        }
+
+        if (! $this->draining && ! $this->drainRequested) {
+            ($this->logger)($raw === false
+                ? 'PID file missing; rewriting.'
+                : "PID file held stale PID {$pidInFile}; reclaiming.");
+
+            try {
+                $this->writePidFile();
+            } catch (\Throwable $e) {
+                ($this->logger)("PID file rewrite failed: {$e->getMessage()}");
+            }
+        }
+    }
+
+    /**
+     * Wait for at least one of this master's own workers to publish a
+     * metrics heartbeat, proving the new fleet actually boots and runs.
+     *
+     * Children are reaped (not respawned) while waiting; a fleet whose every
+     * worker died is reported failed immediately.
+     */
+    private function waitForOwnFleetReady(): bool
+    {
+        $timeout = (float) ($this->config['takeover_ready_timeout'] ?? 30.0);
+        $deadline = microtime(true) + $timeout;
+
+        $publisher = new MetricsPublisher(
+            redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+            prefix: $this->config['redis']['prefix'] ?? 'torque:',
+        );
+
+        while (microtime(true) < $deadline && ! $this->shouldStop) {
+            while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
+                unset($this->workerPids[$pid]);
+                ($this->logger)("Worker PID {$pid} exited during takeover readiness.");
+            }
+
+            if ($this->workerPids === []) {
+                return false;
+            }
+
+            try {
+                foreach ($publisher->getAllWorkerMetrics() as $data) {
+                    if (isset($this->workerPids[(int) ($data['pid'] ?? 0)])) {
+                        return true;
+                    }
+                }
+            } catch (\Throwable) {
+                // Redis hiccup: keep polling until the deadline.
+            }
+
+            usleep(250_000);
+        }
+
+        return false;
+    }
+
+    /**
+     * Ask the old master to drain, master-to-master.
+     *
+     * Idempotent with torque:reload's own signal; this copy covers a reload
+     * process that died between spawning us and signalling. Only a process
+     * positively identified as a torque master is ever signalled: SIGUSR2's
+     * default disposition terminates, so a recycled PID must never receive it.
+     */
+    private function signalOldMaster(): void
+    {
+        $oldPid = $this->takeoverPid;
+
+        if ($oldPid === null || $oldPid === getmypid()) {
+            return;
+        }
+
+        if (! posix_kill($oldPid, 0)) {
+            ($this->logger)("Old master (PID {$oldPid}) already exited.");
+
+            return;
+        }
+
+        $cmdline = ProcessInspector::commandLine($oldPid);
+
+        if ($cmdline === null || ! str_contains($cmdline, 'torque:start')) {
+            ($this->logger)("PID {$oldPid} is not identifiably a torque master; not signalling it.");
+
+            return;
+        }
+
+        posix_kill($oldPid, SIGUSR2);
+        ($this->logger)("Signalled old master (PID {$oldPid}) to drain.");
+    }
+
+    /**
+     * Publish the aggregated fleet metrics from the monitor loop.
+     *
+     * Throughput is a real jobs-per-second computed from the delta of
+     * processed+failed counters between publishes; worker restarts reset
+     * their counters, so negative deltas clamp to zero rather than
+     * publishing nonsense.
+     */
+    private function publishAggregateMetrics(): void
+    {
+        if ($this->metricsPublisher === null || ! ($this->config['metrics']['enabled'] ?? true)) {
+            return;
+        }
+
+        $interval = max(1, (int) ($this->config['metrics']['publish_interval'] ?? 1));
+        $now = microtime(true);
+
+        if ($this->lastAggregateAt !== null && ($now - $this->lastAggregateAt) < $interval) {
+            return;
+        }
+
+        try {
+            $workers = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
+            $aggregate = $this->metricsPublisher->aggregateFromWorkers($workers);
+
+            $jobsTotal = (int) $aggregate['jobs_processed'] + (int) $aggregate['jobs_failed'];
+
+            if ($this->lastAggregateJobsTotal !== null && $this->lastAggregateAt !== null && $now > $this->lastAggregateAt) {
+                $delta = $jobsTotal - $this->lastAggregateJobsTotal;
+                $aggregate['throughput'] = $delta > 0
+                    ? round($delta / ($now - $this->lastAggregateAt), 2)
+                    : 0.0;
+            }
+
+            $this->lastAggregateJobsTotal = $jobsTotal;
+            $this->lastAggregateAt = $now;
+
+            $this->metricsPublisher->publishAggregate($aggregate);
+        } catch (\Throwable) {
+            // Metrics must never take the master down.
+        }
     }
 
     /**
@@ -518,34 +832,16 @@ final class MasterProcess
         // number is often reassigned to an unrelated process (php-fpm,
         // the test runner, ...) which posix_kill alone cannot tell apart
         // from a real master.
-        if (posix_kill($pid, 0) && self::processIsTorqueMaster($pid)) {
+        //
+        // Readers never unlink a stale file: during a takeover the old
+        // master's death races the new master's atomic rename, and a reader
+        // that unlinks in that window deletes the NEW master's entry. A dead
+        // PID simply reads as "not running"; the owning master's lease
+        // maintenance rewrites or reclaims the file on its own.
+        if (posix_kill($pid, 0) && ProcessInspector::isTorqueMaster($pid)) {
             return $pid;
         }
 
-        // Stale PID file — dead or recycled PID. Clean up.
-        @unlink($path);
-
         return null;
-    }
-
-    /**
-     * Whether the process at the given PID is a Torque master.
-     *
-     * Inspects `/proc/<pid>/cmdline` on Linux. On platforms without
-     * `/proc` (e.g. macOS) the command line cannot be read, so the check
-     * is treated as inconclusive and the caller's liveness check stands
-     * on its own — matching the pre-`/proc` behaviour.
-     */
-    private static function processIsTorqueMaster(int $pid): bool
-    {
-        $cmdlinePath = "/proc/{$pid}/cmdline";
-
-        if (! is_readable($cmdlinePath)) {
-            return true;
-        }
-
-        $cmdline = (string) @file_get_contents($cmdlinePath);
-
-        return str_contains($cmdline, 'torque:start');
     }
 }

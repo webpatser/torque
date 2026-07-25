@@ -7,6 +7,9 @@ namespace Webpatser\Torque\Console;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
+use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -32,10 +35,14 @@ final class TorqueStatusCommand extends Command
         $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
         $prefix = $config['redis']['prefix'] ?? 'torque:';
 
+        // One client for everything: a short-lived CLI process must not open
+        // a connection per collaborator, so queue depths and dead-letter
+        // counts are read with raw commands on this client instead of
+        // resolving StreamQueue/DeadLetterHandler instances.
         $redis = createRedisClient($redisUri);
 
         $this->renderMasterStatus();
-        $this->renderOverallMetrics($redis, $prefix);
+        $this->renderOverallMetrics($redis, $prefix, $config);
         $this->renderWorkerTable($redis, $prefix);
 
         return self::SUCCESS;
@@ -43,25 +50,19 @@ final class TorqueStatusCommand extends Command
 
     /**
      * Display whether the master process is running based on the PID file.
+     *
+     * Uses {@see MasterProcess::readPid()} so the symlink guard, the
+     * recycled-PID identity check, and stale-file semantics all match the
+     * rest of the toolchain; a recycled PID must not render as RUNNING.
      */
     private function renderMasterStatus(): void
     {
-        $pidFile = storage_path('torque.pid');
-        $running = false;
-        $pid = null;
-
-        if (file_exists($pidFile)) {
-            $pid = (int) trim((string) file_get_contents($pidFile));
-
-            if ($pid > 0 && posix_kill($pid, 0)) {
-                $running = true;
-            }
-        }
+        $pid = MasterProcess::readPid();
 
         $this->newLine();
         $this->components->twoColumnDetail(
             '<fg=cyan;options=bold>Master Status</>',
-            $running
+            $pid !== null
                 ? "<fg=green;options=bold>RUNNING</> <fg=gray>(PID {$pid})</>"
                 : '<fg=red;options=bold>STOPPED</>',
         );
@@ -70,21 +71,74 @@ final class TorqueStatusCommand extends Command
     }
 
     /**
-     * Read and display overall metrics from the `{prefix}metrics` hash.
+     * Display the fleet summary: master-published aggregate first (it carries
+     * a real throughput), live worker-hash aggregation as fallback, and
+     * always-live queue depth / dead-letter counts, mirroring the dashboard's
+     * OverviewData.
      *
-     * Expected hash fields: throughput, concurrent, avg_latency, pending, failed.
+     * @param  array<string, mixed>  $config
      */
-    private function renderOverallMetrics(RedisClient $redis, string $prefix): void
+    private function renderOverallMetrics(RedisClient $redis, string $prefix, array $config): void
     {
-        $metricsKey = $prefix.'metrics';
+        $throughput = null;
+        $concurrent = null;
+        $avgLatency = null;
 
-        $fields = $this->getHashAll($redis, $metricsKey);
+        try {
+            $agg = $this->getHashAll($redis, $prefix.'metrics');
 
-        $this->components->twoColumnDetail('Throughput (jobs/sec)', $this->formatMetric($fields['throughput'] ?? null, '/s'));
-        $this->components->twoColumnDetail('Concurrent Jobs', $this->formatMetric($fields['concurrent'] ?? null));
-        $this->components->twoColumnDetail('Avg Latency', $this->formatMetric($fields['avg_latency'] ?? null, ' ms'));
-        $this->components->twoColumnDetail('Pending', $this->formatMetric($fields['pending'] ?? null));
-        $this->components->twoColumnDetail('Failed', $this->formatMetric($fields['failed'] ?? null));
+            if ($agg === []) {
+                // No master-published aggregate: aggregate the live worker
+                // hashes. The publisher is used purely for its aggregation
+                // math; it never opens its own connection here.
+                $workers = [];
+
+                foreach ($this->scanKeys($redis, $prefix.'worker:*') as $key) {
+                    $workers[substr($key, strlen($prefix.'worker:'))] = $this->getHashAll($redis, $key);
+                }
+
+                $agg = new MetricsPublisher('redis://unused')->aggregateFromWorkers($workers);
+                // A one-shot snapshot cannot derive a rate; only the
+                // master-published aggregate carries real throughput.
+                unset($agg['throughput']);
+            }
+
+            if ((int) ($agg['workers'] ?? 0) > 0) {
+                $throughput = isset($agg['throughput']) ? (string) $agg['throughput'] : null;
+                $concurrent = (string) ($agg['concurrent'] ?? 0);
+                $avgLatency = (string) ($agg['avg_latency'] ?? 0);
+            }
+        } catch (\Throwable) {
+            // Placeholders below.
+        }
+
+        $pending = null;
+        $failed = null;
+
+        try {
+            $consumerGroup = (string) ($config['consumer_group'] ?? 'torque');
+            $cluster = (bool) ($config['cluster'] ?? ($config['redis']['cluster'] ?? false));
+            $streams = array_keys((array) ($config['streams'] ?? []));
+            $pendingCount = 0;
+
+            foreach ($streams === [] ? ['default'] : $streams as $name) {
+                $streamKey = $prefix.($cluster && ! str_contains((string) $name, '{') ? '{'.$name.'}' : $name);
+
+                $pendingCount += max(0, (int) $redis->execute('XLEN', $streamKey));
+                $pendingCount += max(0, (int) $redis->execute('ZCARD', $streamKey.':delayed'));
+            }
+
+            $pending = (string) $pendingCount;
+            $failed = (string) max(0, (int) $redis->execute('XLEN', $prefix.'dead-letter'));
+        } catch (\Throwable) {
+            // Placeholders below.
+        }
+
+        $this->components->twoColumnDetail('Throughput (jobs/sec)', $this->formatMetric($throughput, '/s'));
+        $this->components->twoColumnDetail('Concurrent Jobs', $this->formatMetric($concurrent));
+        $this->components->twoColumnDetail('Avg Latency', $this->formatMetric($avgLatency, ' ms'));
+        $this->components->twoColumnDetail('Pending', $this->formatMetric($pending));
+        $this->components->twoColumnDetail('Failed (dead letter)', $this->formatMetric($failed));
 
         $this->newLine();
     }
@@ -110,27 +164,34 @@ final class TorqueStatusCommand extends Command
 
         $rows = [];
 
+        $workerPrefix = $prefix.'worker:';
+
         foreach ($workerKeys as $key) {
             $fields = $this->getHashAll($redis, $key);
 
-            $pid = $fields['pid'] ?? '?';
+            // Prefer the published pid field; fall back to parsing the
+            // `{host}-{pid}-{hex}` worker id for rows written by older code.
+            $workerId = str_starts_with($key, $workerPrefix) ? substr($key, strlen($workerPrefix)) : $key;
+            $pid = $fields['pid'] ?? WorkerId::parse($workerId)->pid ?? '?';
             $activeSlots = $fields['active_slots'] ?? '0';
             $totalSlots = $fields['total_slots'] ?? '0';
             $jobsProcessed = $fields['jobs_processed'] ?? '0';
-            $avgLatency = $fields['avg_latency'] ?? '0';
+            $jobsFailed = $fields['jobs_failed'] ?? '0';
+            $avgLatency = $fields['avg_latency_ms'] ?? '0';
             $lastHeartbeat = $fields['last_heartbeat'] ?? null;
 
             $rows[] = [
-                $pid,
+                (string) $pid,
                 "{$activeSlots}/{$totalSlots}",
                 number_format((int) $jobsProcessed),
+                number_format((int) $jobsFailed),
                 round((float) $avgLatency, 2).' ms',
                 $this->formatHeartbeat($lastHeartbeat),
             ];
         }
 
         $this->table(
-            ['PID', 'Slots (active/total)', 'Jobs Processed', 'Avg Latency', 'Last Heartbeat'],
+            ['PID', 'Slots (active/total)', 'Jobs Processed', 'Failed', 'Avg Latency', 'Last Heartbeat'],
             $rows,
         );
     }

@@ -6,8 +6,8 @@ namespace Webpatser\Torque\Console;
 
 use Composer\InstalledVersions;
 use Illuminate\Console\Command;
-use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\ProcessInspector;
 
 /**
  * Start the Torque queue worker with N forked processes.
@@ -23,51 +23,71 @@ final class TorqueStartCommand extends Command
     protected $signature = 'torque:start
         {--workers= : Number of worker processes}
         {--concurrency= : Coroutine slots per worker}
-        {--queues= : Comma-separated queue names}';
+        {--queues= : Comma-separated queue names}
+        {--takeover= : Internal: replace the running master with this PID (used by torque:reload)}';
 
     /** @var string */
     protected $description = 'Start the Torque coroutine-based queue worker';
 
     public function handle(): int
     {
-        // Refuse to start if a master is already running (PID file or actual process).
+        $takeoverPid = $this->option('takeover') !== null ? (int) $this->option('takeover') : null;
+
+        // Refuse to start if a master is already running, unless this is the
+        // takeover half of a reload replacing exactly that master.
         $existingPid = MasterProcess::readPid();
 
-        if ($existingPid !== null) {
-            $this->components->error("Torque is already running (master PID {$existingPid}). Run torque:stop first.");
+        if ($existingPid !== null && $existingPid !== $takeoverPid) {
+            $this->components->error("Torque is already running (master PID {$existingPid}). Run torque:stop first, or torque:reload to replace it.");
 
             return self::FAILURE;
         }
 
-        // Check for orphaned master processes whose PID file was lost (e.g. after deploy).
-        // Kill them automatically so Torque can start cleanly. The first pattern
-        // character is bracketed so the `sh -c` wrapper PHP spawns for exec(),
-        // whose own argv contains the pattern text, never matches itself.
-        $output = [];
-        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:start'), $output);
-        $otherMasters = array_filter(
-            array_map('intval', $output),
-            fn (int $pid) => $pid > 0 && $pid !== getmypid(),
+        if ($takeoverPid !== null) {
+            if ($existingPid === null) {
+                // The old master is already gone; proceed as a normal start.
+                $takeoverPid = null;
+            } else {
+                // Detach into an own session: the takeover master must survive
+                // killasgroup on the old supervisor program and must not share
+                // the reload shell's process group.
+                @posix_setsid();
+            }
+        }
+
+        // Sweep orphaned workers: a master killed with SIGKILL (OOM,
+        // supervisor stop failure) leaves no master process behind, only its
+        // reparented workers, and those must not survive into the new fleet
+        // or every hard death doubles it. Filtered by parentage so a fleet
+        // whose master is alive (the draining side of a takeover, another
+        // release on the same host) is never touched. The first pattern
+        // character is bracketed so the `sh -c` wrapper PHP spawns for
+        // exec(), whose own argv contains the pattern text, never matches
+        // itself.
+        $workerOutput = [];
+        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
+        $orphanWorkers = array_filter(
+            array_map('intval', $workerOutput),
+            function (int $pid): bool {
+                if ($pid <= 0 || $pid === getmypid()) {
+                    return false;
+                }
+
+                $parent = ProcessInspector::parentPid($pid);
+
+                // Only a worker whose parent is not a live torque master is
+                // an orphan; unknown parentage is left alone.
+                return $parent !== null && ! ProcessInspector::isTorqueMaster($parent);
+            },
         );
 
-        if ($otherMasters !== []) {
+        if ($orphanWorkers !== []) {
             $this->components->warn(
-                'Killing orphaned torque:start process(es): '.implode(', ', $otherMasters),
+                'Killing orphaned torque:worker process(es): '.implode(', ', $orphanWorkers),
             );
 
-            foreach ($otherMasters as $orphanPid) {
-                posix_kill(-$orphanPid, SIGKILL);
-                posix_kill($orphanPid, SIGKILL);
-            }
-
-            // Also kill orphaned workers.
-            $workerOutput = [];
-            exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
-            foreach ($workerOutput as $line) {
-                $pid = (int) trim($line);
-                if ($pid > 0 && $pid !== getmypid()) {
-                    posix_kill($pid, SIGKILL);
-                }
+            foreach ($orphanWorkers as $pid) {
+                posix_kill($pid, SIGKILL);
             }
 
             usleep(200_000);
@@ -75,9 +95,6 @@ final class TorqueStartCommand extends Command
 
         /** @var array<string, mixed> $config */
         $config = config('torque');
-
-        // Kill any orphaned worker processes and clean stale metrics from a previous run.
-        $this->cleanupOrphans();
 
         // Apply CLI overrides.
         if ($this->option('workers') !== null) {
@@ -133,23 +150,16 @@ final class TorqueStartCommand extends Command
             $this->components->info('Tip: install ext-igbinary for ~2x faster payload encoding (set TORQUE_SERIALIZER=igbinary).');
         }
 
+        if ($takeoverPid !== null) {
+            $this->components->info("Takeover: replacing master PID {$takeoverPid} once this fleet is ready.");
+        }
+
         $master = new MasterProcess(
             config: $config,
             logger: fn (string $message) => $this->components->info($message),
+            takeoverPid: $takeoverPid,
         );
 
         return $master->start();
-    }
-
-    /**
-     * Clean stale worker metrics from Redis left by a previous run.
-     */
-    private function cleanupOrphans(): void
-    {
-        try {
-            app(MetricsPublisher::class)->removeAllWorkerMetrics();
-        } catch (\Throwable) {
-            // Best-effort — Redis may be unavailable.
-        }
     }
 }

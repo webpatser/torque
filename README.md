@@ -270,7 +270,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:tail` | Tail a job's event stream in real-time |
 | `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
 | `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
-| `torque:reload` | Zero-downtime reload. Spawns a replacement master, waits for it to take over the PID file, then drains the old one. `--drain` for supervisor-driven setups |
+| `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
 | `torque:supervisor` | Generate a Supervisor config file |
 
 ## Configuration
@@ -283,7 +283,9 @@ All options are in `config/torque.php`. Key settings:
 | `coroutines_per_worker` | 50 | Concurrent job slots per worker |
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
-| `drain_grace_seconds` | 10 | Seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation |
+| `drain_grace_seconds` | 10 | Seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM |
+| `takeover_ready_timeout` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
+| `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
 | `stall_warn_seconds` | 300 | Watchdog logs a WARN for any slot whose current job has been running longer than this |
 | `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
@@ -462,23 +464,33 @@ sudo supervisorctl start torque
 
 ### Zero-downtime reload
 
-`torque:stop` followed by `torque:start` works for cold deploys, but it leaves a queue-processing gap (jobs queue up in Redis until the new master is back). `torque:reload` swaps the master in one step, with no manual chaining of pause + wait + stop:
+`torque:stop` followed by `torque:start` works for cold deploys, but it leaves a queue-processing gap (jobs queue up in Redis until the new master is back). `torque:reload` swaps the master in one step, with no manual chaining of pause + wait + stop. Pick the mode by who owns the respawn:
+
+**Under a process supervisor (supervisord, systemd) — use `--drain`.** The supervisor owns respawning, so the reload only signals:
 
 ```bash
-# Default: spawn a replacement, wait for it to take over the PID file,
-# then drain the old master (pause pickup, wait drain_grace_seconds, SIGTERM).
-php artisan torque:reload
-
-# Signal-only mode for systemd ExecReload= / Kubernetes preStop / Supervisor
-# recipes that own spawning the replacement themselves.
+# supervisord (autorestart=true): drain, exit, supervisor respawns from the
+# current release. systemd: wire it as ExecReload=; Kubernetes: preStop.
 php artisan torque:reload --drain
 ```
 
-In-flight jobs finish naturally on the old master while the new one starts taking new work; the Redis queue handles claim-once semantics across both. Tune the drain window with `TORQUE_DRAIN_GRACE` (default `10` seconds).
+A spawned replacement would escape supervision permanently, which is why the default mode warns when the master looks supervised.
+
+**Unsupervised hosts — the default takeover handshake:**
+
+```bash
+php artisan torque:reload
+```
+
+The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
+
+During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. Keep `TORQUE_DRAIN_GRACE` (default `10`) below the stream `retry_after` so the brief overlap cannot double-claim jobs. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
+
+Mutual exclusion between masters is a lifetime `flock` on `storage/torque.lock` (released by the kernel on any exit, including SIGKILL), and the PID file self-heals every second: the owning master rewrites it if missing, reclaims it from a stale PID, and self-demotes into a drain if another live master owns it. Concurrent reloads fail fast on `storage/torque.reload.lock`.
 
 ### Containerized deployment
 
-When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master — on Linux it checks `/proc/<pid>/cmdline` — so a stale PID file left by a previous container is detected and cleared automatically, even when its number has since been recycled by an unrelated process. No manual `rm storage/torque.pid` is needed between restarts.
+When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master — via `/proc/<pid>/cmdline` on Linux, `ps` elsewhere — so a stale PID file left by a previous container reads as "not running", even when its number has since been recycled by an unrelated process. Readers never delete the file (that would race a takeover's atomic rename); the next master simply overwrites it at boot. No manual `rm storage/torque.pid` is needed between restarts.
 
 ## Performance
 

@@ -39,7 +39,7 @@ it('builds the overview shape with correct types', function () {
     $handler = new DeadLetterHandler(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
 
     try {
-        $publisher->publishWorkerMetrics('web-01-5123', new WorkerSnapshot(
+        $publisher->publishWorkerMetrics('web-01-5123-a1b2c3d4', new WorkerSnapshot(
             jobsProcessed: 100,
             jobsFailed: 4,
             activeSlots: 8,
@@ -68,7 +68,7 @@ it('builds the overview shape with correct types', function () {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     } finally {
         $redis = torqueTestRedis();
-        $redis->execute('DEL', 'torque-test:worker:web-01-5123');
+        $redis->execute('DEL', 'torque-test:worker:web-01-5123-a1b2c3d4');
         $redis->execute('DEL', 'torque-test:metrics');
         $redis->execute('DEL', 'torque-test:dead-letter');
     }
@@ -78,7 +78,7 @@ it('builds workers with the documented keys and null sub-widgets', function () {
     $publisher = new MetricsPublisher(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
 
     try {
-        $publisher->publishWorkerMetrics('web-01-5123', new WorkerSnapshot(
+        $publisher->publishWorkerMetrics('web-01-5123-a1b2c3d4', new WorkerSnapshot(
             jobsProcessed: 18_234,
             jobsFailed: 12,
             activeSlots: 38,
@@ -91,7 +91,7 @@ it('builds workers with the documented keys and null sub-widgets', function () {
 
         $workers = app(WorkersData::class)->get()['workers'];
 
-        $worker = collect($workers)->firstWhere('id', 'web-01-5123');
+        $worker = collect($workers)->firstWhere('id', 'web-01-5123-a1b2c3d4');
 
         expect($worker)->not->toBeNull()
             ->and($worker)->toHaveKeys(['id', 'host', 'pid', 'slots', 'busy', 'stalled', 'memMb', 'memPeakMb', 'processed', 'failed', 'rpm', 'latencyMs', 'uptime', 'status', 'pools', 'history'])
@@ -111,7 +111,7 @@ it('builds workers with the documented keys and null sub-widgets', function () {
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     } finally {
-        torqueTestRedis()->execute('DEL', 'torque-test:worker:web-01-5123');
+        torqueTestRedis()->execute('DEL', 'torque-test:worker:web-01-5123-a1b2c3d4');
     }
 });
 
@@ -147,7 +147,7 @@ it('maps job summaries for the jobs list and filters by status', function () {
 
     try {
         $recorder->record($running, 'queued', ['queue' => 'default', 'displayName' => 'App\\Jobs\\ProcessDocument']);
-        $recorder->record($running, 'started', ['worker' => 'web-01-5123']);
+        $recorder->record($running, 'started', ['worker' => 'web-01-5123-a1b2c3d4']);
 
         $recorder->record($done, 'queued', ['queue' => 'default', 'displayName' => 'App\\Jobs\\SendInvoice']);
         $recorder->record($done, 'completed', [], terminal: true);
@@ -162,7 +162,7 @@ it('maps job summaries for the jobs list and filters by status', function () {
             ->and($job['cls'])->toBe('ProcessDocument')
             ->and($job['queue'])->toBe('default')
             ->and($job['status'])->toBe('running')
-            ->and($job['worker'])->toBe('web-01-5123')
+            ->and($job['worker'])->toBe('web-01-5123-a1b2c3d4')
             ->and($job['ts'])->toBeInt()
             ->and($job['ts'])->toBeGreaterThan(0);
 
@@ -185,7 +185,7 @@ it('returns a single job with its event stream', function () {
 
     try {
         $recorder->record($uuid, 'queued', ['queue' => 'default', 'displayName' => 'App\\Jobs\\ScrapeKvK']);
-        $recorder->record($uuid, 'started', ['worker' => 'web-01-5123']);
+        $recorder->record($uuid, 'started', ['worker' => 'web-01-5123-a1b2c3d4']);
         $recorder->record($uuid, 'completed', [], terminal: true);
 
         $payload = app(JobsData::class)->show($uuid);

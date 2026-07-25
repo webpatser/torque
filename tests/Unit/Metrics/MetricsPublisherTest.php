@@ -267,3 +267,76 @@ it('returns empty array from getAllWorkerMetrics when no workers exist', functio
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
+
+it('publishes pid and host fields derived from the worker id', function () {
+    $prefix = 'torque-pid-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        $publisher->publishWorkerMetrics('web-01-5123-a1b2c3d4', makeSnapshot());
+
+        $metrics = $publisher->getWorkerMetrics('web-01-5123-a1b2c3d4');
+
+        expect($metrics['pid'])->toBe('5123')
+            ->and($metrics['host'])->toBe('web-01');
+
+        cleanupRedisKeys($publisher, $prefix, ['web-01-5123-a1b2c3d4']);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+it('publishes a precomputed aggregate with an expiry', function () {
+    $prefix = 'torque-agg-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        $publisher->publishAggregate([
+            'throughput' => 123.456,
+            'concurrent' => 7,
+            'total_slots' => 200,
+            'avg_latency' => 12.5,
+            'jobs_processed' => 4200,
+            'jobs_failed' => 3,
+            'memory_mb' => 128.5,
+            'workers' => 4,
+        ]);
+
+        $aggregate = $publisher->getAggregatedMetrics();
+
+        $redis = (new ReflectionClass($publisher))
+            ->getMethod('getRedis')
+            ->invoke($publisher);
+        $ttl = (int) $redis->execute('TTL', $prefix.'metrics');
+
+        expect($aggregate['throughput'])->toBe('123.46')
+            ->and($aggregate['workers'])->toBe('4')
+            ->and($aggregate['jobs_processed'])->toBe('4200')
+            // A dead publisher must read as "no data", never as stale numbers.
+            ->and($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(30);
+
+        cleanupRedisKeys($publisher, $prefix, []);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+it('sets an expiry on the snapshot-based aggregate publish as well', function () {
+    $prefix = 'torque-agg2-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        $publisher->publishAggregatedMetrics([makeSnapshot()]);
+
+        $redis = (new ReflectionClass($publisher))
+            ->getMethod('getRedis')
+            ->invoke($publisher);
+        $ttl = (int) $redis->execute('TTL', $prefix.'metrics');
+
+        expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(30);
+
+        cleanupRedisKeys($publisher, $prefix, []);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});

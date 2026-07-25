@@ -7,15 +7,20 @@ namespace Webpatser\Torque\Console;
 use Illuminate\Console\Command;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\ProcessInspector;
 
 /**
  * Zero-downtime reload of the Torque master.
  *
- * Mirrors `resonate:reload`. Default flow: spawn a replacement master, wait
- * for it to take over `storage/torque.pid`, then signal the old master via
- * SIGUSR2. `--drain` skips the spawn step and only signals; use it when an
- * external supervisor (systemd, k8s preStop, Supervisor) handles spawning
- * the replacement.
+ * Default flow (takeover handshake): spawn `torque:start --takeover=<oldPid>`,
+ * which forks its fleet, waits for its own workers' first heartbeat, only then
+ * takes over `storage/torque.pid` and asks the old master to drain. This
+ * command polls for the PID-file flip and signals the drain as well
+ * (idempotent with the master-to-master signal). `--drain` skips the spawn
+ * step and only signals; use it when an external supervisor (systemd, k8s
+ * preStop, Supervisor) owns spawning the replacement — under a supervisor the
+ * spawned takeover master would escape supervision, so `--drain` is the
+ * correct production mode there.
  *
  * Unlike Resonate, Torque has no socket to share. Two masters running
  * briefly during the swap is harmless: the Redis queue claims jobs
@@ -29,7 +34,7 @@ final class TorqueReloadCommand extends Command
     protected $signature = 'torque:reload
         {--drain : Only signal the running master to drain; do not spawn a replacement}
         {--timeout=30 : Seconds to wait for the old master to exit after the drain signal}
-        {--health-timeout=10 : Seconds to wait for the new master to take over the PID file}';
+        {--health-timeout=45 : Seconds to wait for the new master to take over the PID file (covers its worker-heartbeat readiness gate)}';
 
     /** @var string */
     protected $description = 'Reload the Torque master with zero downtime';
@@ -37,11 +42,12 @@ final class TorqueReloadCommand extends Command
     /**
      * Spawner callable, swappable in tests.
      *
-     * Returns the PID of the spawned `torque:start` process, or null on
-     * failure. The default implementation uses `proc_open` and lets the
-     * child be reparented to init when this command exits.
+     * Receives the old master PID and returns the PID of the spawned
+     * `torque:start --takeover` process, or null on failure. The default
+     * implementation uses `proc_open` and lets the child be reparented to
+     * init when this command exits.
      *
-     * @var (callable():(?int))|null
+     * @var (callable(int):(?int))|null
      */
     public static $spawner = null;
 
@@ -55,6 +61,16 @@ final class TorqueReloadCommand extends Command
      */
     public static $readinessChecker = null;
 
+    /**
+     * The reload mutex handle; held until this process exits.
+     *
+     * @var resource|null
+     */
+    private $reloadLock = null;
+
+    /** Where the spawned child's stderr is captured for diagnostics. */
+    private ?string $stderrPath = null;
+
     public function handle(): int
     {
         if (windows_os() || ! function_exists('posix_kill')) {
@@ -62,6 +78,24 @@ final class TorqueReloadCommand extends Command
 
             return self::FAILURE;
         }
+
+        if (! $this->acquireReloadLock()) {
+            $this->components->error('Another torque:reload is already running; refusing to double-spawn.');
+
+            return self::FAILURE;
+        }
+
+        try {
+            return $this->reload();
+        } finally {
+            // Command instances persist in the console kernel, so the lock is
+            // released explicitly rather than relying on handle GC.
+            $this->releaseReloadLock();
+        }
+    }
+
+    private function reload(): int
+    {
 
         $oldPid = MasterProcess::readPid();
 
@@ -80,9 +114,22 @@ final class TorqueReloadCommand extends Command
             return $this->signalDrain($oldPid, $drainTimeout);
         }
 
+        // A supervised master (supervisord, systemd) should be reloaded with
+        // --drain: the supervisor owns the respawn, and a self-spawned
+        // takeover master would run unsupervised from then on.
+        $masterParent = ProcessInspector::parentPid($oldPid);
+
+        if ($masterParent !== null && $masterParent !== 1) {
+            $this->components->warn(
+                "Master PID {$oldPid} appears to run under a process supervisor (parent PID {$masterParent}). "
+                .'Prefer `torque:reload --drain` there: the supervisor respawns the master, while a spawned '
+                .'takeover master would escape supervision.',
+            );
+        }
+
         $this->components->info("Spawning replacement master (current PID: {$oldPid}).");
 
-        $newPid = $this->spawn();
+        $newPid = $this->spawn($oldPid);
 
         if ($newPid === null) {
             $this->components->error('Failed to spawn replacement master.');
@@ -94,11 +141,13 @@ final class TorqueReloadCommand extends Command
 
         if (! $this->waitForReady($oldPid, $healthTimeout)) {
             $this->components->error('Replacement master did not take over the PID file in time; terminating it.');
+            $this->surfaceChildStderr();
             @posix_kill($newPid, SIGTERM);
 
             return self::FAILURE;
         }
 
+        $this->cleanupStderrCapture();
         $this->components->info("Replacement ready; draining old master (PID: {$oldPid}).");
 
         return $this->signalDrain($oldPid, $drainTimeout);
@@ -109,6 +158,15 @@ final class TorqueReloadCommand extends Command
      */
     private function signalDrain(int $pid, int $timeout): int
     {
+        // The takeover master signals the old one itself the moment it takes
+        // the PID file, so by the time this runs the old master may already
+        // be gone. That is success, not an error.
+        if (! @posix_kill($pid, 0)) {
+            $this->components->info("Old master (PID: {$pid}) already exited.");
+
+            return self::SUCCESS;
+        }
+
         if (! @posix_kill($pid, SIGUSR2)) {
             $this->components->error("Failed to signal PID {$pid} (SIGUSR2).");
 
@@ -134,12 +192,12 @@ final class TorqueReloadCommand extends Command
     }
 
     /**
-     * Spawn a detached `torque:start` child process.
+     * Spawn a detached `torque:start --takeover` child process.
      */
-    private function spawn(): ?int
+    private function spawn(int $oldPid): ?int
     {
         if (is_callable(self::$spawner)) {
-            return (self::$spawner)();
+            return (self::$spawner)($oldPid);
         }
 
         $artisan = base_path('artisan');
@@ -148,16 +206,21 @@ final class TorqueReloadCommand extends Command
             return null;
         }
 
+        // Capture stderr: a replacement that refuses to boot must say why in
+        // the reload output instead of dying silently into /dev/null.
+        $stderr = tempnam(sys_get_temp_dir(), 'torque-reload-');
+        $this->stderrPath = $stderr === false ? null : $stderr;
+
         $descriptors = [
             0 => ['file', '/dev/null', 'r'],
-            1 => ['file', '/dev/null', 'a'],
-            2 => ['file', '/dev/null', 'a'],
+            1 => ['file', $this->stderrPath ?? '/dev/null', 'a'],
+            2 => ['file', $this->stderrPath ?? '/dev/null', 'a'],
         ];
 
         $pipes = [];
 
         $process = @proc_open(
-            [PHP_BINARY, $artisan, 'torque:start'],
+            [PHP_BINARY, $artisan, 'torque:start', "--takeover={$oldPid}"],
             $descriptors,
             $pipes,
             base_path(),
@@ -203,5 +266,64 @@ final class TorqueReloadCommand extends Command
         $current = MasterProcess::readPid();
 
         return $current !== null && $current !== $oldPid;
+    }
+
+    /**
+     * Take the non-blocking reload mutex so two concurrent reloads cannot
+     * both spawn replacements for the same master.
+     */
+    private function acquireReloadLock(): bool
+    {
+        $handle = @fopen(storage_path('torque.reload.lock'), 'c');
+
+        if ($handle === false) {
+            return false;
+        }
+
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            return false;
+        }
+
+        $this->reloadLock = $handle;
+
+        return true;
+    }
+
+    private function releaseReloadLock(): void
+    {
+        if ($this->reloadLock !== null) {
+            flock($this->reloadLock, LOCK_UN);
+            fclose($this->reloadLock);
+            $this->reloadLock = null;
+        }
+    }
+
+    /**
+     * Print the captured stderr of the failed replacement, if any.
+     */
+    private function surfaceChildStderr(): void
+    {
+        if ($this->stderrPath === null || ! is_file($this->stderrPath)) {
+            return;
+        }
+
+        $output = trim((string) @file_get_contents($this->stderrPath));
+
+        if ($output !== '') {
+            $this->components->twoColumnDetail('Replacement output', '');
+            $this->line($output);
+        }
+
+        $this->cleanupStderrCapture();
+    }
+
+    private function cleanupStderrCapture(): void
+    {
+        if ($this->stderrPath !== null) {
+            @unlink($this->stderrPath);
+            $this->stderrPath = null;
+        }
     }
 }

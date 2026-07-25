@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Metrics;
 
 use Fledge\Async\Redis\RedisClient;
+use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -21,6 +22,13 @@ use function Fledge\Async\Redis\createRedisClient;
 final class MetricsPublisher
 {
     private const int HEARTBEAT_TTL_SECONDS = 60;
+
+    /**
+     * TTL on the aggregated `{prefix}metrics` hash. A dead publisher must
+     * read as "no data" (dashboards and torque:status render placeholders)
+     * rather than serving stale numbers forever.
+     */
+    private const int AGGREGATE_TTL_SECONDS = 30;
 
     private ?RedisClient $redis = null;
 
@@ -40,8 +48,11 @@ final class MetricsPublisher
     {
         $redis = $this->getRedis();
         $key = $this->prefix.'worker:'.$workerId;
+        $parsed = WorkerId::parse($workerId);
 
         $redis->execute('HSET', $key,
+            'pid', (string) ($parsed->pid ?? getmypid()),
+            'host', $parsed->host,
             'jobs_processed', (string) $snapshot->jobsProcessed,
             'jobs_failed', (string) $snapshot->jobsFailed,
             'active_slots', (string) $snapshot->activeSlots,
@@ -121,6 +132,36 @@ final class MetricsPublisher
             'workers', (string) $workerCount,
             'updated_at', (string) time(),
         );
+
+        $redis->execute('EXPIRE', $key, (string) self::AGGREGATE_TTL_SECONDS);
+    }
+
+    /**
+     * Publish an already-aggregated summary (the {@see aggregateFromWorkers()}
+     * shape) to the `{prefix}metrics` hash. Used by the master's monitor loop,
+     * which aggregates from the worker hashes and computes real throughput
+     * from jobs_processed deltas between ticks.
+     *
+     * @param  array<string, mixed>  $aggregate
+     */
+    public function publishAggregate(array $aggregate): void
+    {
+        $redis = $this->getRedis();
+        $key = $this->prefix.'metrics';
+
+        $redis->execute('HSET', $key,
+            'throughput', (string) round((float) ($aggregate['throughput'] ?? 0.0), 2),
+            'concurrent', (string) (int) ($aggregate['concurrent'] ?? 0),
+            'total_slots', (string) (int) ($aggregate['total_slots'] ?? 0),
+            'avg_latency', (string) round((float) ($aggregate['avg_latency'] ?? 0.0), 2),
+            'jobs_processed', (string) (int) ($aggregate['jobs_processed'] ?? 0),
+            'jobs_failed', (string) (int) ($aggregate['jobs_failed'] ?? 0),
+            'memory_mb', (string) round((float) ($aggregate['memory_mb'] ?? 0.0), 2),
+            'workers', (string) (int) ($aggregate['workers'] ?? 0),
+            'updated_at', (string) time(),
+        );
+
+        $redis->execute('EXPIRE', $key, (string) self::AGGREGATE_TTL_SECONDS);
     }
 
     /**

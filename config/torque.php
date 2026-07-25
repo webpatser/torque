@@ -69,6 +69,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Takeover readiness timeout (seconds)
+    |--------------------------------------------------------------------------
+    | During a self-spawn `torque:reload`, how long the replacement master
+    | waits for the first metrics heartbeat from its own workers before
+    | aborting the takeover and leaving the old master untouched. Keep it
+    | below torque:reload's --health-timeout.
+    */
+
+    'takeover_ready_timeout' => (int) env('TORQUE_TAKEOVER_READY_TIMEOUT', 30),
+
+    /*
+    |--------------------------------------------------------------------------
     | Stall warning threshold (seconds)
     |--------------------------------------------------------------------------
     | The watchdog logs a WARN line every 30s for any slot whose current job
