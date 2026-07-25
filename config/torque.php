@@ -113,6 +113,11 @@ return [
     |--------------------------------------------------------------------------
     | Each stream maps to a Redis Stream with its own consumer group.
     | Priority determines processing order when multiple streams have work.
+    |
+    | Optional per-stream `max_concurrency` caps how many of a stream's jobs a
+    | single worker processes simultaneously (fleet-wide cap = workers x
+    | max_concurrency). Use it to keep bulk queues from hammering external
+    | APIs; the cap is approximate under bursts (bounded by fiber count).
     */
     'streams' => [
         'default' => [

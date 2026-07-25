@@ -73,6 +73,15 @@ LUA;
         get => $this->stopRequested;
     }
 
+    /**
+     * Jobs currently being processed per stream, keyed by queue name. Shared
+     * across this worker's Fibers (single-threaded event loop, mutated only
+     * between awaits) to enforce per-stream `max_concurrency`.
+     *
+     * @var array<string, int>
+     */
+    private array $streamActive = [];
+
     /** Limits — set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
@@ -301,23 +310,37 @@ LUA;
 
                     $events->dispatch(new Looping($connectionName, $queues[0] ?? 'default'));
 
+                    // Per-stream concurrency cap: exclude streams that already
+                    // have max_concurrency jobs in flight in this worker. The
+                    // cap is approximate under bursts (fibers that passed this
+                    // filter may still be awaiting their read), overshooting by
+                    // at most the number of concurrently-polling fibers.
+                    $pollQueues = self::eligibleQueues($queues, $streams, $this->streamActive);
+
+                    $loopCount++;
+
+                    if ($pollQueues === []) {
+                        \Fledge\Async\delay($pollInterval);
+
+                        continue;
+                    }
+
                     // Non-blocking poll for new messages.
-                    $message = $this->readNextMessage($fiberRedis, $queues, $prefix, $consumerGroup, $buildStreamKey);
+                    $message = $this->readNextMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
 
                     // Periodically re-check PEL for any orphaned messages (~every 25s).
-                    $loopCount++;
                     if ($message === null && $loopCount % 50 === 0) {
-                        $message = $this->readPendingMessage($fiberRedis, $queues, $prefix, $consumerGroup, $buildStreamKey);
+                        $message = $this->readPendingMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
                     }
 
                     // Drain pending on first iteration (crash recovery).
                     if ($message === null && $loopCount === 1) {
-                        $message = $this->readPendingMessage($fiberRedis, $queues, $prefix, $consumerGroup, $buildStreamKey);
+                        $message = $this->readPendingMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
                     }
 
                     // Still nothing: steal from dead consumers.
                     if ($message === null) {
-                        $message = $this->stealMessage($fiberRedis, $queues, $prefix, $consumerGroup, $streams, $buildStreamKey);
+                        $message = $this->stealMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $streams, $buildStreamKey);
                     }
 
                     if ($message === null) {
@@ -371,6 +394,7 @@ LUA;
                         queue: $queueName,
                     );
                     $slotJobs[$fiberIndex] = $streamJob;
+                    $this->streamActive[$queueName] = ($this->streamActive[$queueName] ?? 0) + 1;
 
                     try {
                         $this->processMessage($streamJob, $events, $connectionName);
@@ -381,6 +405,7 @@ LUA;
                         $metrics->recordJobFailed($durationMs);
                         $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler);
                     } finally {
+                        $this->streamActive[$queueName] = max(0, ($this->streamActive[$queueName] ?? 1) - 1);
                         unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
@@ -937,6 +962,32 @@ LUA;
     /**
      * Resolve the queue name by stripping the prefix from a stream key.
      */
+    /**
+     * Filter the poll list down to streams below their max_concurrency cap.
+     *
+     * A stream with `max_concurrency` in its config is skipped while this
+     * worker already has that many of its jobs in flight; streams without a
+     * cap are always eligible. The cap is per worker process: a fleet of N
+     * workers allows up to N * max_concurrency simultaneous jobs fleet-wide.
+     *
+     * @param  list<string>  $queues
+     * @param  array<string, array<string, mixed>>  $streams
+     * @param  array<string, int>  $active
+     * @return list<string>
+     */
+    public static function eligibleQueues(array $queues, array $streams, array $active): array
+    {
+        return array_values(array_filter($queues, function (string $queue) use ($streams, $active): bool {
+            $cap = $streams[$queue]['max_concurrency'] ?? null;
+
+            if ($cap === null) {
+                return true;
+            }
+
+            return ($active[$queue] ?? 0) < (int) $cap;
+        }));
+    }
+
     private function resolveQueueName(string $streamKey, string $prefix): string
     {
         if (str_starts_with($streamKey, $prefix)) {
