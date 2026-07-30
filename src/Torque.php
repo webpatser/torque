@@ -54,6 +54,7 @@ final class Torque
     {
         if (class_exists(DevCommands::class)) {
             DevCommands::artisan('torque:start', 'torque');
+            DevCommands::except('queue');
         }
     }
 

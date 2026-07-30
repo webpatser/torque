@@ -8,6 +8,7 @@ use Illuminate\Queue\QueueManager;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Torque;
 
 it('merges the torque config', function () {
     $config = config('torque');
@@ -88,4 +89,15 @@ it('registers torque:start as a dev command', function () {
 
     expect($torque)->not->toBeNull()
         ->and($torque['command'])->toBe('php artisan torque:start');
+});
+
+it('excludes the default queue dev command so it cannot compete for jobs', function () {
+    DevCommands::artisan('queue:listen --tries=1', 'queue');
+
+    Torque::registerDevCommands();
+
+    $commands = collect(DevCommands::commands());
+
+    expect($commands->firstWhere('name', 'queue'))->toBeNull()
+        ->and($commands->firstWhere('name', 'torque'))->not->toBeNull();
 });

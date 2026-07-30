@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-07-30
+
+### Fixed
+- `Torque::registerDevCommands()` now excludes the framework's default `queue` dev command (`DevCommands::except('queue')`), so `composer dev` runs only `torque:start` instead of two competing consumers. Mirrors Horizon v5.48.1.
+
 ## [0.14.0] - 2026-07-25
 
 ### Added
