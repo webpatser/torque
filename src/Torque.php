@@ -21,6 +21,11 @@ use RuntimeException;
 final class Torque
 {
     /**
+     * The queue connection name Torque registers and its workers report under.
+     */
+    public const string CONNECTION = 'torque';
+
+    /**
      * The explicit CSP nonce set via cspNonce(), if any.
      */
     private static ?string $cspNonce = null;

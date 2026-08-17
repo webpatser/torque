@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Dashboard\Data;
 
 use Webpatser\Torque\Support\StreamQueueResolver;
+use Webpatser\Torque\Torque;
 
 /**
  * Per-stream depth read-model for the queues screen.
@@ -22,9 +23,18 @@ final class QueuesData
         $queue = StreamQueueResolver::make();
         $queues = [];
 
-        foreach (array_keys((array) config('torque.streams', [])) as $name) {
-            $name = (string) $name;
+        $names = array_map(strval(...), array_keys((array) config('torque.streams', [])));
 
+        // Framework pause state (queue:pause / queue:pause --all); one cache
+        // round-trip for all names. A broken cache store must not 500 the
+        // dashboard, so degrade to "nothing paused".
+        try {
+            $paused = array_flip(app('queue')->getPausedQueues(Torque::CONNECTION, $names));
+        } catch (\Throwable) {
+            $paused = [];
+        }
+
+        foreach ($names as $name) {
             $queues[] = [
                 'name' => $name,
                 'pending' => $queue->pendingSize($name),
@@ -34,7 +44,7 @@ final class QueuesData
                 'throughput' => null,
                 'wait' => null,
                 'history' => [],
-                'paused' => false,
+                'paused' => isset($paused[$name]),
             ];
         }
 

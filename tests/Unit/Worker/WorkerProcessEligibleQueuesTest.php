@@ -27,3 +27,19 @@ it('returns an empty list when every stream is capped out', function () {
 
     expect(WorkerProcess::eligibleQueues($queues, $streams, ['backfill' => 1]))->toBe([]);
 });
+
+it('excludes framework-paused queues', function () {
+    $queues = ['default', 'backfill'];
+    $streams = ['default' => [], 'backfill' => []];
+
+    expect(WorkerProcess::eligibleQueues($queues, $streams, [], ['backfill']))->toBe(['default'])
+        ->and(WorkerProcess::eligibleQueues($queues, $streams, [], ['default', 'backfill']))->toBe([])
+        ->and(WorkerProcess::eligibleQueues($queues, $streams, [], []))->toBe(['default', 'backfill']);
+});
+
+it('combines the pause filter with the concurrency cap', function () {
+    $queues = ['default', 'backfill'];
+    $streams = ['default' => ['max_concurrency' => 1]];
+
+    expect(WorkerProcess::eligibleQueues($queues, $streams, ['default' => 1], ['backfill']))->toBe([]);
+});

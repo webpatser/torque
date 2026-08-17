@@ -6,6 +6,7 @@ use Livewire\Attributes\Computed;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Concerns\AuthorizesTorqueAccess;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Torque;
 
 new class extends Component
 {
@@ -22,7 +23,7 @@ new class extends Component
         $errors = [];
 
         /** @var StreamQueue $queue */
-        $queue = app('queue')->connection('torque');
+        $queue = app('queue')->connection(Torque::CONNECTION);
 
         foreach ($streams as $name => $config) {
             $streamKey = $config['stream'] ?? ('torque:stream:'.$name);

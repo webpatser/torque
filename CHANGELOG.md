@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-17
+
+### Added
+- Workers honor Laravel 13.25's framework queue pause switches: `php artisan queue:pause --all` pauses the whole worker (dispatching `WorkerPausing` once), pausing an individual queue (`queue:pause <name>` on the `torque` connection) makes reader fibers skip just that stream, and `queue:resume` reverses either. Torque's own `torque:pause` remains an independent switch, mirroring upstream's pause/pauseAll independence. The paused state is polled from the framework cache by the existing 2s timer, guarded by `Worker::$pausable`; a cache outage keeps the last known state instead of silently resuming a paused fleet.
+- `StreamQueue` accepts `\UnitEnum|string|null` queue names everywhere the first-party drivers do, normalized through `getQueue()` via `enum_value()`.
+- The dashboard queues screen shows the framework paused state per stream.
+- `Torque::CONNECTION` constant replaces the hardcoded `'torque'` connection name in the worker and dashboard.
+
+### Changed
+- `illuminate/*` constraints raised to `^13.25` (required for the global pause flag; per-queue pause works from 13.8).
+- `StreamQueue::getQueue('')` now falls back to the default queue instead of producing the bare-prefix stream key, matching the first-party drivers' `enum_value($queue) ?: $this->default` semantics.
+
 ## [0.14.5] - 2026-07-30
 
 ### Fixed

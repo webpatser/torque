@@ -18,6 +18,8 @@ use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerInterrupted;
 use Illuminate\Queue\Events\WorkerPausing;
 use Illuminate\Queue\Events\WorkerResuming;
+use Illuminate\Queue\QueueManager;
+use Illuminate\Queue\Worker;
 use Revolt\EventLoop;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
 use Webpatser\Torque\Job\CoroutineContext;
@@ -27,6 +29,7 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Pool\RedisPool;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Torque;
 
 use function Fledge\Async\async;
 use function Fledge\Async\Redis\createRedisClient;
@@ -122,7 +125,7 @@ LUA;
         $poolSize = (int) ($this->config['pools']['redis']['size'] ?? 30);
         /** @var string[] $queues */
         $queues = (array) ($this->config['queues'] ?? ['default']);
-        $connectionName = 'torque';
+        $connectionName = Torque::CONNECTION;
         $streams = $this->config['streams'] ?? [];
 
         // Pool for job operations (delete, release, etc.)
@@ -149,6 +152,7 @@ LUA;
         );
 
         $events = app(Dispatcher::class);
+        $queueManager = app('queue');
 
         // Mirror queue:work's failed-job bookkeeping (WorkCommand::listenForEvents):
         // the failed-jobs provider write is a listener concern of the worker command
@@ -205,6 +209,9 @@ LUA;
         // Shared pause flag updated by a timer instead of per-Fiber EXISTS calls.
         $pauseState = new \stdClass;
         $pauseState->paused = false;
+        // Framework-paused queue names (queue:pause / queue:pause --all), kept
+        // fresh by the same 2s timer that polls Torque's own pause key.
+        $pauseState->pausedQueues = [];
 
         // Per-slot job-start tracker for the stalled-job watchdog. Indexed by
         // Fiber index; the value is the unix timestamp when the slot picked up
@@ -234,18 +241,40 @@ LUA;
         EventLoop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
 
         $masterPidForPause = posix_getppid();
-        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause) {
-            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause) {
+        $pauseFetchFailed = false;
+        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, &$pauseFetchFailed) {
+            // Framework pause state (queue:pause / queue:pause --all) lives in
+            // the cache store, read synchronously outside the pool callback so
+            // pool-connection hold time is unchanged. On a failed read we keep
+            // the last known set: a cache restart must not silently resume a
+            // deliberately paused fleet.
+            $fetched = self::fetchFrameworkPausedQueues($queueManager, $connectionName, $queues);
+
+            if ($fetched !== null) {
+                $pauseState->pausedQueues = $fetched;
+                $pauseFetchFailed = false;
+            } elseif (! $pauseFetchFailed) {
+                $pauseFetchFailed = true;
+                fwrite(STDERR, "[torque:worker] Framework pause state unreadable (cache store down?), keeping last known state\n");
+            }
+
+            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queues) {
                 $value = $redis->execute('GET', $prefix.'paused');
                 $ttl = (int) $redis->execute('TTL', $prefix.'paused');
 
-                $isPaused = self::shouldPauseFor(
+                $torquePaused = self::shouldPauseFor(
                     $value === null ? null : (string) $value,
                     $ttl,
                     $masterPidForPause,
                 );
 
-                self::applyPauseTransition($isPaused, $pauseState, $events, $connectionName, $primaryQueue);
+                self::applyPauseTransition(
+                    self::shouldFullyPause($torquePaused, $pauseState->pausedQueues, $queues),
+                    $pauseState,
+                    $events,
+                    $connectionName,
+                    $primaryQueue,
+                );
             });
         });
 
@@ -315,7 +344,7 @@ LUA;
                     // cap is approximate under bursts (fibers that passed this
                     // filter may still be awaiting their read), overshooting by
                     // at most the number of concurrently-polling fibers.
-                    $pollQueues = self::eligibleQueues($queues, $streams, $this->streamActive);
+                    $pollQueues = self::eligibleQueues($queues, $streams, $this->streamActive, $pauseState->pausedQueues);
 
                     $loopCount++;
 
@@ -743,6 +772,51 @@ LUA;
     }
 
     /**
+     * Combined pause decision: Torque's own switch OR the framework pausing
+     * every queue this worker serves. `QueueManager::getPausedQueues()` returns
+     * the full queue list when the global `illuminate:queues:paused` flag is
+     * set, so "all queues paused" covers both the global switch and every
+     * queue being paused individually. Static and pure for unit testing.
+     *
+     * @param  list<string>  $frameworkPaused
+     * @param  list<string>  $queues
+     */
+    public static function shouldFullyPause(bool $torquePaused, array $frameworkPaused, array $queues): bool
+    {
+        if ($torquePaused) {
+            return true;
+        }
+
+        return $queues !== [] && array_diff($queues, $frameworkPaused) === [];
+    }
+
+    /**
+     * Read the framework's paused-queue state (queue:pause per-queue keys plus
+     * the 13.25 global flag) in a single cache round-trip. Returns null when
+     * the state could not be read so the caller keeps the last known set
+     * instead of spuriously pausing or resuming. Honors Worker::$pausable the
+     * same way the stock queue worker does.
+     *
+     * @param  list<string>  $queues
+     * @return list<string>|null
+     */
+    public static function fetchFrameworkPausedQueues(
+        QueueManager $manager,
+        string $connectionName,
+        array $queues,
+    ): ?array {
+        if (! Worker::$pausable) {
+            return [];
+        }
+
+        try {
+            return array_values($manager->getPausedQueues($connectionName, $queues));
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Reconcile the pause flag with the latest Redis state and dispatch the
      * matching Laravel event when it transitions.
      *
@@ -973,11 +1047,16 @@ LUA;
      * @param  list<string>  $queues
      * @param  array<string, array<string, mixed>>  $streams
      * @param  array<string, int>  $active
+     * @param  list<string>  $paused  Framework-paused queue names to skip.
      * @return list<string>
      */
-    public static function eligibleQueues(array $queues, array $streams, array $active): array
+    public static function eligibleQueues(array $queues, array $streams, array $active, array $paused = []): array
     {
-        return array_values(array_filter($queues, function (string $queue) use ($streams, $active): bool {
+        return array_values(array_filter($queues, function (string $queue) use ($streams, $active, $paused): bool {
+            if (in_array($queue, $paused, true)) {
+                return false;
+            }
+
             $cap = $streams[$queue]['max_concurrency'] ?? null;
 
             if ($cap === null) {

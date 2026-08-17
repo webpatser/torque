@@ -91,3 +91,43 @@ it('produces correct delayed key in cluster mode', function () {
     $delayedKey = $queue->getStreamKey().':delayed';
     expect($delayedKey)->toBe('app:{default}:delayed');
 });
+
+enum StreamQueueTestPriority: string
+{
+    case High = 'high';
+}
+
+enum StreamQueueTestIntPriority: int
+{
+    case Urgent = 7;
+}
+
+enum StreamQueueTestLane
+{
+    case Backfill;
+}
+
+it('resolves enum queue names like the first-party drivers', function () {
+    $queue = new StreamQueue(
+        redisUri: 'redis://127.0.0.1:6379',
+        default: 'emails',
+        prefix: 'app:',
+    );
+
+    expect($queue->getQueue(StreamQueueTestPriority::High))->toBe('high')
+        ->and($queue->getQueue(StreamQueueTestLane::Backfill))->toBe('Backfill')
+        ->and($queue->getQueue(StreamQueueTestIntPriority::Urgent))->toBe('7')
+        ->and($queue->getStreamKey(StreamQueueTestPriority::High))->toBe('app:high');
+});
+
+it('falls back to the default queue for null and empty names', function () {
+    $queue = new StreamQueue(
+        redisUri: 'redis://127.0.0.1:6379',
+        default: 'emails',
+        prefix: 'app:',
+    );
+
+    expect($queue->getQueue(null))->toBe('emails')
+        ->and($queue->getQueue(''))->toBe('emails')
+        ->and($queue->getStreamKey(''))->toBe('app:emails');
+});
