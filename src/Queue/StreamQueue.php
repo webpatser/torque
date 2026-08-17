@@ -17,6 +17,7 @@ use Webpatser\Torque\Stream\JobStreamRecorder;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
+use function Illuminate\Support\enum_value;
 
 /**
  * Laravel queue driver backed by Redis Streams + AMPHP.
@@ -152,7 +153,7 @@ class StreamQueue extends Queue implements QueueContract
      *
      * @param  object|string  $job
      * @param  mixed  $data
-     * @param  string|null  $queue
+     * @param  \UnitEnum|string|null  $queue
      * @return string The stream message ID.
      */
     #[\NoDiscard]
@@ -164,7 +165,7 @@ class StreamQueue extends Queue implements QueueContract
             $this->createPayload($job, $this->getQueue($queue), $data),
             $queue,
             null,
-            fn (string $payload, ?string $queue) => $this->pushRaw($payload, $queue),
+            fn (string $payload, \UnitEnum|string|null $queue) => $this->pushRaw($payload, $queue),
         );
     }
 
@@ -172,7 +173,7 @@ class StreamQueue extends Queue implements QueueContract
      * Push a raw payload onto the queue.
      *
      * @param  string  $payload  JSON-encoded job payload.
-     * @param  string|null  $queue
+     * @param  \UnitEnum|string|null  $queue
      * @return string The stream message ID.
      */
     #[\NoDiscard]
@@ -216,7 +217,7 @@ class StreamQueue extends Queue implements QueueContract
      * @param  DateTimeInterface|DateInterval|int  $delay
      * @param  object|string  $job
      * @param  mixed  $data
-     * @param  string|null  $queue
+     * @param  \UnitEnum|string|null  $queue
      * @return string The payload UUID.
      */
     #[\NoDiscard]
@@ -228,14 +229,14 @@ class StreamQueue extends Queue implements QueueContract
             $this->createPayload($job, $this->getQueue($queue), $data, $delay),
             $queue,
             $delay,
-            fn (string $payload, ?string $queue, $delay) => $this->laterRaw($delay, $payload, $queue),
+            fn (string $payload, \UnitEnum|string|null $queue, $delay) => $this->laterRaw($delay, $payload, $queue),
         );
     }
 
     /**
      * Push a raw payload onto the delayed sorted set.
      */
-    private function laterRaw(DateTimeInterface|DateInterval|int $delay, string $payload, ?string $queue = null): string
+    private function laterRaw(DateTimeInterface|DateInterval|int $delay, string $payload, \UnitEnum|string|null $queue = null): string
     {
         // Same transcode rationale as pushRaw: createPayload emits JSON.
         $payload = $this->transcodeIncomingPayload($payload);
@@ -268,7 +269,7 @@ class StreamQueue extends Queue implements QueueContract
      * Uses XREADGROUP with a blocking timeout. Returns null when no message is
      * available within the block window.
      *
-     * @param  string|null  $queue
+     * @param  \UnitEnum|string|null  $queue
      */
     #[\Override]
     public function pop($queue = null): ?StreamJob
@@ -335,7 +336,7 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Get the size of the queue (total messages in the stream).
      *
-     * @param  string|null  $queue
+     * @param  \UnitEnum|string|null  $queue
      */
     #[\Override]
     public function size($queue = null): int
@@ -699,9 +700,9 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Resolve the queue name, falling back to the default.
      */
-    public function getQueue(?string $queue = null): string
+    public function getQueue(\UnitEnum|string|null $queue = null): string
     {
-        return $queue ?? $this->default;
+        return (string) (enum_value($queue) ?: $this->default);
     }
 
     /**
@@ -710,7 +711,7 @@ class StreamQueue extends Queue implements QueueContract
      * When cluster mode is enabled, wraps the queue name in a Redis hash tag
      * so all related keys (stream, :delayed, :notify) land on the same slot.
      */
-    public function getStreamKey(?string $queue = null): string
+    public function getStreamKey(\UnitEnum|string|null $queue = null): string
     {
         $queue = $this->getQueue($queue);
 

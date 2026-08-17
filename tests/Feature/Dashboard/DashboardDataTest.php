@@ -311,3 +311,62 @@ it('updates the poll interval from the chrome', function () {
         ->call('setPollInterval', 0)
         ->assertSet('pollInterval', 0);
 });
+
+function torqueTestSeedStreams(array $names): void
+{
+    foreach ($names as $name) {
+        try {
+            torqueTestRedis()->execute('XGROUP', 'CREATE', 'torque-test:'.$name, 'torque-test', '$', 'MKSTREAM');
+        } catch (RedisException $e) {
+            if (! str_contains($e->getMessage(), 'BUSYGROUP')) {
+                throw $e;
+            }
+        }
+    }
+}
+
+it('marks every queue paused when the global pause flag is set', function () {
+    config()->set('torque.streams', ['default' => [], 'backfill' => []]);
+    cache()->forever('illuminate:queues:paused', true);
+
+    try {
+        torqueTestSeedStreams(['default', 'backfill']);
+
+        $queues = app(QueuesData::class)->get()['queues'];
+
+        expect($queues)->toHaveCount(2)
+            ->and(collect($queues)->pluck('paused')->unique()->all())->toBe([true]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cache()->forget('illuminate:queues:paused');
+        try {
+            torqueTestRedis()->execute('DEL', 'torque-test:default', 'torque-test:backfill');
+        } catch (RedisException) {
+            // Cleanup only; the try block's outcome is what matters.
+        }
+    }
+});
+
+it('marks only an individually paused queue as paused', function () {
+    config()->set('torque.streams', ['default' => [], 'backfill' => []]);
+    cache()->forever('illuminate:queue:paused:torque:backfill', true);
+
+    try {
+        torqueTestSeedStreams(['default', 'backfill']);
+
+        $queues = collect(app(QueuesData::class)->get()['queues']);
+
+        expect($queues->firstWhere('name', 'backfill')['paused'])->toBeTrue()
+            ->and($queues->firstWhere('name', 'default')['paused'])->toBeFalse();
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cache()->forget('illuminate:queue:paused:torque:backfill');
+        try {
+            torqueTestRedis()->execute('DEL', 'torque-test:default', 'torque-test:backfill');
+        } catch (RedisException) {
+            // Cleanup only; the try block's outcome is what matters.
+        }
+    }
+});

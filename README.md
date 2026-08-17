@@ -443,6 +443,8 @@ Redis Streams (not LISTs like Horizon) provide:
 | Per-job event timeline   | Logs + failed-job retry | First-class, live-tailable per UUID   |
 | Live job progress        | Custom code per job     | `$this->emit(...)` via `Streamable`   |
 | Worker pause/resume events | `WorkerPausing` / `WorkerResuming` (13.8) | Same events, dispatched on `torque:pause` flips |
+| Framework queue pause | `queue:pause` / `queue:pause --all` (13.25) | Honored: global pause stops the worker, per-queue pause skips that stream (keys on the `torque` connection); `torque:pause` stays independent |
+| Enum queue names | `\UnitEnum` accepted by all drivers (13.25) | Same on `StreamQueue` via `enum_value()` |
 | Queue inspection (`all*`) | `allPendingJobs` / `allReservedJobs` / `allDelayedJobs` (13.8) | Same API on `StreamQueue` |
 
 ## Production deployment
