@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Parity
+- Reviewed Horizon v5.48.2 (2026-08-04), v5.48.3 (2026-08-11), and the unreleased 5.x branch through 2026-08-23; no code changes required. Upstream #1798/#1810 fix a `RedisQueue::later()` version-shim typo that dropped the delay on older Laravel versions, while `StreamQueue` passes the delay unconditionally and requires Laravel 13.25+ (Torque fixed its own equivalent earlier, mirroring #1759). Upstream #1801 fixes `horizon:clear-metrics` on phpredis 6.1+, but Torque has no such command and its metrics are TTL-expiring hashes flushed via `SCAN`. Upstream's pending CSP nonce escaping fix (#1811) has been in place here since 0.13.0 (`Torque::cspNonce()` escapes with `e()`). The remaining upstream changes are axios/postcss/actions bumps that do not apply to the Livewire dashboard.
+
 ## [0.15.0] - 2026-08-17
 
 ### Added
