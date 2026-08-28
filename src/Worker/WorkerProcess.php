@@ -87,6 +87,17 @@ LUA;
      */
     private array $streamActive = [];
 
+    /**
+     * Messages already delivered to this consumer by a multi-stream XREADGROUP
+     * but not yet handed to a Fiber. Redis returns up to COUNT entries per
+     * stream, so one read can deliver more than one message; anything beyond
+     * the first is queued here and served before the next XREADGROUP, otherwise
+     * it would sit in the PEL until retry_after lets another worker steal it.
+     *
+     * @var list<array{stream: string, id: string, payload: string}>
+     */
+    private array $prefetched = [];
+
     /** Limits — set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
@@ -618,9 +629,33 @@ LUA;
      */
     private function parseXreadgroupResponse(mixed $result): ?array
     {
-        if ($result === null) {
+        $messages = $this->parseXreadgroupMessages($result);
+
+        if ($messages === []) {
             return null;
         }
+
+        $first = array_shift($messages);
+
+        foreach ($messages as $message) {
+            $this->prefetched[] = $message;
+        }
+
+        return $first;
+    }
+
+    /**
+     * Every message in an XREADGROUP reply, in stream order.
+     *
+     * @return list<array{stream: string, id: string, payload: string}>
+     */
+    private function parseXreadgroupMessages(mixed $result): array
+    {
+        if ($result === null || ! is_array($result)) {
+            return [];
+        }
+
+        $parsed = [];
 
         foreach ($result as $streamData) {
             if ($streamData === null) {
@@ -628,36 +663,32 @@ LUA;
             }
 
             $streamKey = (string) $streamData[0];
-            $messages = $streamData[1] ?? [];
 
-            if ($messages === []) {
-                continue;
-            }
+            foreach ($streamData[1] ?? [] as $message) {
+                $messageId = (string) $message[0];
+                $fields = $message[1];
 
-            $message = $messages[0];
-            $messageId = (string) $message[0];
-            $fields = $message[1];
-
-            $payload = null;
-            for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-                if ((string) $fields[$i] === 'payload') {
-                    $payload = (string) $fields[$i + 1];
-                    break;
+                $payload = null;
+                for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
+                    if ((string) $fields[$i] === 'payload') {
+                        $payload = (string) $fields[$i + 1];
+                        break;
+                    }
                 }
-            }
 
-            if ($payload === null) {
-                continue;
-            }
+                if ($payload === null) {
+                    continue;
+                }
 
-            return [
-                'stream' => $streamKey,
-                'id' => $messageId,
-                'payload' => $payload,
-            ];
+                $parsed[] = [
+                    'stream' => $streamKey,
+                    'id' => $messageId,
+                    'payload' => $payload,
+                ];
+            }
         }
 
-        return null;
+        return $parsed;
     }
 
     /**
@@ -966,6 +997,10 @@ LUA;
         string $consumerGroup,
         \Closure $buildStreamKey,
     ): ?array {
+        if ($this->prefetched !== []) {
+            return array_shift($this->prefetched);
+        }
+
         $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
 
         foreach ($queues as $queue) {

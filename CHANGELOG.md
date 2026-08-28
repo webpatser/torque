@@ -5,6 +5,11 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - 2026-08-28
+
+### Fixed
+- **Multi-stream `XREADGROUP` stranded every message but the first.** A worker polls all eligible streams in one `XREADGROUP ... COUNT 1 STREAMS a b c`, and Redis returns up to `COUNT` entries *per stream*. `parseXreadgroupResponse()` returned only the first stream's entry, so the other entries were delivered to the consumer (in its PEL) and never handed to a Fiber; they waited until `retry_after` let another worker steal them (30 minutes on scrpr's `slowSync`, 2 hours on `slowScrpr`) and, if that worker was busy on a hot stream, were stranded again. Every delivered entry is now parsed and queued in a per-worker prefetch buffer that `readNextMessage()` drains before issuing the next read (same for the periodic own-PEL read). No config or data changes.
+
 ## [0.16.0] - 2026-08-28
 
 ### Added
