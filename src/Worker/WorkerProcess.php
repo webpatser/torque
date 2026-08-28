@@ -178,7 +178,7 @@ LUA;
                 app('queue.failer')->log(
                     $event->connectionName,
                     $event->job->getQueue(),
-                    $event->job->getRawBody(),
+                    self::failerPayload($event->job->getRawBody()),
                     $event->exception,
                 );
             } catch (\Throwable $e) {
@@ -1216,5 +1216,24 @@ LUA;
         }
 
         return $streamKey;
+    }
+
+    /**
+     * The payload the framework's failed-job provider should store.
+     *
+     * Every shipped provider (`database-uuids` in particular, which reads
+     * `json_decode($payload, true)['uuid']`) and `queue:retry` assume JSON. An
+     * igbinary body is re-encoded so `failed_jobs`, `queue:failed` and
+     * `queue:retry` keep working with `TORQUE_SERIALIZER=igbinary`; the retry
+     * push runs through {@see StreamQueue::transcodeIncomingPayload()}, which
+     * turns it back into igbinary on the wire. JSON bodies pass untouched.
+     */
+    public static function failerPayload(string $rawBody): string
+    {
+        if ($rawBody === '' || $rawBody[0] === '{') {
+            return $rawBody;
+        }
+
+        return json_encode(StreamQueue::decodePayload($rawBody), JSON_THROW_ON_ERROR);
     }
 }

@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Multi-stream `XREADGROUP` stranded every message but the first.** A worker polls all eligible streams in one `XREADGROUP ... COUNT 1 STREAMS a b c`, and Redis returns up to `COUNT` entries *per stream*. `parseXreadgroupResponse()` returned only the first stream's entry, so the other entries were delivered to the consumer (in its PEL) and never handed to a Fiber; they waited until `retry_after` let another worker steal them (30 minutes on scrpr's `slowSync`, 2 hours on `slowScrpr`) and, if that worker was busy on a hot stream, were stranded again. Every delivered entry is now parsed and queued in a per-worker prefetch buffer that `readNextMessage()` drains before issuing the next read (same for the periodic own-PEL read). No config or data changes.
 
+## [0.16.1] - 2026-08-28
+
+### Fixed
+- **`failed_jobs` works with `TORQUE_SERIALIZER=igbinary`.** The worker's `JobFailed` listener handed the raw igbinary body to the framework's failed-job provider, and `database-uuids` reads `json_decode($payload, true)['uuid']`, so every permanent failure logged `failed-jobs log threw: Trying to access array offset on null` and the table stayed empty (seen on a production instance: one line per dead-letter). The listener now passes `WorkerProcess::failerPayload()`, which re-encodes an igbinary body as JSON and leaves JSON untouched, so `queue:failed` and `queue:retry` work on igbinary sites too; a retried job is transcoded back to igbinary on push by the existing `transcodeIncomingPayload()`.
+
 ## [0.16.0] - 2026-08-28
 
 ### Added
