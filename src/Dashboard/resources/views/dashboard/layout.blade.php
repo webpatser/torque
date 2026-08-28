@@ -101,9 +101,12 @@
                     return;
                 }
 
-                // Highlight the picked option right away: the panel is wire:ignore'd,
-                // so the server render never repaints it. Livewire handles the value.
-                if (action === 'close-popover') {
+                // Refresh interval: highlight the picked option right away (the panel
+                // is wire:ignore'd, so the server render never repaints it) and call
+                // the component directly. Livewire.find() returns the $wire proxy and
+                // .call() is plain JS, so this works without expression evaluation
+                // under a CSP without unsafe-eval, where wire:click="method(arg)" may not.
+                if (action === 'set-poll') {
                     var owner = hook.closest('.popover');
                     if (owner) {
                         owner.querySelectorAll('.popover-item.active').forEach(function (item) {
@@ -111,8 +114,18 @@
                         });
                         hook.classList.add('active');
                     }
-                    return closePopovers();
+                    closePopovers();
+
+                    var root = hook.closest('[wire\\:id]');
+                    var id = root && root.getAttribute('wire:id');
+                    var component = id && window.Livewire && window.Livewire.find(id);
+                    if (component) {
+                        component.call('setPollInterval', Number(hook.getAttribute('data-torque-value')));
+                    }
+                    return;
                 }
+
+                if (action === 'close-popover') return closePopovers();
 
                 // Any click outside an open panel closes it.
                 if (target.closest('.popover')) return;

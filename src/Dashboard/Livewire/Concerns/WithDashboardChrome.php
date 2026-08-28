@@ -24,21 +24,47 @@ trait WithDashboardChrome
     public ?int $pollInterval = null;
 
     /**
-     * Seed the poll interval from config on first load.
+     * Session key that remembers the chosen interval across screens and reloads.
+     */
+    private const string POLL_SESSION_KEY = 'torque.poll_interval';
+
+    /**
+     * Seed the poll interval on first load: the interval chosen earlier in this
+     * session wins, then the configured default.
      */
     public function bootWithDashboardChrome(): void
     {
         if ($this->pollInterval === null) {
-            $this->pollInterval = (int) config('torque.dashboard.default_poll_interval', 2000);
+            $remembered = session(self::POLL_SESSION_KEY);
+
+            $this->pollInterval = is_int($remembered) && $this->isAllowedPollInterval($remembered)
+                ? $remembered
+                : (int) config('torque.dashboard.default_poll_interval', 2000);
         }
     }
 
     /**
-     * Update the live-refresh interval from the topbar selector.
+     * Update the live-refresh interval from the topbar selector and remember
+     * it for the rest of the session. Values outside the configured list fall
+     * back to the default so a hand-crafted request cannot set a 1ms poll.
      */
     public function setPollInterval(int $interval): void
     {
-        $this->pollInterval = max(0, $interval);
+        $interval = max(0, $interval);
+
+        if (! $this->isAllowedPollInterval($interval)) {
+            $interval = (int) config('torque.dashboard.default_poll_interval', 2000);
+        }
+
+        $this->pollInterval = $interval;
+        session([self::POLL_SESSION_KEY => $interval]);
+    }
+
+    private function isAllowedPollInterval(int $interval): bool
+    {
+        $allowed = config('torque.dashboard.poll_intervals', [0, 1000, 2000, 5000, 10000, 30000]);
+
+        return in_array($interval, array_map(intval(...), (array) $allowed), true);
     }
 
     /**

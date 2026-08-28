@@ -5,6 +5,11 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.3] - 2026-08-28
+
+### Fixed
+- **Refresh interval could not be changed on CSP-restricted hosts.** The popover options were `wire:click="setPollInterval(N)"`, which Livewire's CSP-safe build has to interpret; on the affected host the call never reached the component. The options now call the component from the chrome script through `Livewire.find(id).call('setPollInterval', N)`, plain JS with nothing to interpret. Two follow-on quirks are fixed with it: the polled region carries `wire:key="poll-{interval}"` so Livewire starts a fresh `wire:poll` timer instead of keeping the old one after the interval changes, and the chosen interval is remembered in the session across screens and reloads (values outside `dashboard.poll_intervals` fall back to the default).
+
 ## [0.16.2] - 2026-08-28
 
 ### Fixed
