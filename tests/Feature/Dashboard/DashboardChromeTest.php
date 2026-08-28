@@ -5,6 +5,8 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Str;
+use Livewire\Livewire;
+use Webpatser\Torque\Dashboard\Livewire\Overview;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
 use Webpatser\Torque\Torque;
 
@@ -59,7 +61,7 @@ it('drives the chrome through delegated data-torque-action hooks', function () {
         ->toContain('data-torque-action="toggle-nav"')
         ->toContain('data-torque-action="toggle-theme"')
         ->toContain('data-torque-action="toggle-popover"')
-        ->toContain('data-torque-action="close-popover"');
+        ->toContain('data-torque-action="set-poll"');
 });
 
 it('renders the refresh popover closed and shielded from the morph', function () {
@@ -73,10 +75,20 @@ it('renders the refresh popover closed and shielded from the morph', function ()
         ->not->toContain('class="popover open"')
         ->and($html)->toContain('aria-expanded="false"');
 
-    // Options are plain Livewire now, no Alpine round-trip.
+    // Options call the component through Livewire.find().call() from the chrome
+    // script: no wire:click expression, so nothing for a CSP interpreter to reject.
     expect($html)
-        ->toContain('wire:click="setPollInterval(')
+        ->toContain('data-torque-action="set-poll"')
+        ->toContain('data-torque-value="5000"')
+        ->and($html)->not->toContain('wire:click="setPollInterval(')
         ->and($html)->not->toContain('$wire.setPollInterval(');
+
+    // The script resolves the component id and calls the method by name.
+    expect($html)->toContain("component.call('setPollInterval'");
+
+    // The polled region is keyed by the interval so the morph replaces it and
+    // Livewire starts a fresh wire:poll timer instead of keeping the old one.
+    expect($html)->toContain('wire:key="poll-1000"');
 
     // The active option is rendered server-side; the script moves the class on
     // click, since the wire:ignore'd panel is never repainted by the server.
@@ -154,4 +166,33 @@ it('keeps the full job class name in a tooltip, since the cell truncates it', fu
     );
 
     expect($html)->toContain('title="App\Jobs\ProcessPodcast"');
+});
+
+it('remembers the chosen interval in the session and rejects unlisted values', function () {
+    config(['torque.dashboard.default_poll_interval' => 1000]);
+
+    Livewire::actingAs(torqueTestUser())
+        ->test(Overview::class)
+        ->assertSet('pollInterval', 1000)
+        ->call('setPollInterval', 5000)
+        ->assertSet('pollInterval', 5000);
+
+    expect(session('torque.poll_interval'))->toBe(5000);
+
+    // A fresh component on another screen boots with the remembered value.
+    Livewire::actingAs(torqueTestUser())->test(Overview::class)->assertSet('pollInterval', 5000);
+
+    // Hand-crafted values outside dashboard.poll_intervals fall back to the default.
+    Livewire::actingAs(torqueTestUser())
+        ->test(Overview::class)
+        ->call('setPollInterval', 1)
+        ->assertSet('pollInterval', 1000);
+
+    // Paused (0) is a listed value and is remembered too.
+    Livewire::actingAs(torqueTestUser())
+        ->test(Overview::class)
+        ->call('setPollInterval', 0)
+        ->assertSet('pollInterval', 0);
+
+    expect(session('torque.poll_interval'))->toBe(0);
 });

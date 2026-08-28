@@ -90,7 +90,10 @@
                  This page polls, so the panel is wire:ignore'd: a morph would
                  otherwise strip the `open` class from under the user's cursor.
                  The initial active option is rendered server-side; the script
-                 moves the class on click, and Livewire stores the value. --}}
+                 moves the class on click and calls setPollInterval() on the
+                 component through Livewire.find().call(), a plain JS call that
+                 needs no wire:click expression evaluation (the CSP build of
+                 Livewire interprets expressions and is the fragile part). --}}
             <div class="popover-anchor">
                 <button type="button" class="btn sm poll-trigger" data-torque-action="toggle-popover" aria-expanded="false">
                     @if ($pollInterval === 0)
@@ -105,8 +108,8 @@
                     <div class="eyebrow">Refresh</div>
                     @foreach ($pollOpts as $o)
                         <button type="button" @class(['popover-item', 'mono', 'active' => $o['v'] === $pollInterval])
-                            data-torque-action="close-popover"
-                            wire:click="setPollInterval({{ $o['v'] }})">
+                            data-torque-action="set-poll"
+                            data-torque-value="{{ $o['v'] }}">
                             <x-torque::icon :name="$o['v'] === 0 ? 'pause' : 'refresh'" :size="12"/>
                             {{ $o['l'] }}
                         </button>
@@ -125,7 +128,10 @@
             </button>
         </header>
         <div class="content">
-            <div class="content-inner page" @if ($pollInterval > 0) wire:poll.{{ $pollInterval }}ms @endif>
+            {{-- wire:key forces the morph to replace this element when the interval
+                 changes: Livewire initialises wire:poll once and never re-reads the
+                 modifier, so without the key the old timer would keep running. --}}
+            <div class="content-inner page" wire:key="poll-{{ $pollInterval }}" @if ($pollInterval > 0) wire:poll.{{ $pollInterval }}ms @endif>
                 {{ $slot }}
             </div>
         </div>
