@@ -531,7 +531,7 @@ LUA;
         // never rotate.
         $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
         $drainStartedAt = null;
-        EventLoop::repeat(1.0, function () use (&$drainStartedAt, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey) {
+        EventLoop::repeat(1.0, function () use (&$drainStartedAt, &$slotStarts, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey) {
             if (! $this->hasReachedLimits()) {
                 return;
             }
@@ -541,7 +541,13 @@ LUA;
                 fwrite(STDERR, "[torque:worker] Limits reached; draining for up to {$drainGrace}s.\n");
             }
 
-            if (time() - $drainStartedAt < $drainGrace) {
+            // The reader Fibers stop polling once limits are reached, so the
+            // drain is complete as soon as no slot is processing a job. Waiting
+            // out the whole window with idle slots kept a rotated worker (and
+            // with it a draining master) parked for the full grace period.
+            $idle = self::drainComplete($slotStarts);
+
+            if (! $idle && time() - $drainStartedAt < $drainGrace) {
                 return;
             }
 
@@ -554,7 +560,9 @@ LUA;
 
             $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
 
-            fwrite(STDERR, "[torque:worker] Drain window expired; forcing exit.\n");
+            fwrite(STDERR, $idle
+                ? "[torque:worker] Drain complete; no jobs in flight, exiting.\n"
+                : "[torque:worker] Drain window expired; forcing exit.\n");
             exit(0);
         });
 
@@ -808,6 +816,16 @@ LUA;
     /**
      * Check if the worker should stop due to any reason: signal, max jobs, or max lifetime.
      */
+    /**
+     * True when no slot is processing a job, i.e. a draining worker may exit now.
+     *
+     * @param  array<int, int>  $slotStarts  Fiber index => start timestamp of its current job.
+     */
+    public static function drainComplete(array $slotStarts): bool
+    {
+        return $slotStarts === [];
+    }
+
     private function hasReachedLimits(): bool
     {
         return $this->stopRequested

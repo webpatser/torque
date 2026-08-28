@@ -5,6 +5,11 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Rotating workers no longer sleep out the drain window with nothing to drain.** After `max_jobs_per_worker` / `max_worker_lifetime` (or a stop signal) the reader Fibers stop polling, but the hard-exit timer still waited the full `drain_grace_seconds` before exiting, even with every slot idle. With a grace sized for long jobs (7200 s on scrpr) that parked each rotated worker, and the draining master behind a deploy, for two hours. The timer now exits as soon as no slot is processing a job; the window only applies while a job is actually in flight.
+
 ## [0.16.4] - 2026-08-28
 
 ### Added
