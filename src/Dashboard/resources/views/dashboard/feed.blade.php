@@ -35,7 +35,7 @@
                     </thead>
                     <tbody>
                         @forelse ($jobs as $j)
-                            <tr class="clickable" @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
+                            <tr class="clickable" data-torque-href="{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}">
                                 <td><x-torque::badge :status="$j['status']" tiny/></td>
                                 <td class="job">
                                     <x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/>

@@ -105,8 +105,6 @@
 
 * { box-sizing: border-box; }
 
-[x-cloak] { display: none !important; }
-
 html, body { height: 100%; }
 
 body {
@@ -141,7 +139,9 @@ body {
   height: 100%;
   min-height: 0;
 }
-.app.nav-collapsed { grid-template-columns: 68px 1fr; }
+/* Sidebar collapse is client-only state, so it is kept on <html> (outside the
+   Livewire root, where the morph cannot reset it) instead of on .app. */
+html.nav-collapsed .app { grid-template-columns: 68px 1fr; }
 
 /* ---------- SIDEBAR ---------- */
 .sidebar {
@@ -322,16 +322,20 @@ body {
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* popover (topbar refresh selector)
-   The panel is x-show driven and sits inside a wire:poll'd component, so its
-   look must come from classes: Livewire's morph resets the style attribute and
-   would wipe Alpine's display:none. */
+   Open/closed is the .open class, toggled by the dashboard chrome script. No
+   inline styles and no Alpine: a CSP without 'unsafe-eval' blocks Alpine's
+   expression compiler, and the morph inside a wire:poll'd component would reset
+   a style attribute anyway. */
 .popover-anchor { position: relative; }
 .popover {
+  display: none;
   position: absolute; top: 40px; right: 0; z-index: 41;
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
   box-shadow: var(--shadow-lg); padding: 5px; min-width: 130px;
 }
+.popover.open { display: block; animation: popin 0.12s var(--ease); }
 .popover .eyebrow { padding: 6px 9px 4px; }
+@keyframes popin { from { opacity: 0; } to { opacity: 1; } }
 .popover-item {
   display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 9px;
   border: none; border-radius: 6px; cursor: pointer; font-size: 12.5px; text-align: left;
@@ -343,8 +347,13 @@ body {
 .poll-trigger { min-width: 92px; }
 .poll-trigger .poll-label { font-size: 12px; }
 .livedot.sm { width: 7px; height: 7px; }
-/* Transparent wrapper that carries wire:ignore around the theme icons. */
+/* Theme toggle: both icons render, CSS shows the one for the active theme.
+   Driven by the <html data-theme> attribute, so no JS expression is involved. */
 .icon-swap { display: contents; }
+.icon-swap .icon-sun, .icon-swap .icon-moon { display: inline-flex; }
+.icon-swap .icon-moon { display: none; }
+html[data-theme="light"] .icon-swap .icon-sun { display: none; }
+html[data-theme="light"] .icon-swap .icon-moon { display: inline-flex; }
 
 /* segmented */
 .seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); }

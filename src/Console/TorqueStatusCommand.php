@@ -9,8 +9,10 @@ use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Process\DrainPause;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Redis\UpgradeRunner;
+use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -44,6 +46,7 @@ final class TorqueStatusCommand extends Command
         $redis = createRedisClient($redisUri);
 
         $this->renderMasterStatus();
+        $this->renderPauseStatus($redis, $prefix);
         $this->renderDataVersion($redis, $prefix);
         $this->renderOverallMetrics($redis, $prefix, $config);
         $this->renderCircuitBreakers($redis, $config);
@@ -70,6 +73,50 @@ final class TorqueStatusCommand extends Command
                 ? "<fg=green;options=bold>RUNNING</> <fg=gray>(PID {$pid})</>"
                 : '<fg=red;options=bold>STOPPED</>',
         );
+
+        $this->newLine();
+    }
+
+    /**
+     * Show why the queue is paused, when it is.
+     *
+     * Nothing is printed on a running queue, so normal output is unchanged.
+     * A pause has two very different causes and the operator response differs
+     * per cause: a deliberate `torque:pause` waits for a human, while a
+     * `drain:<pid>` key is a reload artefact that only outlives its master
+     * when something killed that master mid-drain. Naming the owning PID (and
+     * whether it still runs) is the difference between "someone paused this"
+     * and "a dead reload parked the fleet".
+     */
+    private function renderPauseStatus(RedisClient $redis, string $prefix): void
+    {
+        try {
+            $value = $redis->execute('GET', $prefix.'paused');
+            $ttl = (int) $redis->execute('TTL', $prefix.'paused');
+        } catch (\Throwable) {
+            return;
+        }
+
+        if ($value === null) {
+            return;
+        }
+
+        $ownerPid = DrainPause::ownerPid((string) $value);
+
+        if ($ownerPid === null) {
+            $reason = 'manual <fg=gray>(torque:pause; run `torque:pause continue` to resume)</>';
+        } elseif (ProcessInspector::isTorqueMaster($ownerPid)) {
+            // A live owner means a reload is under way, and then the TTL is
+            // the interesting number: how long this can still last.
+            $reason = "drain from master PID {$ownerPid} <fg=gray>(reload in progress)</>"
+                .($ttl > 0 ? " <fg=gray>[{$ttl}s left]</>" : '');
+        } else {
+            // The remaining TTL is deliberately not shown: nothing will wait
+            // it out, the next master start deletes the key.
+            $reason = "drain from master PID {$ownerPid} <fg=gray>(gone; cleared at next start)</>";
+        }
+
+        $this->components->twoColumnDetail('<fg=yellow;options=bold>Queue PAUSED</>', $reason);
 
         $this->newLine();
     }
