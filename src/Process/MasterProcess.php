@@ -26,6 +26,19 @@ use function Fledge\Async\Redis\createRedisClient;
  */
 final class MasterProcess
 {
+    /**
+     * Compare-and-delete: remove the key only while it still holds the exact
+     * value the caller judged. Used by {@see clearStaleDrainPause()} so a
+     * drain (or a deliberate `torque:pause`) written between the read and the
+     * delete is never swallowed.
+     */
+    private const LUA_DELETE_IF_EQUAL = <<<'LUA'
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+LUA;
+
     /** @var array<int, true> Map of child PIDs to `true`. */
     public private(set) array $workerPids = [];
 
@@ -578,21 +591,99 @@ final class MasterProcess
      * queue (deliberate `torque:pause`, or a not-yet-expired drain flag)
      * spawns workers that pick up nothing, which otherwise looks like a
      * silent hang in the supervisor log.
+     *
+     * A drain pause whose master is gone is cleared first, so the warning is
+     * only ever about a pause that still has an owner.
      */
     private function warnIfPaused(): void
     {
+        if ($this->clearStaleDrainPause()) {
+            return;
+        }
+
         try {
             $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
             $prefix = $this->config['redis']['prefix'] ?? 'torque:';
 
-            $paused = (int) createRedisClient($redisUri)
-                ->execute('EXISTS', $prefix.'paused');
+            $value = createRedisClient($redisUri)->execute('GET', $prefix.'paused');
 
-            if ($paused === 1) {
-                ($this->logger)('Queue is PAUSED (Redis '.$prefix.'paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.');
+            if ($value === null) {
+                return;
             }
+
+            $ownerPid = DrainPause::ownerPid((string) $value);
+
+            $reason = $ownerPid === null
+                ? 'deliberate `torque:pause`'
+                : "drain from master PID {$ownerPid}, which is still running";
+
+            ($this->logger)('Queue is PAUSED ('.$reason.', Redis '.$prefix.'paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.');
         } catch (\Throwable) {
             // Boot must not depend on Redis being up; workers retry on their own.
+        }
+    }
+
+    /**
+     * Delete a `drain:<pid>` pause key whose master is no longer running.
+     *
+     * A drain pause belongs to exactly one master: it stops that master's own
+     * fleet while in-flight jobs finish. When that master is gone (clean exit,
+     * killed by the supervisor, OOM) the key still lives out its TTL of
+     * `drain_grace_seconds + 60`, and installations that raised the grace to
+     * survive long jobs (7200s on one production instance) then start into a
+     * queue that reads as PAUSED for two hours after a killed reload. The
+     * replacement master clears it at boot instead of honouring it.
+     *
+     * Only drain values are touched. A deliberate `torque:pause` writes a
+     * TTL-less generic value and is never cleared automatically: an operator
+     * paused it, an operator resumes it.
+     *
+     * The delete is a compare-and-delete on the exact value we judged, so a
+     * fresh drain or a `torque:pause` landing between the read and the write
+     * survives. Best-effort like the rest of the boot path: a Redis outage
+     * leaves the key alone and logs nothing.
+     *
+     * Public (and with an injectable liveness probe) so the sweep can be
+     * exercised without a live master. Call it only at start: during our own
+     * drain the key legitimately carries our PID.
+     *
+     * @param  (callable(int): bool)|null  $isMasterAlive  Defaults to the real
+     *                                                     process probe.
+     * @return bool Whether a stale key was cleared.
+     */
+    public function clearStaleDrainPause(?callable $isMasterAlive = null): bool
+    {
+        $isMasterAlive ??= ProcessInspector::isTorqueMaster(...);
+
+        try {
+            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+            $prefix = $this->config['redis']['prefix'] ?? 'torque:';
+
+            $redis = createRedisClient($redisUri);
+            $value = $redis->execute('GET', $prefix.'paused');
+            $value = $value === null ? null : (string) $value;
+
+            if (! DrainPause::isStale($value, getmypid(), $isMasterAlive)) {
+                return false;
+            }
+
+            $deleted = (int) $redis->execute(
+                'EVAL',
+                self::LUA_DELETE_IF_EQUAL,
+                '1',
+                $prefix.'paused',
+                (string) $value,
+            );
+
+            if ($deleted === 0) {
+                return false;
+            }
+
+            ($this->logger)('Cleared stale drain pause left by master PID '.DrainPause::ownerPid($value).' (not running).');
+
+            return true;
+        } catch (\Throwable) {
+            return false;
         }
     }
 
@@ -633,6 +724,11 @@ final class MasterProcess
      * and nothing ever deletes it, so every reload leaves the whole queue
      * permanently paused until a manual `torque:pause continue`. A deliberate
      * `torque:pause` still sets the key without a TTL and is unaffected.
+     *
+     * The TTL is the backstop, not the guarantee: it can be hours long on
+     * installations with a big `drain_grace_seconds`, so the next master to
+     * start also clears the key when this PID is gone
+     * (see {@see clearStaleDrainPause()}).
      */
     private function beginDrain(): void
     {

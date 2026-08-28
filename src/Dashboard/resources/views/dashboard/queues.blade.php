@@ -42,7 +42,7 @@
                 </thead>
                 <tbody>
                     @forelse ($queues as $q)
-                        <tr class="clickable" @click="Livewire.navigate('{{ route('torque.feed') }}')">
+                        <tr class="clickable" data-torque-href="{{ route('torque.feed') }}">
                             <td>
                                 <div class="row gap8">
                                     <span class="mono" style="font-size: 12.5px; color: var(--text-faint);">torque:{</span>

@@ -373,12 +373,22 @@ Features:
 
 ### Assets
 
-The dashboard ships pre-built. The compiled `dist/torque.css` lives in the package and is inlined into the layout at request time, so there is nothing to publish and no build step in your application. The behaviour comes from Livewire's own runtime (and bundled Alpine), which your app already loads. If you are working on Torque itself, rebuild the stylesheet with:
+The dashboard ships pre-built. The compiled `dist/torque.css` lives in the package and is inlined into the layout at request time, so there is nothing to publish and no build step in your application. The reactivity comes from Livewire's own runtime, which your app already loads; the chrome (refresh popover, theme and sidebar toggles, copy button, row links) is a small nonce'd vanilla script in the layout. If you are working on Torque itself, rebuild the stylesheet with:
 
 ```bash
 npm install
 npm run build   # writes dist/torque.css (Tailwind 4)
 ```
+
+### Content-Security-Policy
+
+The dashboard works under a strict CSP with a nonce and needs no `'unsafe-eval'`. Torque stamps its inline `<style>` and `<script>` tags with whatever nonce you set, either through `Vite::useCspNonce()` (picked up automatically, same convention Livewire follows) or explicitly:
+
+```php
+\Webpatser\Torque\Torque::cspNonce($nonce);
+```
+
+The dashboard chrome uses no Alpine expressions on purpose: Alpine compiles every directive expression (`x-data`, `x-show`, `@click`, `:class`, `$store`) with `new Function`, which a `script-src` without `'unsafe-eval'` blocks, and the expressions then fail silently. Everything is delegated `data-torque-*` handlers in that one nonce'd script instead. If your policy omits `'unsafe-eval'`, also set `'csp_safe' => true` in `config/livewire.php` so Livewire loads its CSP-safe bundle for the `wire:` directives.
 
 ### Authorization
 
@@ -563,6 +573,8 @@ php artisan torque:reload
 The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
 
 During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. Keep `TORQUE_DRAIN_GRACE` (default `10`) below the stream `retry_after` so the brief overlap cannot double-claim jobs. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
+
+A drain pause belongs to the master that wrote it, so a master starting into a `drain:<pid>` pause whose PID is no longer running deletes the key and logs it, instead of honouring the rest of its TTL (`drain_grace_seconds + 60`, hours on installations with a long grace) after a reload was killed mid-drain. A deliberate `torque:pause` is never cleared automatically, and `torque:status` names which of the two a pause is.
 
 Mutual exclusion between masters is a lifetime `flock` on `storage/torque.lock` (released by the kernel on any exit, including SIGKILL), and the PID file self-heals every second: the owning master rewrites it if missing, reclaims it from a stale PID, and self-demotes into a drain if another live master owns it. Concurrent reloads fail fast on `storage/torque.reload.lock`.
 

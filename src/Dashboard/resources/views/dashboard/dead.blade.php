@@ -66,13 +66,13 @@
                                     @endif
                                 </span>
                             </td>
-                            <td class="job" @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
+                            <td class="job" data-torque-href="{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}">
                                 <x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/>
                                 <div class="mono faint" style="font-size: 10px; margin-top: 2px;">
                                     {{ \Illuminate\Support\Str::substr($j['id'], 0, 8) }} · {{ $j['queue'] }}@if ($j['worker']) · {{ $j['worker'] }}@endif
                                 </div>
                             </td>
-                            <td @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')" style="max-width: 320px;">
+                            <td data-torque-href="{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}" style="max-width: 320px;">
                                 <div class="mono" style="font-size: 11.5px; color: var(--warn);">{{ $j['exception'] }}</div>
                                 <div class="mono faint" style="font-size: 11px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ $j['message'] }}</div>
                             </td>

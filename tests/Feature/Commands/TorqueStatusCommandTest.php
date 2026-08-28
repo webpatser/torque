@@ -73,3 +73,43 @@ it('renders the worker pid and latency from the published hash', function () {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
+
+it('says nothing about pausing while the queue is running', function () {
+    $redis = torqueRedis();
+    $redis->execute('DEL', (string) config('torque.redis.prefix').'paused');
+
+    Artisan::call('torque:status');
+
+    expect(Artisan::output())->not->toContain('Queue PAUSED');
+});
+
+it('names the master a drain pause belongs to', function () {
+    $redis = torqueRedis();
+    $key = (string) config('torque.redis.prefix').'paused';
+
+    $redis->execute('SET', $key, 'drain:424242', 'EX', '60');
+
+    Artisan::call('torque:status');
+    $output = Artisan::output();
+
+    $redis->execute('DEL', $key);
+
+    expect($output)->toContain('Queue PAUSED')
+        ->toContain('drain from master PID 424242');
+});
+
+it('distinguishes a manual pause from a drain', function () {
+    $redis = torqueRedis();
+    $key = (string) config('torque.redis.prefix').'paused';
+
+    $redis->execute('SET', $key, (string) time());
+
+    Artisan::call('torque:status');
+    $output = Artisan::output();
+
+    $redis->execute('DEL', $key);
+
+    expect($output)->toContain('Queue PAUSED')
+        ->toContain('manual')
+        ->not->toContain('drain from master');
+});

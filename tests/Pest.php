@@ -80,3 +80,17 @@ function torqueTestUser(): Authenticatable
         }
     };
 }
+
+/**
+ * The raw Blade source of a dashboard screen.
+ *
+ * Some markup only renders with Redis-backed rows, so the chrome guards assert
+ * on the template itself. Lives here (not in a test file) because parallel
+ * workers only load the test files they own.
+ */
+function torqueDashboardView(string $name): string
+{
+    $path = __DIR__.'/../src/Dashboard/resources/views/dashboard/'.$name.'.blade.php';
+
+    return (string) file_get_contents($path);
+}

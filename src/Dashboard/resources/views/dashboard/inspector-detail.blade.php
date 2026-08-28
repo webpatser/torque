@@ -23,15 +23,18 @@
                     <span style="color: var(--text-dim);">{{ $job['id'] }}</span>
                 </div>
             </div>
-            <div class="row gap8" x-data="{ copied: false }">
+            <div class="row gap8">
                 @if ($canRetry)
                     <button type="button" class="btn primary sm" wire:click="retry('{{ $retryId }}')">
                         <x-torque::icon name="retry" :size="14"/> Retry
                     </button>
                 @endif
-                <button type="button" class="btn sm" @click="navigator.clipboard?.writeText('{{ $job['id'] }}'); copied = true; setTimeout(() => copied = false, 1200)">
+                {{-- Copy is handled by the nonce'd chrome script in the layout: it
+                     writes the clipboard and flips the label for a moment. No Alpine,
+                     whose expressions a CSP without 'unsafe-eval' refuses to compile. --}}
+                <button type="button" class="btn sm" data-torque-action="copy" data-torque-copy="{{ $job['id'] }}">
                     <x-torque::icon name="copy" :size="14"/>
-                    <span x-text="copied ? 'Copied' : 'Copy UUID'">Copy UUID</span>
+                    <span data-torque-copy-label>Copy UUID</span>
                 </button>
             </div>
         </div>

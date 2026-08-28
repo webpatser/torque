@@ -26,7 +26,10 @@
     $curPoll = collect($pollOpts)->firstWhere('v', $pollInterval) ?? $pollOpts[1];
     $version = rescue(fn () => \Composer\InstalledVersions::getPrettyVersion('webpatser/torque'), 'dev', false);
 @endphp
-<div class="app" :class="{ 'nav-collapsed': $store.torque.nav }">
+{{-- The collapsed-nav class lives on <html> (see the chrome script in the
+     layout), not here: this node sits inside the Livewire root, so a poll tick
+     would morph any client-set class straight back to the server value. --}}
+<div class="app">
     <aside class="sidebar">
         <div class="brand">
             <span class="brand-mark"><x-torque::rotor :size="32"/></span>
@@ -71,7 +74,7 @@
     </aside>
     <div class="main">
         <header class="topbar">
-            <button class="icon-btn" type="button" title="Toggle sidebar" @click="$store.torque.toggleNav()">
+            <button class="icon-btn" type="button" title="Toggle sidebar" data-torque-action="toggle-nav">
                 <x-torque::icon name="collapse" :size="17"/>
             </button>
             <div class="tb-title">
@@ -82,17 +85,14 @@
 
             {{-- Poll interval selector.
 
-                 The panel is wire:ignore'd and driven entirely by Alpine. This page
-                 polls, and Livewire's morph only skips attribute patching when
-                 `_x_isShown` differs between the live node and the fresh server node.
-                 A hidden x-show element is `false` while the server node is
-                 `undefined`, so without wire:ignore every poll tick would reset the
-                 style attribute and re-open the panel. For the same reason the look
-                 lives in .popover / .popover-item classes: Alpine must be the only
-                 thing writing to `style`, and the active state reads the reactive
-                 $wire.pollInterval instead of being rendered server-side. --}}
-            <div class="popover-anchor" x-data="{ open: false }">
-                <button type="button" class="btn sm poll-trigger" @click="open = ! open">
+                 Open/closed is a CSS class toggled by the nonce'd chrome script
+                 in the layout (no Alpine: its expressions need 'unsafe-eval').
+                 This page polls, so the panel is wire:ignore'd: a morph would
+                 otherwise strip the `open` class from under the user's cursor.
+                 The initial active option is rendered server-side; the script
+                 moves the class on click, and Livewire stores the value. --}}
+            <div class="popover-anchor">
+                <button type="button" class="btn sm poll-trigger" data-torque-action="toggle-popover" aria-expanded="false">
                     @if ($pollInterval === 0)
                         <x-torque::icon name="pause" :size="13"/>
                     @else
@@ -101,12 +101,12 @@
                     <span class="mono poll-label">{{ $pollInterval === 0 ? 'paused' : 'every '.$curPoll['l'] }}</span>
                     <x-torque::icon name="chevD" :size="13"/>
                 </button>
-                <div wire:ignore class="popover" x-show="open" x-cloak @click.outside="open = false" x-transition.opacity>
+                <div wire:ignore class="popover">
                     <div class="eyebrow">Refresh</div>
                     @foreach ($pollOpts as $o)
-                        <button type="button" class="popover-item mono"
-                            :class="{ active: $wire.pollInterval === {{ $o['v'] }} }"
-                            @click="$wire.setPollInterval({{ $o['v'] }}); open = false">
+                        <button type="button" @class(['popover-item', 'mono', 'active' => $o['v'] === $pollInterval])
+                            data-torque-action="close-popover"
+                            wire:click="setPollInterval({{ $o['v'] }})">
                             <x-torque::icon :name="$o['v'] === 0 ? 'pause' : 'refresh'" :size="12"/>
                             {{ $o['l'] }}
                         </button>
@@ -114,13 +114,13 @@
                 </div>
             </div>
 
-            {{-- Theme toggle. Same morph problem as the popover above: the hidden
-                 icon would be un-hidden on every poll tick, showing both at once.
-                 wire:ignore on a display:contents wrapper leaves both spans alone. --}}
-            <button class="icon-btn" type="button" title="Toggle theme" @click="$store.torque.toggleTheme()">
-                <span wire:ignore class="icon-swap">
-                    <span x-show="$store.torque.theme === 'dark'"><x-torque::icon name="sun" :size="17"/></span>
-                    <span x-show="$store.torque.theme !== 'dark'" x-cloak><x-torque::icon name="moon" :size="17"/></span>
+            {{-- Theme toggle. Both icons are always rendered; CSS picks one off
+                 the <html data-theme> attribute, so a poll tick has nothing to
+                 un-hide and the pair can never show at once. --}}
+            <button class="icon-btn" type="button" title="Toggle theme" data-torque-action="toggle-theme">
+                <span class="icon-swap">
+                    <span class="icon-sun"><x-torque::icon name="sun" :size="17"/></span>
+                    <span class="icon-moon"><x-torque::icon name="moon" :size="17"/></span>
                 </span>
             </button>
         </header>

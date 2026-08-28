@@ -157,7 +157,7 @@
                 <table class="tbl">
                     <tbody>
                         @forelse ($live as $j)
-                            <tr class="clickable" @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
+                            <tr class="clickable" data-torque-href="{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}">
                                 <td style="width: 30px;"><x-torque::badge :status="$j['status']" tiny/></td>
                                 <td class="job"><x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/></td>
                                 <td class="muted mono" style="font-size: 11.5px;">{{ $j['queue'] }}</td>

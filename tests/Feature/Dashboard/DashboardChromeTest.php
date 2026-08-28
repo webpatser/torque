@@ -4,17 +4,23 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Blade;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
+use Webpatser\Torque\Torque;
 
 /**
  * Regression guards for the dashboard chrome markup.
  *
- * Every screen polls (`wire:poll` on the content wrapper), and Livewire's morph
- * resets the `style` attribute of any element whose `_x_isShown` marker differs
- * between the live node and the freshly rendered one. That wiped Alpine's
- * `display: none`, so the refresh popover re-opened on every tick and both theme
- * icons showed at once. The fix is structural (wire:ignore + classes instead of
- * inline styles), so assert on the markup rather than on behaviour.
+ * The chrome contains no Alpine expressions on purpose. Alpine compiles every
+ * directive expression (x-data, x-show, @click, :class, $store, x-text) with
+ * `new Function`, which a Content-Security-Policy without 'unsafe-eval' blocks.
+ * Under such a policy the expressions failed silently: the refresh popover was
+ * stuck open, both theme icons showed and clicks did nothing, while Livewire
+ * (which needs no eval of its own) kept the page looking alive.
+ *
+ * A single nonce'd vanilla script in the layout drives the chrome instead,
+ * through delegated `data-torque-action` hooks that survive Livewire morphs and
+ * wire:navigate. The fix is structural, so assert on the markup.
  */
 beforeEach(function () {
     config()->set('torque.dashboard.enabled', true);
@@ -26,28 +32,97 @@ beforeEach(function () {
     Gate::define('viewTorque', fn ($user): bool => true);
 });
 
-it('renders the refresh popover as an Alpine-owned, morph-ignored panel', function () {
-    $html = $this->actingAs(torqueTestUser())->get('/torque')->assertOk()->getContent();
-
-    // The panel opts out of morphing entirely.
-    expect($html)->toContain('wire:ignore class="popover"');
-
-    // Its options round-trip through Alpine ($wire), never through wire:click:
-    // a server round-trip would re-render the panel and reopen it.
-    expect($html)
-        ->not->toContain('wire:click="setPollInterval')
-        ->and($html)->toContain('$wire.setPollInterval(')
-        ->and($html)->toContain('$wire.pollInterval ===');
-
-    // The active option is a class, not an inline style, so Alpine stays the
-    // only writer of the style attribute inside the popover.
-    expect($html)->toContain('class="popover-item mono"');
+afterEach(function () {
+    Torque::cspNonce(null);
 });
 
-it('shields the theme toggle icons from the morph', function () {
+it('renders no Alpine directive attributes anywhere in the dashboard', function (string $path) {
+    $html = $this->actingAs(torqueTestUser())->get($path)->assertOk()->getContent();
+
+    expect($html)
+        ->not->toMatch('/\sx-[a-z]+[=\s>]/')
+        ->not->toMatch('/\s@[a-z][a-z.]*=/')
+        ->not->toMatch('/\s:[a-z][a-z-]*=/')
+        ->and($html)->not->toContain('$store')
+        ->and($html)->not->toContain('$wire.');
+})->with([
+    'overview' => '/torque',
+    'feed' => '/torque/feed',
+    'queues' => '/torque/queues',
+    'dead-letter' => '/torque/dead',
+]);
+
+it('drives the chrome through delegated data-torque-action hooks', function () {
     $html = $this->actingAs(torqueTestUser())->get('/torque')->assertOk()->getContent();
 
-    expect($html)->toContain('wire:ignore class="icon-swap"');
+    expect($html)
+        ->toContain('data-torque-action="toggle-nav"')
+        ->toContain('data-torque-action="toggle-theme"')
+        ->toContain('data-torque-action="toggle-popover"')
+        ->toContain('data-torque-action="close-popover"');
+});
+
+it('renders the refresh popover closed and shielded from the morph', function () {
+    $html = $this->actingAs(torqueTestUser())->get('/torque')->assertOk()->getContent();
+
+    // The panel opts out of morphing, so an open panel survives a poll tick.
+    expect($html)->toContain('wire:ignore class="popover"');
+
+    // Closed by default: `open` is added by the script, never rendered.
+    expect($html)
+        ->not->toContain('class="popover open"')
+        ->and($html)->toContain('aria-expanded="false"');
+
+    // Options are plain Livewire now, no Alpine round-trip.
+    expect($html)
+        ->toContain('wire:click="setPollInterval(')
+        ->and($html)->not->toContain('$wire.setPollInterval(');
+
+    // The active option is rendered server-side; the script moves the class on
+    // click, since the wire:ignore'd panel is never repainted by the server.
+    expect($html)->toContain('class="popover-item mono active"');
+});
+
+it('renders both theme icons and lets CSS pick one off the html attribute', function () {
+    $html = $this->actingAs(torqueTestUser())->get('/torque')->assertOk()->getContent();
+
+    expect($html)
+        ->toContain('class="icon-sun"')
+        ->toContain('class="icon-moon"')
+        ->and($html)->not->toContain('wire:ignore class="icon-swap"');
+});
+
+// Table rows only render with Redis-backed data, so assert on the templates:
+// the rendered pages are already covered by the no-Alpine test above.
+it('navigates rows through a data attribute instead of an Alpine click', function (string $view) {
+    $source = torqueDashboardView($view);
+
+    expect($source)
+        ->toContain('data-torque-href="')
+        ->not->toContain('Livewire.navigate(');
+})->with(['overview', 'feed', 'queues', 'dead']);
+
+it('copies the job UUID through the chrome script, not Alpine', function () {
+    $source = torqueDashboardView('inspector-detail');
+
+    expect($source)
+        ->toContain('data-torque-action="copy"')
+        ->toContain('data-torque-copy="{{ $job[\'id\'] }}"')
+        ->toContain('data-torque-copy-label');
+});
+
+it('stamps the chrome script with the CSP nonce when one is configured', function () {
+    $nonce = Str::random(40);
+
+    Torque::cspNonce($nonce);
+
+    $html = $this->actingAs(torqueTestUser())->get('/torque')->assertOk()->getContent();
+
+    // Both the pre-paint theme script and the chrome script carry the nonce,
+    // and no inline script slips through without one.
+    expect(substr_count($html, "<script nonce=\"{$nonce}\">"))->toBeGreaterThanOrEqual(2)
+        ->and($html)->not->toContain('<script>')
+        ->and($html)->toContain('data-torque-action');
 });
 
 it('wraps dashboard tables so they scroll instead of overflowing the card', function (string $path) {
