@@ -271,6 +271,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
 | `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
 | `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
+| `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--deep` also sweeps orphaned job streams, stale index members and legacy keys; `--dry-run` to preview |
 | `torque:supervisor` | Generate a Supervisor config file |
 
 ## Configuration
@@ -286,7 +287,14 @@ All options are in `config/torque.php`. Key settings:
 | `drain_grace_seconds` | 10 | Seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM |
 | `takeover_ready_timeout` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
 | `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
+| `metrics.retention` | 86400 | Seconds of per-minute history kept (about 20 bytes per minute) |
+| `metrics.rollups.hourly_days` / `daily_days` | 90 / 730 | Days of hourly and daily `processed,failed` rollups kept, cluster-wide and per stream. Roughly 60 KB in total plus the same per stream; `daily_days` `0` keeps them forever (~7 KB a year) |
+| `dashboard.gauge_max` | null | Scale of the overview gauge in jobs/min; `null` fits it to the busiest minute of the last hour |
 | `stall_warn_seconds` | 300 | Watchdog logs a WARN for any slot whose current job has been running longer than this |
+| `dead_letter.ttl` | 604800 | Seconds a dead-lettered job is kept before it is trimmed |
+| `dead_letter.max_entries` | 100000 | Hard cap on the dead-letter stream, enforced on every write (`XADD MAXLEN ~`). `0` = TTL only |
+| `dead_letter.prune_interval` | 300 | Seconds between the master's own housekeeping runs (dead-letter trim + stale consumer sweep). `0` disables it |
+| `circuit_breaker.enabled` | true | Pause a stream whose jobs are failing permanently at a high rate |
 | `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
 
@@ -313,6 +321,35 @@ All options are in `config/torque.php`. Key settings:
 ],
 ```
 
+### Circuit breaker
+
+When a stream's dependency dies (an API returning 500s, expired credentials), every job on it fails permanently and the whole backlog burns straight into the dead-letter stream. The breaker stops that: once the permanent-failure ratio of a stream's recent outcomes crosses `threshold`, that stream is no longer polled for `cooldown` seconds. Other streams keep running.
+
+```php
+'circuit_breaker' => [
+    'enabled' => true,
+    'window' => 100,        // outcomes per stream in the sliding window
+    'min_samples' => 20,    // never trip below this many outcomes
+    'threshold' => 0.9,     // permanent-failure ratio that opens the breaker
+    'cooldown' => 300,      // seconds the stream stays paused before half-open
+    'half_open_max' => 5,   // probe jobs allowed while half-open
+    'retention' => 3600,    // TTL on the outcome window keys
+],
+```
+
+Only permanent failures (jobs that reached the dead-letter stream) count as failures; completions count as successes and a retry is neutral. After the cooldown the breaker goes half-open: up to `half_open_max` jobs are let through, all of them failing re-opens it for another cooldown, and the first success closes it and resets the window.
+
+Override per stream, or opt a stream out entirely:
+
+```php
+'streams' => [
+    'scrpr' => ['circuit_breaker' => ['threshold' => 0.8, 'cooldown' => 600]],
+    'mail'  => ['circuit_breaker' => false],
+],
+```
+
+State is shared across the whole fleet through Redis (every key carries an expiry) and an open breaker is expressed as a paused queue, exactly like `php artisan queue:pause <name>`. Listen for `QueueCircuitOpened` / `QueueCircuitClosed` to alert on it, check `torque:status` for a line per tripped stream, and force one closed with `php artisan torque:pause continue` or `php artisan queue:resume torque:<queue>` once the upstream problem is fixed.
+
 ## Dashboard
 
 Torque includes a self-contained dashboard at `/torque` (configurable). It is built with **Livewire 4** and plain Blade + Tailwind, served Horizon/Pulse-style: a set of full-page Livewire components share one Blade layout, and the compiled `dist/torque.css` is inlined into it. Livewire (a hard dependency) ships its own runtime and bundled Alpine through your app, so there is **no React, no Flux, no paid UI library, no host Tailwind or Vite build, and no `npm` step in your application**. Enable it in config:
@@ -324,8 +361,10 @@ Torque includes a self-contained dashboard at `/torque` (configurable). It is bu
 ```
 
 Features:
-- Real-time metrics (throughput, latency, concurrent jobs, memory)
+- Real-time metrics (throughput, latency, concurrent jobs, memory) with a damped throughput gauge: the needle shows a smoothed five-minute jobs/min figure plus the exact count for the last hour, so a burst of 1500 jobs every five minutes reads as 300/min instead of 0 and then 90K
+- Long-term history: minute, hour and day rollups (cluster-wide and per stream) power the 1h / 24h / 7d / 90d throughput chart and the processed / failed today columns on the Queues page
 - Worker table with coroutine slot usage bars
+- Jobs page: throughput, average and peak runtime, and fail rate per job class over 1h / 24h / 7d / 90d
 - Stream/queue overview with pending and delayed counts
 - Failed jobs list with retry and delete actions (cursor-paginated)
 - Per-job inspector with a timeline of lifecycle events and exception details
@@ -380,6 +419,27 @@ Event::listen(JobPermanentlyFailed::class, function ($event) {
     // $event->jobName, $event->queue, $event->exceptionMessage, etc.
     Notification::route('slack', '#alerts')->notify(new YourNotification($event));
 });
+```
+
+### Dead-letter retention
+
+The stream is bounded in two ways, so a failure storm can never fill Redis:
+
+```php
+'dead_letter' => [
+    'ttl' => 604800,           // entries older than 7 days are trimmed
+    'max_entries' => 100000,   // hard cap, applied on every write (0 = TTL only)
+    'prune_interval' => 300,   // seconds between the master's housekeeping runs (0 = off)
+],
+```
+
+`max_entries` is enforced by the write itself (`XADD ... MAXLEN ~`), which is what keeps the stream bounded even during a storm; trimming is approximate, so the real length settles slightly above the cap in exchange for an O(1) write. Size it against your payloads: at ~6 KB per entry (payload plus truncated trace) the default is roughly 600 MB worst case.
+
+The master applies the TTL, the cap, and a sweep of consumer names left behind by exited workers on its first tick after start and every `prune_interval` seconds after that, so nothing has to be scheduled. Run the same pass by hand whenever you want:
+
+```bash
+php artisan torque:prune --dry-run        # report only
+php artisan torque:prune --dead-letter-max=50000 --consumer-idle=3600
 ```
 
 ## Architecture
@@ -463,6 +523,22 @@ sudo supervisorctl reread
 sudo supervisorctl update
 sudo supervisorctl start torque
 ```
+
+### Operations
+
+A few settings on the Redis instance and the app side that keep a failure storm from turning into an outage:
+
+- **Give Torque's Redis a `maxmemory` and set `maxmemory-policy noeviction`.** With eviction on, a runaway writer silently evicts other keys; with `noeviction` the writer gets `OOM command not allowed` instead, which is loud, contained, and recoverable. Torque's own keys are all bounded (dead-letter cap, metrics TTLs, breaker expiries).
+- **Prune `failed_jobs` too.** The dead-letter cap bounds Redis, not your database: the framework's failed-jobs table grows one row per permanent failure. Schedule `Schedule::command('queue:prune-failed --hours=168')->daily();`.
+- **Optionally schedule `torque:prune`** hourly as belt and braces. Since the master runs the same housekeeping every `dead_letter.prune_interval` seconds it is no longer required, but it costs nothing and covers a fleet that is down while the scheduler still runs.
+
+### Upgrading from an older Torque
+
+Version-specific notes live in [UPGRADE.md](UPGRADE.md).
+
+Leftovers from a previous version (per-job event streams that never got their terminal expiry, index members pointing at streams that are gone, legacy metric keys) are cleaned up automatically on the first `torque:start` after the deploy: the master runs the sweep once per version and records it in `{prefix}version`, logging a count per category.
+
+To preview it before restarting the fleet, run `php artisan torque:prune --deep --dry-run` and then the same command without `--dry-run`. `torque:status` shows the recorded data version next to the installed one.
 
 ### Zero-downtime reload
 

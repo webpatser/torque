@@ -127,3 +127,63 @@ it('resets all counters', function () {
     expect($collector->activeSlots)->toBe(0);
     expect($collector->getAverageLatencyMs())->toBe(0.0);
 });
+
+it('attributes outcomes to their stream', function () {
+    $collector = new MetricsCollector(totalSlots: 10);
+
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(12.0, 'default');
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(8.0, 'default');
+    $collector->recordJobStarted();
+    $collector->recordJobFailed(20.0, 'default');
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(5.0, 'high');
+
+    // A job handled outside a named stream still counts in the totals, it just
+    // carries no attribution.
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(3.0);
+
+    $snapshot = $collector->snapshot();
+
+    expect($snapshot->perQueue)->toBe(['default' => [2, 1], 'high' => [1, 0]])
+        ->and($snapshot->jobsProcessed)->toBe(4)
+        ->and($snapshot->jobsFailed)->toBe(1);
+
+    $collector->reset();
+
+    expect($collector->snapshot()->perQueue)->toBe([]);
+});
+
+it('attributes runtime to the job class that produced it', function () {
+    $collector = new MetricsCollector(totalSlots: 10);
+
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(120.0, 'default', 'App\Jobs\ProcessPodcast');
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(80.0, 'default', 'App\Jobs\ProcessPodcast');
+    $collector->recordJobStarted();
+    $collector->recordJobFailed(500.0, 'default', 'App\Jobs\ProcessPodcast');
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(10.0, 'high', 'App\Jobs\SendInvoice');
+
+    // No class attribution still counts in the totals.
+    $collector->recordJobStarted();
+    $collector->recordJobCompleted(5.0, 'default');
+
+    $snapshot = $collector->snapshot();
+
+    expect($snapshot->perJob)->toBe([
+        // [processed, failed, runtimeSumMs, runtimeMaxMs]: the failed run is the
+        // slowest, and a peak is a high-water mark rather than a sum.
+        'App\Jobs\ProcessPodcast' => [2, 1, 700.0, 500.0],
+        'App\Jobs\SendInvoice' => [1, 0, 10.0, 10.0],
+    ])
+        ->and($snapshot->jobsProcessed)->toBe(4)
+        ->and($snapshot->jobsFailed)->toBe(1);
+
+    $collector->reset();
+
+    expect($collector->snapshot()->perJob)->toBe([]);
+});

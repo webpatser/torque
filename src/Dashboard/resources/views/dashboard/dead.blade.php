@@ -43,56 +43,58 @@
                 @endif
             </div>
         </div>
-        <table class="tbl">
-            <thead>
-                <tr>
-                    <th style="width: 30px;"></th>
-                    <th>Job</th>
-                    <th>Exception</th>
-                    <th class="r">Tries</th>
-                    <th class="r">Failed</th>
-                    <th style="width: 80px;"></th>
-                </tr>
-            </thead>
-            <tbody>
-                @forelse ($shown as $j)
-                    @php $isSel = in_array($j['id'], $selected, true); @endphp
-                    <tr class="clickable">
-                        <td wire:click="toggleSelect('{{ $j['id'] }}')">
-                            <span style="width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid {{ $isSel ? 'var(--accent)' : 'var(--border-2)' }}; background: {{ $isSel ? 'var(--accent)' : 'transparent' }}; display: grid; place-items: center;">
-                                @if ($isSel)
-                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--accent-ink)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                                @endif
-                            </span>
-                        </td>
-                        <td @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
-                            <x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/>
-                            <div class="mono faint" style="font-size: 10px; margin-top: 2px;">
-                                {{ \Illuminate\Support\Str::substr($j['id'], 0, 8) }} · {{ $j['queue'] }}@if ($j['worker']) · {{ $j['worker'] }}@endif
-                            </div>
-                        </td>
-                        <td @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')" style="max-width: 320px;">
-                            <div class="mono" style="font-size: 11.5px; color: var(--warn);">{{ $j['exception'] }}</div>
-                            <div class="mono faint" style="font-size: 11px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ $j['message'] }}</div>
-                        </td>
-                        <td class="r mono"><span class="badge s-failed tiny">{{ $j['attempts'] ?? '–' }}</span></td>
-                        <td class="r mono faint" style="font-size: 11.5px;">{{ Format::ago($j['failedAt']) }}</td>
-                        <td class="r">
-                            <div class="row gap6" style="justify-content: flex-end;">
-                                <button type="button" class="icon-btn" style="width: 28px; height: 28px;" title="Retry" wire:click="retryOne('{{ $j['id'] }}')" wire:loading.attr="disabled">
-                                    <x-torque::icon name="retry" :size="14"/>
-                                </button>
-                                <button type="button" class="icon-btn" style="width: 28px; height: 28px;" title="Delete" wire:click="purgeOne('{{ $j['id'] }}')" wire:loading.attr="disabled">
-                                    <x-torque::icon name="trash" :size="14"/>
-                                </button>
-                            </div>
-                        </td>
+        <div class="tbl-wrap">
+            <table class="tbl">
+                <thead>
+                    <tr>
+                        <th style="width: 30px;"></th>
+                        <th>Job</th>
+                        <th>Exception</th>
+                        <th class="r">Tries</th>
+                        <th class="r">Failed</th>
+                        <th style="width: 80px;"></th>
                     </tr>
-                @empty
-                    <tr><td colspan="6"><div class="empty mono">{{ $search ? 'no matches' : 'dead-letter stream is empty 🎉' }}</div></td></tr>
-                @endforelse
-            </tbody>
-        </table>
+                </thead>
+                <tbody>
+                    @forelse ($shown as $j)
+                        @php $isSel = in_array($j['id'], $selected, true); @endphp
+                        <tr class="clickable">
+                            <td wire:click="toggleSelect('{{ $j['id'] }}')">
+                                <span style="width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid {{ $isSel ? 'var(--accent)' : 'var(--border-2)' }}; background: {{ $isSel ? 'var(--accent)' : 'transparent' }}; display: grid; place-items: center;">
+                                    @if ($isSel)
+                                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="var(--accent-ink)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                    @endif
+                                </span>
+                            </td>
+                            <td class="job" @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
+                                <x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/>
+                                <div class="mono faint" style="font-size: 10px; margin-top: 2px;">
+                                    {{ \Illuminate\Support\Str::substr($j['id'], 0, 8) }} · {{ $j['queue'] }}@if ($j['worker']) · {{ $j['worker'] }}@endif
+                                </div>
+                            </td>
+                            <td @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')" style="max-width: 320px;">
+                                <div class="mono" style="font-size: 11.5px; color: var(--warn);">{{ $j['exception'] }}</div>
+                                <div class="mono faint" style="font-size: 11px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ $j['message'] }}</div>
+                            </td>
+                            <td class="r mono"><span class="badge s-failed tiny">{{ $j['attempts'] ?? '–' }}</span></td>
+                            <td class="r mono faint" style="font-size: 11.5px;">{{ Format::ago($j['failedAt']) }}</td>
+                            <td class="r">
+                                <div class="row gap6" style="justify-content: flex-end;">
+                                    <button type="button" class="icon-btn" style="width: 28px; height: 28px;" title="Retry" wire:click="retryOne('{{ $j['id'] }}')" wire:loading.attr="disabled">
+                                        <x-torque::icon name="retry" :size="14"/>
+                                    </button>
+                                    <button type="button" class="icon-btn" style="width: 28px; height: 28px;" title="Delete" wire:click="purgeOne('{{ $j['id'] }}')" wire:loading.attr="disabled">
+                                        <x-torque::icon name="trash" :size="14"/>
+                                    </button>
+                                </div>
+                            </td>
+                        </tr>
+                    @empty
+                        <tr><td colspan="6"><div class="empty mono">{{ $search ? 'no matches' : 'dead-letter stream is empty 🎉' }}</div></td></tr>
+                    @endforelse
+                </tbody>
+            </table>
+        </div>
         @if ($total > $perPage)
             <div class="row between" style="padding: 12px 16px; border-top: 1px solid var(--border);">
                 <span class="mono faint" style="font-size: 11px;">{{ $from }}–{{ $to }} of {{ $total }} · cursor-paginated</span>

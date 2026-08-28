@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
+use Webpatser\Torque\Job\CircuitBreaker;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -16,6 +17,9 @@ use function Fledge\Async\Redis\createRedisClient;
  * Sets or removes the `{prefix}paused` key in Redis. Workers check this key
  * in their main loop — when set, they skip reading new jobs but keep running
  * so in-flight jobs can complete.
+ *
+ * Resuming additionally force-closes any open circuit breaker, so an operator
+ * who has fixed the upstream problem does not have to wait out the cooldown.
  */
 final class TorquePauseCommand extends Command
 {
@@ -52,6 +56,19 @@ final class TorquePauseCommand extends Command
             'continue' => false,
             'toggle' => ! $currentlyPaused,
         };
+
+        // Resuming is also the operator override for a tripped circuit
+        // breaker, and it applies even when the global pause flag was never
+        // set: a stream can be paused by its breaker alone.
+        if (! $shouldPause) {
+            $closed = app(CircuitBreaker::class)->forceCloseAll(
+                array_keys((array) ($config['streams'] ?? [])),
+            );
+
+            if ($closed !== []) {
+                $this->components->info('Closed the circuit breaker on: '.implode(', ', $closed).'.');
+            }
+        }
 
         if ($shouldPause === $currentlyPaused) {
             $state = $currentlyPaused ? 'paused' : 'running';

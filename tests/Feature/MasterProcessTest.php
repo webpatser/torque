@@ -134,3 +134,37 @@ it('constructor accepts config and logger', function () {
         ->and($master->workerPids)->toBe([])
         ->and($master->workerCount)->toBe(0);
 });
+
+it('turns cumulative per-class counters into per-tick deltas', function () {
+    $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+
+    $deltas = new ReflectionMethod($master, 'perJobDeltas');
+    $state = new ReflectionProperty($master, 'lastAggregatePerJob');
+
+    // With no previous sample the whole cumulative figure reads as the delta.
+    // The caller only reaches this helper from the second publish onwards, so
+    // in practice the first tick is what seeds the state below.
+    expect($deltas->invoke($master, ['App\Jobs\A' => [10, 2, 1000.0, 240.0]]))
+        ->toBe(['App\Jobs\A' => [10, 2, 1000.0, 240.0]]);
+
+    $state->setValue($master, ['App\Jobs\A' => [10, 2, 1000.0, 240.0]]);
+
+    expect($deltas->invoke($master, [
+        'App\Jobs\A' => [14, 3, 1400.0, 90.0],
+        // A class that has not moved contributes nothing at all.
+        'App\Jobs\B' => [0, 0, 0.0, 0.0],
+    ]))->toBe([
+        // Counters and the runtime sum are deltas; the peak is whatever the
+        // largest run reported this tick was, so it passes through unchanged
+        // even when it is lower than the previous tick's.
+        'App\Jobs\A' => [4, 1, 400.0, 90.0],
+    ]);
+
+    // A worker restart resets its counters, so the cumulative total falls. The
+    // clamp turns that into no delta at all rather than negative history: one
+    // tick is lost and the next resynchronises, which is the same trade the
+    // cluster-wide throughput delta makes.
+    $state->setValue($master, ['App\Jobs\A' => [999, 999, 99999.0, 500.0]]);
+
+    expect($deltas->invoke($master, ['App\Jobs\A' => [3, 1, 30.0, 12.0]]))->toBe([]);
+});

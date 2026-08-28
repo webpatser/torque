@@ -47,7 +47,7 @@ it('has all properties publicly accessible', function () {
     $reflection = new ReflectionClass($snapshot);
     $properties = $reflection->getProperties(ReflectionProperty::IS_PUBLIC);
 
-    expect($properties)->toHaveCount(8);
+    expect($properties)->toHaveCount(10);
 
     $names = array_map(fn (ReflectionProperty $p) => $p->getName(), $properties);
 
@@ -58,7 +58,14 @@ it('has all properties publicly accessible', function () {
         ->toContain('averageLatencyMs')
         ->toContain('slotUsageRatio')
         ->toContain('memoryBytes')
-        ->toContain('timestamp');
+        ->toContain('timestamp')
+        ->toContain('perQueue')
+        ->toContain('perJob');
+
+    // Attribution is optional, so a snapshot built without it is still valid
+    // and simply reports nothing per stream or per class.
+    expect($snapshot->perQueue)->toBe([])
+        ->and($snapshot->perJob)->toBe([]);
 });
 
 it('accepts zero values for all fields', function () {

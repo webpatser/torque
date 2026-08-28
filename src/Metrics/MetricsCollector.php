@@ -35,6 +35,27 @@ final class MetricsCollector
             : 0.0;
     }
 
+    /**
+     * Per-stream counters, queue name => [processed, failed].
+     *
+     * One entry per configured stream at most, so this stays a handful of
+     * integers regardless of throughput.
+     *
+     * @var array<string, array{0: int, 1: int}>
+     */
+    private array $perQueue = [];
+
+    /**
+     * Per-job-class counters, class => [processed, failed, runtimeSumMs,
+     * runtimeMaxMs].
+     *
+     * Bounded by the number of distinct job classes the worker handles, and the
+     * worker is recycled long before that becomes interesting.
+     *
+     * @var array<string, array{0: int, 1: int, 2: float, 3: float}>
+     */
+    private array $perJob = [];
+
     /** Circular buffer holding the most recent latency samples (ms). */
     private SplFixedArray $latencyBuffer;
 
@@ -74,11 +95,13 @@ final class MetricsCollector
      * Frees one coroutine slot, increments the processed counter,
      * and records the latency sample.
      */
-    public function recordJobCompleted(float $durationMs): void
+    public function recordJobCompleted(float $durationMs, ?string $queue = null, ?string $jobClass = null): void
     {
         $this->activeSlots = max(0, $this->activeSlots - 1);
         $this->jobsProcessed++;
         $this->recordLatency($durationMs);
+        $this->recordQueueOutcome($queue, processed: 1, failed: 0);
+        $this->recordJobClassOutcome($jobClass, $durationMs, processed: 1, failed: 0);
     }
 
     /**
@@ -87,11 +110,13 @@ final class MetricsCollector
      * Frees one coroutine slot, increments the failure counter,
      * and records the latency sample.
      */
-    public function recordJobFailed(float $durationMs): void
+    public function recordJobFailed(float $durationMs, ?string $queue = null, ?string $jobClass = null): void
     {
         $this->activeSlots = max(0, $this->activeSlots - 1);
         $this->jobsFailed++;
         $this->recordLatency($durationMs);
+        $this->recordQueueOutcome($queue, processed: 0, failed: 1);
+        $this->recordJobClassOutcome($jobClass, $durationMs, processed: 0, failed: 1);
     }
 
     /**
@@ -137,6 +162,8 @@ final class MetricsCollector
                 : 0.0,
             memoryBytes: memory_get_usage(true),
             timestamp: time(),
+            perQueue: $this->perQueue,
+            perJob: $this->perJob,
         );
     }
 
@@ -150,9 +177,50 @@ final class MetricsCollector
         $this->jobsProcessed = 0;
         $this->jobsFailed = 0;
         $this->activeSlots = 0;
+        $this->perQueue = [];
+        $this->perJob = [];
         $this->latencyCursor = 0;
         $this->latencySamplesRecorded = 0;
         $this->latencyBuffer = new SplFixedArray($this->latencyWindowSize);
+    }
+
+    /**
+     * Attribute an outcome to its stream.
+     *
+     * Jobs handled outside a named stream are still counted in the totals, they
+     * just carry no per-stream attribution.
+     */
+    private function recordQueueOutcome(?string $queue, int $processed, int $failed): void
+    {
+        if ($queue === null || $queue === '') {
+            return;
+        }
+
+        [$currentProcessed, $currentFailed] = $this->perQueue[$queue] ?? [0, 0];
+
+        $this->perQueue[$queue] = [$currentProcessed + $processed, $currentFailed + $failed];
+    }
+
+    /**
+     * Attribute an outcome and its runtime to the job class that produced it.
+     *
+     * Runtime is kept as a sum and a high-water mark rather than a list, so the
+     * dashboard can show an average and a peak at constant memory.
+     */
+    private function recordJobClassOutcome(?string $jobClass, float $durationMs, int $processed, int $failed): void
+    {
+        if ($jobClass === null || $jobClass === '') {
+            return;
+        }
+
+        [$currentProcessed, $currentFailed, $runtimeSum, $runtimeMax] = $this->perJob[$jobClass] ?? [0, 0, 0.0, 0.0];
+
+        $this->perJob[$jobClass] = [
+            $currentProcessed + $processed,
+            $currentFailed + $failed,
+            $runtimeSum + $durationMs,
+            max($runtimeMax, $durationMs),
+        ];
     }
 
     /**

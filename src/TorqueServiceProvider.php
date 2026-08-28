@@ -8,6 +8,8 @@ use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Events\QueueResumed;
+use Illuminate\Queue\Events\QueuesResumed;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
@@ -29,6 +31,7 @@ use Webpatser\Torque\Dashboard\Livewire\Overview;
 use Webpatser\Torque\Dashboard\Livewire\Queues;
 use Webpatser\Torque\Dashboard\Livewire\Workers;
 use Webpatser\Torque\Dashboard\TorqueDashboardController;
+use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamConnector;
@@ -53,6 +56,7 @@ final class TorqueServiceProvider extends ServiceProvider
             return new MetricsPublisher(
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
                 prefix: $config['redis']['prefix'] ?? 'torque:',
+                settings: $config['metrics'] ?? [],
             );
         });
 
@@ -86,7 +90,14 @@ final class TorqueServiceProvider extends ServiceProvider
                 ttl: $config['dead_letter']['ttl'] ?? 604800,
                 prefix: $config['redis']['prefix'] ?? 'torque:',
                 allowedQueues: array_keys($config['streams'] ?? []),
+                maxEntries: (int) ($config['dead_letter']['max_entries'] ?? 100000),
             );
+        });
+
+        $this->app->singleton(CircuitBreaker::class, function ($app) {
+            // The dispatcher is resolved lazily inside the breaker so a test's
+            // Event::fake() (or any later swap) is honored.
+            return CircuitBreaker::fromConfig($app['config']['torque']);
         });
 
         Torque::registerDevCommands();
@@ -125,6 +136,23 @@ final class TorqueServiceProvider extends ServiceProvider
         Event::listen(JobFailed::class, [$recorder, 'onFailed']);
         Event::listen(JobExceptionOccurred::class, [$recorder, 'onExceptionOccurred']);
 
+        // Resuming a queue through the framework also clears any circuit
+        // breaker on it: an operator saying "run again" must not be overruled
+        // by a cooldown that still has minutes left on it.
+        Event::listen(QueueResumed::class, static function (QueueResumed $event): void {
+            if ((string) $event->connection !== Torque::CONNECTION) {
+                return;
+            }
+
+            app(CircuitBreaker::class)->forceClose((string) $event->queue);
+        });
+
+        Event::listen(QueuesResumed::class, static function (): void {
+            app(CircuitBreaker::class)->forceCloseAll(
+                array_keys((array) config('torque.streams', [])),
+            );
+        });
+
         if ($this->app->runningInConsole()) {
             $this->commands([
                 TorqueStartCommand::class,
@@ -135,6 +163,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorqueSupervisorCommand::class,
                 TorqueMonitorCommand::class,
                 Console\TorqueFlushCommand::class,
+                Console\TorquePruneCommand::class,
                 TorqueWorkerCommand::class,
                 Console\TorqueTailCommand::class,
                 TorqueBenchCommand::class,

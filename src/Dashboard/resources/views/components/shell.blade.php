@@ -53,6 +53,10 @@
                 </a>
             @endforeach
             <div class="nav-label">Inspect</div>
+            <a href="{{ route('torque.jobs') }}" wire:navigate @class(['nav-item', 'active' => $active === 'jobs'])>
+                <span class="ni-icon"><x-torque::icon name="layers" :size="18"/></span>
+                <span class="ni-text">Jobs</span>
+            </a>
             <a href="{{ route('torque.inspector') }}" wire:navigate @class(['nav-item', 'active' => $active === 'inspector'])>
                 <span class="ni-icon"><x-torque::icon name="inspect" :size="18"/></span>
                 <span class="ni-text">Job inspector</span>
@@ -76,24 +80,33 @@
             </div>
             <div class="spacer"></div>
 
-            {{-- Poll interval selector --}}
-            <div style="position: relative;" x-data="{ open: false }">
-                <button type="button" class="btn sm" style="min-width: 92px;" @click="open = ! open">
+            {{-- Poll interval selector.
+
+                 The panel is wire:ignore'd and driven entirely by Alpine. This page
+                 polls, and Livewire's morph only skips attribute patching when
+                 `_x_isShown` differs between the live node and the fresh server node.
+                 A hidden x-show element is `false` while the server node is
+                 `undefined`, so without wire:ignore every poll tick would reset the
+                 style attribute and re-open the panel. For the same reason the look
+                 lives in .popover / .popover-item classes: Alpine must be the only
+                 thing writing to `style`, and the active state reads the reactive
+                 $wire.pollInterval instead of being rendered server-side. --}}
+            <div class="popover-anchor" x-data="{ open: false }">
+                <button type="button" class="btn sm poll-trigger" @click="open = ! open">
                     @if ($pollInterval === 0)
                         <x-torque::icon name="pause" :size="13"/>
                     @else
-                        <span class="livedot" style="width: 7px; height: 7px;"></span>
+                        <span class="livedot sm"></span>
                     @endif
-                    <span class="mono" style="font-size: 12px;">{{ $pollInterval === 0 ? 'paused' : 'every '.$curPoll['l'] }}</span>
+                    <span class="mono poll-label">{{ $pollInterval === 0 ? 'paused' : 'every '.$curPoll['l'] }}</span>
                     <x-torque::icon name="chevD" :size="13"/>
                 </button>
-                <div x-show="open" x-cloak @click.outside="open = false" x-transition.opacity
-                    style="position: absolute; top: 40px; right: 0; z-index: 41; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); box-shadow: var(--shadow-lg); padding: 5px; min-width: 130px;">
-                    <div class="eyebrow" style="padding: 6px 9px 4px;">Refresh</div>
+                <div wire:ignore class="popover" x-show="open" x-cloak @click.outside="open = false" x-transition.opacity>
+                    <div class="eyebrow">Refresh</div>
                     @foreach ($pollOpts as $o)
-                        <button type="button" wire:click="setPollInterval({{ $o['v'] }})" @click="open = false"
-                            class="mono"
-                            style="display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 9px; border: none; border-radius: 6px; cursor: pointer; font-size: 12.5px; text-align: left; {{ $o['v'] === $pollInterval ? 'color: var(--accent); background: var(--accent-soft);' : 'color: var(--text-dim); background: transparent;' }}">
+                        <button type="button" class="popover-item mono"
+                            :class="{ active: $wire.pollInterval === {{ $o['v'] }} }"
+                            @click="$wire.setPollInterval({{ $o['v'] }}); open = false">
                             <x-torque::icon :name="$o['v'] === 0 ? 'pause' : 'refresh'" :size="12"/>
                             {{ $o['l'] }}
                         </button>
@@ -101,10 +114,14 @@
                 </div>
             </div>
 
-            {{-- Theme toggle --}}
+            {{-- Theme toggle. Same morph problem as the popover above: the hidden
+                 icon would be un-hidden on every poll tick, showing both at once.
+                 wire:ignore on a display:contents wrapper leaves both spans alone. --}}
             <button class="icon-btn" type="button" title="Toggle theme" @click="$store.torque.toggleTheme()">
-                <span x-show="$store.torque.theme === 'dark'"><x-torque::icon name="sun" :size="17"/></span>
-                <span x-show="$store.torque.theme !== 'dark'" x-cloak><x-torque::icon name="moon" :size="17"/></span>
+                <span wire:ignore class="icon-swap">
+                    <span x-show="$store.torque.theme === 'dark'"><x-torque::icon name="sun" :size="17"/></span>
+                    <span x-show="$store.torque.theme !== 'dark'" x-cloak><x-torque::icon name="moon" :size="17"/></span>
+                </span>
             </button>
         </header>
         <div class="content">

@@ -39,6 +39,10 @@ it('builds the overview shape with correct types', function () {
     $handler = new DeadLetterHandler(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
 
     try {
+        // OverviewData reads stream depths, and reservedSize() errors with
+        // NOGROUP until the stream and its consumer group exist.
+        torqueTestRedis()->execute('XGROUP', 'CREATE', 'torque-test:default', 'torque-test', '$', 'MKSTREAM');
+
         $publisher->publishWorkerMetrics('web-01-5123-a1b2c3d4', new WorkerSnapshot(
             jobsProcessed: 100,
             jobsFailed: 4,
@@ -54,13 +58,17 @@ it('builds the overview shape with correct types', function () {
 
         $payload = app(OverviewData::class)->get();
 
-        expect($payload)->toHaveKeys(['totals', 'metrics', 'live', 'deadCount'])
-            ->and($payload['totals'])->toHaveKeys(['slots', 'busy', 'pending', 'delayed', 'rpm', 'util'])
-            ->and($payload['metrics'])->toHaveKeys(['throughput', 'concurrent', 'latencyMs', 'memoryMb', 'failRate', 'jobsTotal', 'workers'])
+        expect($payload)->toHaveKeys(['totals', 'metrics', 'history', 'live', 'deadCount'])
+            ->and($payload['totals'])->toHaveKeys(['slots', 'busy', 'pending', 'delayed', 'rpm', 'gaugeMax', 'util'])
+            ->and($payload['metrics'])->toHaveKeys(['throughput', 'throughputPerMinute', 'jobsLastHour', 'concurrent', 'latencyMs', 'memoryMb', 'failRate', 'jobsTotal', 'workers'])
             ->and($payload['totals']['slots'])->toBeInt()
             ->and($payload['totals']['pending'])->toBeInt()
             ->and($payload['totals']['delayed'])->toBeInt()
             ->and($payload['metrics']['throughput'])->toBeNumeric()
+            // Gap-filled minute buckets: one entry per minute of the last hour,
+            // present even when the cluster has been idle.
+            ->and($payload['history'])->toHaveCount(60)
+            ->and($payload['totals']['gaugeMax'])->toBeGreaterThanOrEqual(100)
             ->and($payload['live'])->toBeArray()
             ->and($payload['deadCount'])->toBeInt()
             ->and($payload['deadCount'])->toBeGreaterThanOrEqual(1);
@@ -71,6 +79,7 @@ it('builds the overview shape with correct types', function () {
         $redis->execute('DEL', 'torque-test:worker:web-01-5123-a1b2c3d4');
         $redis->execute('DEL', 'torque-test:metrics');
         $redis->execute('DEL', 'torque-test:dead-letter');
+        $redis->execute('DEL', 'torque-test:default');
     }
 });
 
@@ -115,8 +124,12 @@ it('builds workers with the documented keys and null sub-widgets', function () {
     }
 });
 
-it('builds one queue entry per configured stream with null throughput', function () {
+it('builds one queue entry per configured stream', function () {
     try {
+        // reservedSize() reads the consumer group's pending list, so the stream
+        // and group have to exist before the read model can be exercised.
+        torqueTestRedis()->execute('XGROUP', 'CREATE', 'torque-test:default', 'torque-test', '$', 'MKSTREAM');
+
         $queues = app(QueuesData::class)->get()['queues'];
 
         $names = array_column($queues, 'name');
@@ -126,16 +139,22 @@ it('builds one queue entry per configured stream with null throughput', function
 
         $default = collect($queues)->firstWhere('name', 'default');
 
-        expect($default)->toHaveKeys(['name', 'pending', 'delayed', 'reserved', 'processedToday', 'throughput', 'wait', 'history', 'paused'])
+        expect($default)->toHaveKeys(['name', 'pending', 'delayed', 'reserved', 'processedToday', 'failedToday', 'throughput', 'wait', 'history', 'paused', 'circuit'])
             ->and($default['pending'])->toBeInt()
             ->and($default['delayed'])->toBeInt()
             ->and($default['reserved'])->toBeInt()
-            ->and($default['throughput'])->toBeNull()
+            // Counts and throughput now come from the per-stream rollups; only
+            // queue wait time still has no collector.
+            ->and($default['throughput'])->toBeFloat()
+            ->and($default['processedToday'])->toBeInt()
+            ->and($default['failedToday'])->toBeInt()
             ->and($default['wait'])->toBeNull()
-            ->and($default['processedToday'])->toBeNull()
+            ->and($default['circuit'])->toBeNull()
             ->and($default['paused'])->toBeFalse();
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        rescue(fn () => torqueTestRedis()->execute('DEL', 'torque-test:default'), null, false);
     }
 });
 

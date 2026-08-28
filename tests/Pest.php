@@ -2,10 +2,39 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Contracts\Auth\Authenticatable;
 use Webpatser\Torque\Tests\TestCase;
 
+use function Fledge\Async\Redis\createRedisClient;
+
 pest()->extend(TestCase::class)->in('Feature', 'Integration');
+
+/**
+ * The Redis instance the suite runs against (DB 15 by default).
+ */
+function torqueRedisUri(): string
+{
+    return env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15');
+}
+
+/**
+ * Open a connection to the test Redis, skipping the test when it is down.
+ *
+ * Lives here rather than in a single test file so parallel workers, which
+ * only load their own subset of test files, always have it available.
+ */
+function torqueRedis(): RedisClient
+{
+    try {
+        $redis = createRedisClient(torqueRedisUri());
+        $redis->execute('PING');
+
+        return $redis;
+    } catch (Throwable $e) {
+        test()->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+}
 
 /**
  * A minimal authenticatable user for dashboard route tests.
