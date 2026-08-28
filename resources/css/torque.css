@@ -220,6 +220,13 @@ html.nav-collapsed .app { grid-template-columns: 68px 1fr; }
 /* ---------- MAIN ---------- */
 .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 
+.notice {
+  display: flex; align-items: center; gap: 10px; flex: none;
+  padding: 10px 24px; font-size: 12.5px; line-height: 1.4;
+  border-bottom: 1px solid var(--border);
+}
+.notice.warn { color: var(--warn); background: var(--warn-soft); }
+
 .topbar {
   display: flex; align-items: center; gap: 16px;
   padding: 0 24px; height: 64px; flex: none;

@@ -25,6 +25,7 @@
     ];
     $curPoll = collect($pollOpts)->firstWhere('v', $pollInterval) ?? $pollOpts[1];
     $version = rescue(fn () => \Composer\InstalledVersions::getPrettyVersion('webpatser/torque'), 'dev', false);
+    $cspWarning = rescue(fn () => cache()->get(\Webpatser\Torque\Dashboard\Http\Middleware\DetectCspMismatch::CACHE_KEY), null, false);
 @endphp
 {{-- The collapsed-nav class lives on <html> (see the chrome script in the
      layout), not here: this node sits inside the Livewire root, so a poll tick
@@ -127,6 +128,12 @@
                 </span>
             </button>
         </header>
+        @if (is_string($cspWarning) && $cspWarning !== '')
+            <div class="notice warn" role="alert">
+                <x-torque::icon name="warn" :size="14"/>
+                <span>{{ $cspWarning }}</span>
+            </div>
+        @endif
         <div class="content">
             {{-- wire:key forces the morph to replace this element when the interval
                  changes: Livewire initialises wire:poll once and never re-reads the

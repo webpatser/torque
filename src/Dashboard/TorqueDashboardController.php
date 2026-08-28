@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Dashboard;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Route;
 use Webpatser\Torque\Dashboard\Http\Middleware\Authorize;
+use Webpatser\Torque\Dashboard\Http\Middleware\DetectCspMismatch;
 use Webpatser\Torque\Dashboard\Livewire\Dead;
 use Webpatser\Torque\Dashboard\Livewire\Feed;
 use Webpatser\Torque\Dashboard\Livewire\Inspector;
@@ -61,7 +62,7 @@ final class TorqueDashboardController
         Route::prefix(config('torque.dashboard.path', 'torque'))
             ->middleware(config('torque.dashboard.middleware', ['web', 'auth']))
             ->group(static function (): void {
-                Route::middleware(Authorize::class)->group(static function (): void {
+                Route::middleware([Authorize::class, DetectCspMismatch::class])->group(static function (): void {
                     Route::get('/', Overview::class)->name('torque.overview');
                     Route::get('workers', Workers::class)->name('torque.workers');
                     Route::get('queues', Queues::class)->name('torque.queues');
