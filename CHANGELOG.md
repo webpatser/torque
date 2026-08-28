@@ -5,6 +5,11 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.4] - 2026-08-28
+
+### Added
+- **CSP self-check.** The dashboard inspects its own responses: a `script-src` (or `default-src`) without `'unsafe-eval'` while `livewire.csp_safe` is off means Alpine and `wire:` expressions fail silently, so the shell now shows a warning banner and the log gets one line per hour explaining what to set. Clears itself as soon as the policy or config is fixed.
+
 ## [0.16.3] - 2026-08-28
 
 ### Fixed

@@ -388,7 +388,7 @@ The dashboard works under a strict CSP with a nonce and needs no `'unsafe-eval'`
 \Webpatser\Torque\Torque::cspNonce($nonce);
 ```
 
-The dashboard chrome uses no Alpine expressions on purpose: Alpine compiles every directive expression (`x-data`, `x-show`, `@click`, `:class`, `$store`) with `new Function`, which a `script-src` without `'unsafe-eval'` blocks, and the expressions then fail silently. Everything is delegated `data-torque-*` handlers in that one nonce'd script instead, and chrome actions that reach the component (the refresh interval) go through `Livewire.find(id).call(...)`, plain JS with nothing to interpret. If your policy omits `'unsafe-eval'`, also set `'csp_safe' => true` in `config/livewire.php` so Livewire loads its CSP-safe bundle for the `wire:` directives.
+The dashboard chrome uses no Alpine expressions on purpose: Alpine compiles every directive expression (`x-data`, `x-show`, `@click`, `:class`, `$store`) with `new Function`, which a `script-src` without `'unsafe-eval'` blocks, and the expressions then fail silently. Everything is delegated `data-torque-*` handlers in that one nonce'd script instead, and chrome actions that reach the component (the refresh interval) go through `Livewire.find(id).call(...)`, plain JS with nothing to interpret. If your policy omits `'unsafe-eval'`, also set `'csp_safe' => true` in `config/livewire.php` so Livewire loads its CSP-safe bundle for the `wire:` directives. The dashboard checks this on every response: a policy without `'unsafe-eval'` while `csp_safe` is off shows a warning banner in the chrome and logs one line per hour, so the mismatch never fails silently.
 
 ### Authorization
 
