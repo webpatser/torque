@@ -224,3 +224,26 @@ it('excludes auxiliary keys (paused, :delayed) from queue enumeration', function
     expect($pending)->toHaveCount(1);
     expect($pending->first()->uuid)->toBe('real-1');
 });
+
+// -------------------------------------------------------------------------
+//  Reserved namespaces
+// -------------------------------------------------------------------------
+
+it('ignores Torque bookkeeping keys when enumerating queues', function () {
+    (void) $this->streamQueue->pushRaw(
+        json_encode(['uuid' => 'real-2', 'displayName' => 'JobR', 'attempts' => 0]),
+        'default',
+    );
+
+    // Metrics, per-job streams, worker hashes, the dead-letter stream and
+    // circuit-breaker state all live under the prefix but are not queues.
+    $redis = $this->streamQueue->getRedisClient();
+    foreach (['cb:scrpr:state', 'worker:abc', 'metrics:aggregate', 'job:uuid-1', 'jobs:recent', 'dead-letter'] as $suffix) {
+        $redis->execute('SET', $this->testPrefix.$suffix, '1');
+    }
+
+    $pending = $this->streamQueue->allPendingJobs();
+
+    expect($pending)->toHaveCount(1);
+    expect($pending->first()->uuid)->toBe('real-2');
+});

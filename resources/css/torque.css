@@ -249,7 +249,11 @@ body {
 .card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg);
   box-shadow: var(--shadow);
+  /* Grid/flex items default to min-width:auto, which lets a wide table push the
+     card past its track. Never use overflow:hidden here: it would clip popovers. */
+  min-width: 0;
 }
+.card.sticky { position: sticky; top: 0; }
 .card-pad { padding: 18px 20px; }
 .card-head { display: flex; align-items: center; gap: 12px; padding: 15px 18px; border-bottom: 1px solid var(--border); }
 .card-head h3 { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
@@ -262,6 +266,18 @@ body {
 .section-title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
 
 .grid { display: grid; gap: 16px; }
+
+/* Two-column page layouts. Inline grid-template-columns cannot be overridden by
+   a media query, so every page-level split lives here and collapses below. */
+.grid-2, .grid-2-wide, .grid-2-narrow, .grid-2-inspect, .grid-2-hero, .grid-2-chart {
+  display: grid; gap: 16px;
+}
+.grid-2         { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.grid-2-wide    { grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); align-items: start; }
+.grid-2-narrow  { grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); }
+.grid-2-inspect { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: start; }
+.grid-2-hero    { grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); align-items: stretch; }
+.grid-2-chart   { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
 
 /* badges */
 .badge {
@@ -305,6 +321,31 @@ body {
 .btn.sm { height: 28px; padding: 0 10px; font-size: 12px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* popover (topbar refresh selector)
+   The panel is x-show driven and sits inside a wire:poll'd component, so its
+   look must come from classes: Livewire's morph resets the style attribute and
+   would wipe Alpine's display:none. */
+.popover-anchor { position: relative; }
+.popover {
+  position: absolute; top: 40px; right: 0; z-index: 41;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg); padding: 5px; min-width: 130px;
+}
+.popover .eyebrow { padding: 6px 9px 4px; }
+.popover-item {
+  display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 9px;
+  border: none; border-radius: 6px; cursor: pointer; font-size: 12.5px; text-align: left;
+  color: var(--text-dim); background: transparent; transition: all 0.14s var(--ease);
+}
+.popover-item:hover { color: var(--text); background: var(--surface-2); }
+.popover-item.active { color: var(--accent); background: var(--accent-soft); }
+
+.poll-trigger { min-width: 92px; }
+.poll-trigger .poll-label { font-size: 12px; }
+.livedot.sm { width: 7px; height: 7px; }
+/* Transparent wrapper that carries wire:ignore around the theme icons. */
+.icon-swap { display: contents; }
+
 /* segmented */
 .seg { display: inline-flex; padding: 3px; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); }
 .seg button {
@@ -316,6 +357,7 @@ body {
 .seg button.on { background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 
 /* tables */
+.tbl-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .tbl { width: 100%; border-collapse: collapse; }
 .tbl th {
   text-align: left; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em;
@@ -328,6 +370,23 @@ body {
 .tbl tbody tr.clickable { cursor: pointer; }
 .tbl tbody tr.clickable:hover { background: var(--surface-2); }
 .tbl td.r, .tbl th.r { text-align: right; }
+
+/* Sortable column header. The button carries the click so the whole header
+   stays keyboard reachable, but it has to read as plain header text. */
+.tbl th .th-sort {
+  display: inline-flex; align-items: center; gap: 5px; padding: 0;
+  border: none; background: none; cursor: pointer;
+  font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit;
+  transition: color 0.14s var(--ease);
+}
+.tbl th .th-sort:hover { color: var(--text); }
+
+/* Fully-qualified job names are the widest thing in these tables, so let that
+   column shrink first and ellipsize. max-width:0 zeroes the column's max-content
+   contribution under table-layout:auto, which is the standard truncation trick. */
+.tbl td.job { max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tbl td.job > .jobname,
+.tbl td.job > div { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .jobname { font-family: var(--font-mono); font-size: 12.5px; color: var(--text); }
 .jobname .ns { color: var(--text-faint); }
@@ -435,9 +494,20 @@ body {
 .wbars { display: grid; grid-template-columns: repeat(auto-fill, 5px); gap: 3px; align-items: end; }
 
 /* responsive */
+/* Stack the page-level splits before a table can spill under the side card. */
+@media (max-width: 1180px) {
+  .grid-2-wide, .grid-2-narrow, .grid-2-inspect, .grid-2-hero, .grid-2-chart {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .card.sticky { position: static; }
+}
+
 @media (max-width: 880px) {
   .app { grid-template-columns: 68px 1fr; }
   .app .sidebar .brand-text, .app .nav-item .ni-text, .app .nav-item .ni-badge, .app .env-chip .et { display: none; }
+  /* .grid-2 holds content nested inside a card (stat tiles), so it stays two-up
+     through the 1180px stack and only collapses on genuinely narrow screens. */
+  .grid-2 { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* utility flex */

@@ -7,8 +7,10 @@ namespace Webpatser\Torque\Console;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
+use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -42,7 +44,9 @@ final class TorqueStatusCommand extends Command
         $redis = createRedisClient($redisUri);
 
         $this->renderMasterStatus();
+        $this->renderDataVersion($redis, $prefix);
         $this->renderOverallMetrics($redis, $prefix, $config);
+        $this->renderCircuitBreakers($redis, $config);
         $this->renderWorkerTable($redis, $prefix);
 
         return self::SUCCESS;
@@ -141,6 +145,72 @@ final class TorqueStatusCommand extends Command
         $this->components->twoColumnDetail('Failed (dead letter)', $this->formatMetric($failed));
 
         $this->newLine();
+    }
+
+    /**
+     * Show the recorded data version next to the installed one.
+     *
+     * They differ only between a deploy and the first master start after it,
+     * which is exactly when knowing the upgrade sweep has not run yet is
+     * useful.
+     */
+    private function renderDataVersion(RedisClient $redis, string $prefix): void
+    {
+        $installed = UpgradeRunner::installedVersion();
+
+        try {
+            $stored = $redis->execute('GET', $prefix.UpgradeRunner::VERSION_KEY_SUFFIX);
+        } catch (\Throwable) {
+            $stored = null;
+        }
+
+        $stored = $stored === null ? null : (string) $stored;
+
+        $this->components->twoColumnDetail(
+            'Data version',
+            $stored === null
+                ? "<fg=yellow>not recorded</> <fg=gray>(upgrade runs on the next master start, installed {$installed})</>"
+                : ($stored === $installed
+                    ? "{$stored}"
+                    : "{$stored} <fg=gray>(installed {$installed})</>"),
+        );
+
+        $this->newLine();
+    }
+
+    /**
+     * List every stream whose circuit breaker is not closed.
+     *
+     * Nothing is printed while all breakers are closed, so the normal status
+     * output is unchanged; a tripped stream is the exception worth a line.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    private function renderCircuitBreakers(RedisClient $redis, array $config): void
+    {
+        $breaker = CircuitBreaker::fromConfig($config, client: $redis);
+        $printed = false;
+
+        foreach (array_keys((array) ($config['streams'] ?? [])) as $queue) {
+            $state = $breaker->state((string) $queue);
+
+            if ($state === null) {
+                continue;
+            }
+
+            $detail = $state['state'] === 'open'
+                ? '<fg=red;options=bold>OPEN</>'.($state['resumes_at'] !== null
+                    ? ' <fg=gray>(probes in '.max(0, $state['resumes_at'] - time()).'s)</>'
+                    : '')
+                : '<fg=yellow;options=bold>HALF-OPEN</> <fg=gray>(probing)</>';
+
+            $this->components->twoColumnDetail("Circuit breaker [{$queue}]", $detail);
+            $printed = true;
+        }
+
+        if ($printed) {
+            $this->newLine();
+        }
     }
 
     /**

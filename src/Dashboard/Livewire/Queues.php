@@ -41,6 +41,7 @@ final class Queues extends Component
             'pending' => array_sum(array_column($queues, 'pending')),
             'delayed' => array_sum(array_column($queues, 'delayed')),
             'today' => array_sum(array_map(fn ($q) => (int) ($q['processedToday'] ?? 0), $queues)),
+            'failed' => array_sum(array_map(fn ($q) => (int) ($q['failedToday'] ?? 0), $queues)),
         ];
 
         return view('torque::dashboard.queues', [
@@ -49,6 +50,9 @@ final class Queues extends Component
             'hasToday' => collect($queues)->contains(fn ($q) => $q['processedToday'] !== null),
             'hasThroughput' => collect($queues)->contains(fn ($q) => $q['throughput'] !== null),
             'hasWait' => collect($queues)->contains(fn ($q) => $q['wait'] !== null),
+            // Unlike the others this is a "> 0" test: a permanently visible
+            // column of zeros would be noise on a healthy cluster.
+            'hasFailed' => collect($queues)->contains(fn ($q) => (int) ($q['failedToday'] ?? 0) > 0),
             'deadCount' => $this->chrome()['deadCount'],
             'workerCount' => $this->chrome()['workerCount'],
         ]);

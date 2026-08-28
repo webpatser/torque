@@ -22,6 +22,7 @@ use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\Worker;
 use Revolt\EventLoop;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
+use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Job\CoroutineContext;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsCollector;
@@ -29,6 +30,7 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Pool\RedisPool;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Torque;
 
 use function Fledge\Async\async;
@@ -95,7 +97,8 @@ LUA;
     /** @var array<string, mixed> */
     private readonly array $config;
 
-    private readonly string $consumerId;
+    /** This worker's XREADGROUP consumer name (`{host}-{pid}-{hex}`). */
+    public private(set) string $consumerId;
 
     public function __construct(array $config)
     {
@@ -136,7 +139,7 @@ LUA;
         // We create them lazily inside the Fiber loop instead of sharing one.
 
         $metrics = new MetricsCollector(totalSlots: $concurrency);
-        $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix);
+        $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix, settings: $this->config['metrics'] ?? []);
 
         $cluster = (bool) ($this->config['redis']['cluster'] ?? false);
 
@@ -177,6 +180,19 @@ LUA;
             redisUri: $redisUri,
             ttl: (int) ($deadLetterConfig['ttl'] ?? 604800),
             prefix: $prefix,
+            maxEntries: (int) ($deadLetterConfig['max_entries'] ?? 100000),
+        );
+
+        // Failure-storm breaker. Shared across the fleet through Redis, so a
+        // dead dependency pauses the affected stream once for everyone
+        // instead of every worker discovering it separately.
+        $circuitBreaker = new CircuitBreaker(
+            redisUri: $redisUri,
+            prefix: $prefix,
+            config: (array) ($this->config['circuit_breaker'] ?? []),
+            streams: $streams,
+            cluster: $cluster,
+            events: $events,
         );
 
         // Build cluster-safe stream key (matches StreamQueue::getStreamKey).
@@ -211,6 +227,10 @@ LUA;
         $pauseState->paused = false;
         // Framework-paused queue names (queue:pause / queue:pause --all), kept
         // fresh by the same 2s timer that polls Torque's own pause key.
+        $pauseState->frameworkPausedQueues = [];
+        // The effective per-queue pause set the reader fibers consume: the
+        // framework's paused queues plus any stream whose circuit breaker is
+        // open. One representation, one code path, whatever the source.
         $pauseState->pausedQueues = [];
 
         // Per-slot job-start tracker for the stalled-job watchdog. Indexed by
@@ -242,7 +262,7 @@ LUA;
 
         $masterPidForPause = posix_getppid();
         $pauseFetchFailed = false;
-        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, &$pauseFetchFailed) {
+        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, &$pauseFetchFailed) {
             // Framework pause state (queue:pause / queue:pause --all) lives in
             // the cache store, read synchronously outside the pool callback so
             // pool-connection hold time is unchanged. On a failed read we keep
@@ -251,12 +271,21 @@ LUA;
             $fetched = self::fetchFrameworkPausedQueues($queueManager, $connectionName, $queues);
 
             if ($fetched !== null) {
-                $pauseState->pausedQueues = $fetched;
+                $pauseState->frameworkPausedQueues = $fetched;
                 $pauseFetchFailed = false;
             } elseif (! $pauseFetchFailed) {
                 $pauseFetchFailed = true;
                 fwrite(STDERR, "[torque:worker] Framework pause state unreadable (cache store down?), keeping last known state\n");
             }
+
+            // A tripped circuit breaker is expressed as a paused queue, so it
+            // reaches the reader fibers through the same set the framework's
+            // per-queue pauses use: only that stream stops being polled, and
+            // a worker serving nothing else pauses fully.
+            $pauseState->pausedQueues = self::mergePausedQueues(
+                $pauseState->frameworkPausedQueues,
+                $circuitBreaker->openQueues($queues),
+            );
 
             $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queues) {
                 $value = $redis->execute('GET', $prefix.'paused');
@@ -314,6 +343,7 @@ LUA;
                 $streams,
                 $metrics,
                 $deadLetterHandler,
+                $circuitBreaker,
                 $pauseState,
                 $concurrency,
                 $buildStreamKey,
@@ -428,11 +458,18 @@ LUA;
                     try {
                         $this->processMessage($streamJob, $events, $connectionName);
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
-                        $metrics->recordJobCompleted($durationMs);
+                        $metrics->recordJobCompleted($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
+
+                        // A job that released itself for a later attempt is
+                        // neutral for the breaker, exactly like a retry after
+                        // an exception; only a real completion counts.
+                        if (! $streamJob->isReleased() && ! $streamJob->hasFailed()) {
+                            $circuitBreaker->recordSuccess($queueName);
+                        }
                     } catch (\Throwable $e) {
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
-                        $metrics->recordJobFailed($durationMs);
-                        $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler);
+                        $metrics->recordJobFailed($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
+                        $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler, $circuitBreaker);
                     } finally {
                         $this->streamActive[$queueName] = max(0, ($this->streamActive[$queueName] ?? 1) - 1);
                         unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex]);
@@ -483,7 +520,7 @@ LUA;
         // never rotate.
         $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
         $drainStartedAt = null;
-        EventLoop::repeat(1.0, function () use (&$drainStartedAt, $drainGrace, $metricsPublisher, $metrics) {
+        EventLoop::repeat(1.0, function () use (&$drainStartedAt, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey) {
             if (! $this->hasReachedLimits()) {
                 return;
             }
@@ -504,6 +541,8 @@ LUA;
                 // Best-effort cleanup; do not block the hard exit.
             }
 
+            $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
+
             fwrite(STDERR, "[torque:worker] Drain window expired; forcing exit.\n");
             exit(0);
         });
@@ -522,7 +561,54 @@ LUA;
             // Best-effort cleanup — don't prevent shutdown.
         }
 
+        $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
+
         $this->isRunning = false;
+    }
+
+    /**
+     * Delete this worker's consumer from every stream it served.
+     *
+     * Every worker start mints a fresh `{host}-{pid}-{hex}` consumer name, so
+     * without this each rotation leaves one behind forever (scrpr 2026-08-27:
+     * 124k consumers per stream). A consumer with pending entries is left
+     * alone: XGROUP DELCONSUMER discards its PEL, and those entries must stay
+     * claimable by the next worker's XAUTOCLAIM instead.
+     *
+     * Best-effort throughout, like the metrics cleanup next to it: shutdown
+     * must never hang on Redis. Names left behind by a crashed worker are
+     * swept later by {@see StreamHousekeeper}.
+     *
+     * @param  string[]  $queues
+     * @param  \Closure(string): string  $buildStreamKey
+     */
+    public function releaseConsumer(
+        string $redisUri,
+        array $queues,
+        string $consumerGroup,
+        \Closure $buildStreamKey,
+    ): void {
+        try {
+            $redis = createRedisClient($redisUri);
+        } catch (\Throwable) {
+            return;
+        }
+
+        foreach ($queues as $queue) {
+            $streamKey = $buildStreamKey($queue);
+
+            try {
+                $pending = $redis->execute('XPENDING', $streamKey, $consumerGroup, '-', '+', '1', $this->consumerId);
+
+                if (is_array($pending) && $pending !== []) {
+                    continue;
+                }
+
+                $redis->execute('XGROUP', 'DELCONSUMER', $streamKey, $consumerGroup, $this->consumerId);
+            } catch (\Throwable) {
+                continue;
+            }
+        }
     }
 
     /**
@@ -817,6 +903,21 @@ LUA;
     }
 
     /**
+     * Combine the framework's paused queues with the circuit breaker's open
+     * ones into the single set the reader fibers consume.
+     *
+     * Static and pure for unit testing.
+     *
+     * @param  list<string>  $frameworkPaused
+     * @param  list<string>  $circuitOpen
+     * @return list<string>
+     */
+    public static function mergePausedQueues(array $frameworkPaused, array $circuitOpen): array
+    {
+        return array_values(array_unique([...$frameworkPaused, ...$circuitOpen]));
+    }
+
+    /**
      * Reconcile the pause flag with the latest Redis state and dispatch the
      * matching Laravel event when it transitions.
      *
@@ -918,6 +1019,7 @@ LUA;
         string $connectionName,
         array $streams,
         DeadLetterHandler $deadLetterHandler,
+        ?CircuitBreaker $circuitBreaker = null,
     ): void {
         $queueName = $job->getQueue();
 
@@ -943,6 +1045,11 @@ LUA;
                 messageId: $message['id'],
                 exception: $exception,
             );
+
+            // Only permanent failures feed the breaker; a release/retry is
+            // neutral, since a job that is going to be retried says nothing
+            // yet about the health of the stream's dependencies.
+            $circuitBreaker?->recordFailure($queueName);
 
             // Mark as failed via Laravel's base Job — this ACKs/DELs the
             // stream message and calls the job's failed() callback.

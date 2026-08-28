@@ -31,6 +31,13 @@ class StreamQueue extends Queue implements QueueContract
 
     private readonly string $consumerId;
 
+    /**
+     * Key namespaces under the prefix that are never queues.
+     *
+     * @var list<string>
+     */
+    private const array RESERVED_NAMESPACES = ['paused', 'version', 'worker', 'metrics', 'job', 'jobs', 'dead-letter', 'cb'];
+
     public function __construct(
         private readonly string $redisUri,
         private readonly string $default = 'default',
@@ -465,7 +472,9 @@ class StreamQueue extends Queue implements QueueContract
      * Enumerate the configured queue names by scanning the prefix.
      *
      * Includes queues that exist only as a `:delayed` sorted set (no stream
-     * yet) and filters out the singleton `paused` flag. Auxiliary suffixes
+     * yet) and filters out Torque's own bookkeeping namespaces (the `paused`
+     * flag, worker and aggregate metrics, per-job event streams, the
+     * dead-letter stream and circuit-breaker state). Auxiliary suffixes
      * after the queue name are stripped so a single queue with both a
      * stream and a `:delayed` set is reported once.
      *
@@ -479,7 +488,7 @@ class StreamQueue extends Queue implements QueueContract
         return (new Collection($keys))
             ->map(fn (string $key) => Str::after($key, $this->prefix))
             ->map(fn (string $name) => str_contains($name, ':') ? Str::before($name, ':') : $name)
-            ->reject(fn (string $name) => $name === '' || $name === 'paused')
+            ->reject(fn (string $name) => $name === '' || in_array($name, self::RESERVED_NAMESPACES, true))
             ->map(fn (string $name) => $this->cluster ? trim($name, '{}') : $name)
             ->unique()
             ->values();

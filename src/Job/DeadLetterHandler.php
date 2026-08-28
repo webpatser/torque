@@ -23,12 +23,14 @@ final class DeadLetterHandler
 
     /**
      * @param  array<int, string>  $allowedQueues  Whitelist of queue names permitted as retry targets.
+     * @param  int  $maxEntries  Hard cap on stream length, enforced at write time. 0 = uncapped.
      */
     public function __construct(
         private readonly string $redisUri,
         private readonly int $ttl = 604800, // 7 days
         private readonly string $prefix = 'torque:',
         private readonly array $allowedQueues = [],
+        private readonly int $maxEntries = 100000,
     ) {
         $this->deadLetterStream = $this->prefix.'dead-letter';
         $this->redis = createRedisClient($this->redisUri);
@@ -44,9 +46,19 @@ final class DeadLetterHandler
      */
     public function handle(string $queue, string $payload, string $messageId, \Throwable $exception): void
     {
-        $this->redis->execute(
-            'XADD',
-            $this->deadLetterStream,
+        // Cap the stream at write time. Approximate trimming (MAXLEN ~) keeps
+        // XADD O(1) by only evicting whole macro nodes, so the real length
+        // hovers just above the cap instead of being exact. Without this a
+        // failure storm grows the stream without bound (scrpr 2026-08-27:
+        // 3.9M entries, 22 GB, Redis OOM).
+        $args = [$this->deadLetterStream];
+
+        if ($this->maxEntries > 0) {
+            array_push($args, 'MAXLEN', '~', (string) $this->maxEntries);
+        }
+
+        array_push(
+            $args,
             '*',
             'payload', $payload,
             'original_queue', $queue,
@@ -55,6 +67,8 @@ final class DeadLetterHandler
             'exception_trace', substr($exception->getTraceAsString(), 0, 5000),
             'failed_at', (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c'),
         );
+
+        $this->redis->execute('XADD', ...$args);
     }
 
     /**
@@ -226,10 +240,12 @@ final class DeadLetterHandler
     }
 
     /**
-     * Trim entries older than the configured TTL from the dead-letter stream.
+     * Apply the full dead-letter retention policy: TTL first, then the cap.
      *
      * Computes a minimum message ID based on `now - ttl` (in milliseconds) and
-     * uses XTRIM MINID to evict all older entries.
+     * uses XTRIM MINID to evict all older entries, then enforces
+     * `max_entries` with an approximate XTRIM MAXLEN so a burst that arrived
+     * inside the TTL window still cannot outgrow the cap.
      */
     public function trim(): void
     {
@@ -239,6 +255,19 @@ final class DeadLetterHandler
         // The ID format is {milliseconds}-{sequence}; using just the ms timestamp
         // trims everything older than the cutoff.
         $this->redis->execute('XTRIM', $this->deadLetterStream, 'MINID', (string) $cutoffMs);
+
+        if ($this->maxEntries > 0) {
+            $this->redis->execute('XTRIM', $this->deadLetterStream, 'MAXLEN', '~', (string) $this->maxEntries);
+        }
+    }
+
+    /**
+     * The Redis key of the dead-letter stream.
+     */
+    #[\NoDiscard]
+    public function streamKey(): string
+    {
+        return $this->deadLetterStream;
     }
 
     /**

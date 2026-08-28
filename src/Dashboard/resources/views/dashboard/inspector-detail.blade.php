@@ -56,7 +56,7 @@
         </div>
     </div>
 
-    <div class="grid" style="grid-template-columns: minmax(0,1.25fr) minmax(0,1fr); align-items: start;">
+    <div class="grid-2-inspect">
         {{-- timeline: per-job event stream --}}
         <div class="card">
             <div class="card-head">
@@ -77,7 +77,7 @@
         </div>
 
         {{-- right: payload / exception / tail --}}
-        <div class="card" style="position: sticky; top: 0;">
+        <div class="card sticky">
             <div class="card-head" style="padding: 9px 12px;">
                 <div class="seg">
                     <button type="button" wire:click="setTab('payload')" @class(['on' => $tab === 'payload'])>payload</button>

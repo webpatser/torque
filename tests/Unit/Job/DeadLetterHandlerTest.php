@@ -245,3 +245,65 @@ it('handle truncates exception messages to 1000 chars', function () {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
+
+/*
+ * The 2026-08-27 OOM: XADD had no MAXLEN and trim() was never called, so a
+ * failure storm grew the dead-letter stream to 3.9M entries / 22 GB. Both the
+ * write path and trim() now enforce dead_letter.max_entries.
+ *
+ * Redis trims approximately (MAXLEN ~): it only evicts whole macro nodes, so
+ * the length settles near the cap plus one node rather than exactly at the
+ * cap. These tests assert the property that matters (the stream stops
+ * tracking the number of writes) instead of an exact length.
+ */
+
+it('caps the dead-letter stream at write time', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-dl-cap-'.bin2hex(random_bytes(4)).':';
+
+    $capped = new DeadLetterHandler(redisUri: torqueRedisUri(), prefix: $prefix, maxEntries: 50);
+    $uncapped = new DeadLetterHandler(redisUri: torqueRedisUri(), prefix: $prefix.'un:', maxEntries: 0);
+
+    for ($i = 0; $i < 400; $i++) {
+        $capped->handle('default', '{"uuid":"cap-'.$i.'"}', '0-0', new RuntimeException('boom'));
+        $uncapped->handle('default', '{"uuid":"cap-'.$i.'"}', '0-0', new RuntimeException('boom'));
+    }
+
+    $cappedLength = (int) $redis->execute('XLEN', $prefix.'dead-letter');
+
+    expect($cappedLength)->toBeLessThan(400)
+        ->and($cappedLength)->toBeLessThanOrEqual(200)
+        ->and((int) $redis->execute('XLEN', $prefix.'un:dead-letter'))->toBe(400);
+
+    $redis->execute('DEL', $prefix.'dead-letter', $prefix.'un:dead-letter');
+});
+
+it('trims by ttl and by cap', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-dl-trim-'.bin2hex(random_bytes(4)).':';
+    $key = $prefix.'dead-letter';
+
+    $handler = new DeadLetterHandler(
+        redisUri: torqueRedisUri(),
+        ttl: 60,
+        prefix: $prefix,
+        maxEntries: 50,
+    );
+
+    // One entry well outside the TTL window plus a burst inside it.
+    $old = ((time() - 3600) * 1000).'-0';
+    $redis->execute('XADD', $key, $old, 'payload', 'stale');
+
+    for ($i = 0; $i < 400; $i++) {
+        $redis->execute('XADD', $key, '*', 'payload', 'fresh');
+    }
+
+    $handler->trim();
+
+    $length = (int) $redis->execute('XLEN', $key);
+
+    expect($redis->execute('XRANGE', $key, $old, $old))->toBe([])
+        ->and($length)->toBeLessThan(400);
+
+    $redis->execute('DEL', $key);
+});

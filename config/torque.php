@@ -179,9 +179,47 @@ return [
     | Dead letter
     |--------------------------------------------------------------------------
     | Jobs that exceed max_retries go to the dead letter stream.
+    |
+    | 'ttl'         : entries older than this are trimmed (XTRIM MINID).
+    | 'max_entries' : hard cap enforced at write time (XADD MAXLEN ~), so a
+    |                 failure storm can never fill Redis. 0 disables the cap
+    |                 and leaves only the TTL. Sizing: the 2026-08-27 incident
+    |                 averaged ~6 KB per entry (payload + trace), so the
+    |                 default 100k entries is ~600 MB worst case. Halve it if
+    |                 the Torque Redis has less than 1 GB of headroom.
+    | 'prune_interval': seconds between master-driven housekeeping runs (TTL
+    |                 trim, cap trim, stale consumer sweep). 0 disables it and
+    |                 leaves pruning to a scheduled `torque:prune`.
     */
     'dead_letter' => [
         'ttl' => 604800,
+        'max_entries' => (int) env('TORQUE_DEAD_LETTER_MAX', 100000),
+        'prune_interval' => (int) env('TORQUE_PRUNE_INTERVAL', 300),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Circuit breaker
+    |--------------------------------------------------------------------------
+    | Stops a stream from being polled when its jobs are failing permanently
+    | at a high rate (a dead upstream API, expired credentials). Instead of
+    | burning through the whole backlog into the dead-letter stream, the queue
+    | is paused for `cooldown` seconds and then probed again.
+    |
+    | Outcomes are recorded per stream in a sliding window shared by every
+    | worker; only permanent failures count as failures, retries are neutral.
+    |
+    | Per-stream overrides live under `streams.<queue>.circuit_breaker` and are
+    | merged over these defaults; set that key to `false` to opt a stream out.
+    */
+    'circuit_breaker' => [
+        'enabled' => (bool) env('TORQUE_CIRCUIT_BREAKER', true),
+        'window' => 100,        // outcomes per stream in the sliding window
+        'min_samples' => 20,    // never trip below this many outcomes
+        'threshold' => 0.9,     // permanent-failure ratio that opens the breaker
+        'cooldown' => 300,      // seconds the stream stays paused before half-open
+        'half_open_max' => 5,   // probe jobs allowed while half-open
+        'retention' => 3600,    // TTL on the outcome window keys
     ],
 
     /*
@@ -208,7 +246,32 @@ return [
     'metrics' => [
         'enabled' => true,
         'publish_interval' => 1,
-        'retention' => 3600,
+
+        /*
+         * Retention of the minute-resolution history, in seconds. One field per
+         * minute, so a day is 1440 fields.
+         */
+        'retention' => 86400,
+
+        /*
+         * Coarser tiers, so history can outlive the day without the storage
+         * growing linearly. Every finished job lands in a minute, an hour and a
+         * day bucket; each bucket is one hash field of roughly 20 bytes
+         * ("1700000000" => "1500,3").
+         *
+         * Cluster-wide at the defaults below:
+         *   1440 minute fields (24h) + 2160 hour fields (90d) + 730 day fields
+         *   (2y) = ~4300 fields, about 60 KB with hash overhead.
+         *
+         * The same set exists per stream, so budget another ~60 KB per stream.
+         *
+         * `daily_days` at 0 keeps the daily tier forever (it costs 365 fields,
+         * roughly 7 KB, per year).
+         */
+        'rollups' => [
+            'hourly_days' => 90,
+            'daily_days' => 730,
+        ],
     ],
 
     /*
@@ -222,6 +285,15 @@ return [
         'middleware' => ['web', 'auth'],
         'poll_intervals' => [0, 1000, 2000, 5000, 10000, 30000],
         'default_poll_interval' => 1000,
+
+        /*
+         * Ceiling of the overview throughput gauge, in jobs per minute.
+         * Null scales it to the busiest minute of the last hour (rounded up to
+         * a round number), so a queue that gets one big burst every few minutes
+         * stays readable without pinning the needle. Set an integer to freeze
+         * the scale.
+         */
+        'gauge_max' => null,
     ],
 
     /*

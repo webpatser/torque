@@ -8,7 +8,11 @@ use Closure;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Redis\StreamHousekeeper;
+use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\ProcessInspector;
+use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -60,8 +64,36 @@ final class MasterProcess
     /** Whether this master has written (and thus owns) the PID file. */
     private bool $ownsPidFile = false;
 
+    /**
+     * Unix timestamp of the next Redis housekeeping run, or null when
+     * housekeeping has not run yet (which makes the first monitor tick after
+     * start run it immediately, so a restart after an incident cleans up
+     * without waiting out a full interval).
+     */
+    private ?int $housekeepingDueAt = null;
+
     /** Rolling throughput state for the aggregate metrics publisher. */
     private ?int $lastAggregateJobsTotal = null;
+
+    /** Failure counter at the previous publish, for the failed-jobs delta. */
+    private ?int $lastAggregateJobsFailed = null;
+
+    /**
+     * Per-stream cumulative counters at the previous publish.
+     *
+     * @var array<string, array{0: int, 1: int}>|null
+     */
+    private ?array $lastAggregatePerQueue = null;
+
+    /**
+     * Per-job-class cumulative counters at the previous publish.
+     *
+     * @var array<string, array{0: int, 1: int, 2: float, 3: float}>|null
+     */
+    private ?array $lastAggregatePerJob = null;
+
+    /** Stream depth probe for the pending gauge, opened once and reused. */
+    private ?StreamQueue $depthProbe = null;
 
     private ?float $lastAggregateAt = null;
 
@@ -135,6 +167,7 @@ final class MasterProcess
         });
 
         $this->warnIfPaused();
+        $this->runDataUpgrade();
 
         $numWorkers = (int) ($this->config['workers'] ?? 4);
 
@@ -168,6 +201,7 @@ final class MasterProcess
             $this->metricsPublisher = new MetricsPublisher(
                 redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
                 prefix: $this->config['redis']['prefix'] ?? 'torque:',
+                settings: $this->config['metrics'] ?? [],
             );
         }
 
@@ -189,6 +223,7 @@ final class MasterProcess
             $this->metricsPublisher ??= new MetricsPublisher(
                 redisUri: $redisUri,
                 prefix: $this->config['redis']['prefix'] ?? 'torque:',
+                settings: $this->config['metrics'] ?? [],
             );
 
             ($this->logger)('Autoscaling enabled ('
@@ -327,6 +362,7 @@ final class MasterProcess
 
                 $this->maintainLease();
                 $this->publishAggregateMetrics();
+                $this->handleHousekeepingTick();
 
                 if ($this->autoScaler !== null) {
                     $this->evaluateAutoscale();
@@ -484,6 +520,60 @@ final class MasterProcess
     }
 
     /**
+     * Run Redis housekeeping on the first monitor tick and every
+     * `dead_letter.prune_interval` seconds after that.
+     *
+     * Trims the dead-letter stream (TTL plus hard cap) and sweeps consumer
+     * names left behind by exited workers, so neither can grow without bound
+     * on installations that never scheduled `torque:prune`. Set the interval
+     * to 0 to disable and keep pruning purely scheduler-driven.
+     *
+     * Entirely best-effort: a Redis outage logs one line and re-arms the
+     * timer. The master must keep supervising workers regardless, the same
+     * way {@see warnIfPaused()} tolerates Redis being down at boot.
+     *
+     * Public so the cadence can be exercised without entering the monitor loop.
+     */
+    public function handleHousekeepingTick(): void
+    {
+        $interval = (int) ($this->config['dead_letter']['prune_interval'] ?? 300);
+
+        if ($interval <= 0) {
+            return;
+        }
+
+        $now = time();
+
+        if ($this->housekeepingDueAt !== null && $now < $this->housekeepingDueAt) {
+            return;
+        }
+
+        $this->housekeepingDueAt = $now + $interval;
+
+        try {
+            $housekeeper = StreamHousekeeper::fromConfig($this->config);
+
+            $deadLetter = $housekeeper->pruneDeadLetter();
+
+            if ($deadLetter['before'] !== $deadLetter['after']) {
+                ($this->logger)("Housekeeping: dead-letter trimmed from {$deadLetter['before']} to {$deadLetter['after']} entries.");
+            }
+
+            // A live worker touches its consumer on every poll, so anything
+            // idle for longer than a full worker lifetime belongs to a
+            // process that is gone.
+            $idleSeconds = max(3600, (int) ($this->config['max_worker_lifetime'] ?? 3600));
+            $removed = array_sum($housekeeper->pruneConsumers($idleSeconds));
+
+            if ($removed > 0) {
+                ($this->logger)("Housekeeping: removed {$removed} stale stream consumers.");
+            }
+        } catch (\Throwable $e) {
+            ($this->logger)("Housekeeping failed ({$e->getMessage()}); retrying in {$interval}s.");
+        }
+    }
+
+    /**
      * Surface a pre-existing pause at boot: a master starting into a paused
      * queue (deliberate `torque:pause`, or a not-yet-expired drain flag)
      * spawns workers that pick up nothing, which otherwise looks like a
@@ -503,6 +593,30 @@ final class MasterProcess
             }
         } catch (\Throwable) {
             // Boot must not depend on Redis being up; workers retry on their own.
+        }
+    }
+
+    /**
+     * Run the one-off data upgrade for the installed Torque version.
+     *
+     * Deploying over an older release leaves keys behind that the new code no
+     * longer writes or expires, so the first master start after an upgrade
+     * cleans them up and records the version in `{prefix}version`. Subsequent
+     * starts on the same version do nothing.
+     *
+     * Best-effort like {@see warnIfPaused()}: startup must never depend on
+     * Redis being reachable, and a failed attempt simply runs again next time.
+     *
+     * The runner is injectable so the once-per-version contract can be
+     * exercised against a pinned version instead of whatever this checkout
+     * happens to report.
+     */
+    private function runDataUpgrade(?UpgradeRunner $runner = null): void
+    {
+        try {
+            ($runner ?? UpgradeRunner::fromConfig($this->config, $this->logger))->run();
+        } catch (\Throwable $e) {
+            ($this->logger)("Data upgrade skipped ({$e->getMessage()}); it runs again on the next start.");
         }
     }
 
@@ -673,6 +787,7 @@ final class MasterProcess
         $publisher = new MetricsPublisher(
             redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
             prefix: $this->config['redis']['prefix'] ?? 'torque:',
+            settings: $this->config['metrics'] ?? [],
         );
 
         while (microtime(true) < $deadline && ! $this->shouldStop) {
@@ -760,22 +875,138 @@ final class MasterProcess
             $workers = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
             $aggregate = $this->metricsPublisher->aggregateFromWorkers($workers);
 
-            $jobsTotal = (int) $aggregate['jobs_processed'] + (int) $aggregate['jobs_failed'];
+            $jobsFailed = (int) $aggregate['jobs_failed'];
+            $jobsTotal = (int) $aggregate['jobs_processed'] + $jobsFailed;
+            $perQueue = is_array($aggregate['per_queue'] ?? null) ? $aggregate['per_queue'] : [];
+            $perJob = is_array($aggregate['per_job'] ?? null) ? $aggregate['per_job'] : [];
 
             if ($this->lastAggregateJobsTotal !== null && $this->lastAggregateAt !== null && $now > $this->lastAggregateAt) {
                 $delta = $jobsTotal - $this->lastAggregateJobsTotal;
                 $aggregate['throughput'] = $delta > 0
                     ? round($delta / ($now - $this->lastAggregateAt), 2)
                     : 0.0;
+
+                // Persist the same deltas into the metric rollups. The dashboard
+                // reads those for a damped rate, exact daily counts and a
+                // history that outlives any single page load. A worker that
+                // restarted resets its counters, so every delta is clamped the
+                // same way the throughput above is.
+                $failedDelta = max(0, $jobsFailed - (int) $this->lastAggregateJobsFailed);
+
+                $this->metricsPublisher->recordOutcomes(
+                    max(0, $delta - $failedDelta),
+                    $failedDelta,
+                    $this->perQueueDeltas($perQueue),
+                );
+
+                $this->metricsPublisher->recordJobOutcomes($this->perJobDeltas($perJob));
             }
 
+            // Gauges are point-in-time, so unlike the counters they are sampled
+            // on every tick including the first.
+            $this->metricsPublisher->recordGauges($this->gaugeSamples($aggregate));
+
             $this->lastAggregateJobsTotal = $jobsTotal;
+            $this->lastAggregateJobsFailed = $jobsFailed;
+            $this->lastAggregatePerQueue = $perQueue;
+            $this->lastAggregatePerJob = $perJob;
             $this->lastAggregateAt = $now;
 
             $this->metricsPublisher->publishAggregate($aggregate);
         } catch (\Throwable) {
             // Metrics must never take the master down.
         }
+    }
+
+    /**
+     * Per-stream deltas since the previous publish, clamped at zero.
+     *
+     * @param  array<string, array{0: int, 1: int}>  $perQueue  Cumulative counters.
+     * @return array<string, array{0: int, 1: int}>
+     */
+    private function perQueueDeltas(array $perQueue): array
+    {
+        $deltas = [];
+
+        foreach ($perQueue as $queue => [$processed, $failed]) {
+            [$lastProcessed, $lastFailed] = $this->lastAggregatePerQueue[$queue] ?? [0, 0];
+
+            $processedDelta = max(0, (int) $processed - (int) $lastProcessed);
+            $failedDelta = max(0, (int) $failed - (int) $lastFailed);
+
+            if ($processedDelta > 0 || $failedDelta > 0) {
+                $deltas[(string) $queue] = [$processedDelta, $failedDelta];
+            }
+        }
+
+        return $deltas;
+    }
+
+    /**
+     * Per-job-class deltas since the previous publish.
+     *
+     * Counters and the runtime sum are cumulative and clamp at zero the way the
+     * stream deltas do. The runtime high-water mark is not cumulative: it is
+     * whatever the largest run reported this tick was, so it passes through.
+     *
+     * @param  array<string, array{0: int, 1: int, 2: float, 3: float}>  $perJob  Cumulative counters.
+     * @return array<string, array{0: int, 1: int, 2: float, 3: float}>
+     */
+    private function perJobDeltas(array $perJob): array
+    {
+        $deltas = [];
+
+        foreach ($perJob as $class => [$processed, $failed, $runtimeSum, $runtimeMax]) {
+            [$lastProcessed, $lastFailed, $lastRuntimeSum] = $this->lastAggregatePerJob[$class] ?? [0, 0, 0.0, 0.0];
+
+            $processedDelta = max(0, (int) $processed - (int) $lastProcessed);
+            $failedDelta = max(0, (int) $failed - (int) $lastFailed);
+
+            if ($processedDelta > 0 || $failedDelta > 0) {
+                $deltas[(string) $class] = [
+                    $processedDelta,
+                    $failedDelta,
+                    max(0.0, (float) $runtimeSum - (float) $lastRuntimeSum),
+                    (float) $runtimeMax,
+                ];
+            }
+        }
+
+        return $deltas;
+    }
+
+    /**
+     * Gauge samples for this tick: the fleet numbers plus the queue depth.
+     *
+     * Depth is the one figure the aggregate cannot supply, so it is probed here
+     * with an XPENDING and a ZCARD per stream. A stream whose consumer group
+     * does not exist yet must not cost us the rest of the samples, hence the
+     * per-stream rescue.
+     *
+     * @param  array<string, mixed>  $aggregate
+     * @return array<string, float>
+     */
+    private function gaugeSamples(array $aggregate): array
+    {
+        $pending = 0;
+        $delayed = 0;
+        $probe = $this->depthProbe ??= rescue(fn (): ?StreamQueue => StreamQueueResolver::make(), null, false);
+
+        if ($probe !== null) {
+            foreach (array_keys((array) ($this->config['streams'] ?? [])) as $stream) {
+                $pending += (int) rescue(fn (): int => $probe->pendingSize((string) $stream), 0, false);
+                $delayed += (int) rescue(fn (): int => $probe->delayedSize((string) $stream), 0, false);
+            }
+        }
+
+        return [
+            MetricsPublisher::GAUGE_LATENCY => (float) ($aggregate['avg_latency'] ?? 0),
+            MetricsPublisher::GAUGE_CONCURRENT => (float) ($aggregate['concurrent'] ?? 0),
+            MetricsPublisher::GAUGE_MEMORY => (float) ($aggregate['memory_mb'] ?? 0),
+            MetricsPublisher::GAUGE_WORKER_MEMORY_PEAK => (float) ($aggregate['memory_peak_mb'] ?? 0),
+            MetricsPublisher::GAUGE_PENDING => (float) $pending,
+            MetricsPublisher::GAUGE_DELAYED => (float) $delayed,
+        ];
     }
 
     /**

@@ -1,7 +1,13 @@
 @php
     use Webpatser\Torque\Dashboard\Support\Format;
 
-    $last = fn (array $a) => $a[array_key_last($a)] ?? 0;
+    $rangeLabels = [
+        '1h' => 'jobs / minute · last 60 min',
+        '24h' => 'jobs / hour · last 24 hours',
+        '7d' => 'jobs / hour · last 7 days',
+        '90d' => 'jobs / day · last 90 days',
+    ];
+
     $util = (float) ($totals['util'] ?? 0);
     $workerCount = $metrics['workers'] ?? count($workers);
 @endphp
@@ -9,10 +15,18 @@
     :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
 
     {{-- hero --}}
-    <div class="grid" style="grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); align-items: stretch;">
+    <div class="grid-2-hero">
         <div class="card" style="display: grid; grid-template-columns: auto 1fr; gap: 4px;">
             <div class="card-pad" style="display: grid; place-items: center; border-right: 1px solid var(--border);">
-                <x-torque::viz.tachometer :value="round($totals['rpm'])" :max="2000" :size="208"/>
+                <div class="col" style="align-items: center; gap: 8px;">
+                    {{-- Damped 5-minute rate on a scale that follows the busiest
+                         minute of the hour, so a bursty queue neither pins the
+                         needle nor sits flat at zero between bursts. --}}
+                    <x-torque::viz.tachometer :value="$totals['rpm']" :max="$totals['gaugeMax']" :size="208"/>
+                    <span class="mono faint" style="font-size: 11px; text-align: center;">
+                        {{ Format::int($metrics['jobsLastHour']) }} jobs in the last hour
+                    </span>
+                </div>
             </div>
             <div class="card-pad col" style="justify-content: center; gap: 18px;">
                 <div>
@@ -26,12 +40,12 @@
                 <div class="row gap20 wrap">
                     <div class="col" style="gap: 2px;">
                         <span class="mono faint" style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; white-space: nowrap;">concurrent</span>
-                        <span class="mono" style="font-size: 21px; font-weight: 700; line-height: 1;">{{ Format::int($last($concurrent)) }}</span>
+                        <span class="mono" style="font-size: 21px; font-weight: 700; line-height: 1;">{{ Format::int($metrics['concurrent']) }}</span>
                         <span class="mono faint" style="font-size: 10px;">fibers</span>
                     </div>
                     <div class="col" style="gap: 2px;">
                         <span class="mono faint" style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; white-space: nowrap;">latency</span>
-                        <span class="mono" style="font-size: 21px; font-weight: 700; line-height: 1;">{{ Format::num($last($latency), 2) }}s</span>
+                        <span class="mono" style="font-size: 21px; font-weight: 700; line-height: 1;">{{ Format::num($metrics['latencyMs'] / 1000, 2) }}s</span>
                         <span class="mono faint" style="font-size: 10px;">p50</span>
                     </div>
                     <div class="col" style="gap: 2px;">
@@ -43,37 +57,40 @@
             </div>
         </div>
 
-        <div class="grid" style="grid-template-columns: 1fr 1fr; gap: 16px;">
+        <div class="grid-2">
             <x-torque::stat label="Pending" :value="Format::int($totals['pending'])">
-                <div class="spark"><x-torque::viz.sparkline :data="$pending" :w="116" :h="38"/></div>
+                <div class="spark"><x-torque::viz.sparkline :data="$series['pending']" :w="116" :h="38"/></div>
             </x-torque::stat>
             <x-torque::stat label="Delayed" :value="Format::int($totals['delayed'])">
-                <div class="spark"><x-torque::viz.sparkline :data="$latency" :w="116" :h="38" color="var(--info)"/></div>
+                <div class="spark"><x-torque::viz.sparkline :data="$series['delayed']" :w="116" :h="38" color="var(--info)"/></div>
             </x-torque::stat>
-            <x-torque::stat label="Throughput" :value="Format::int($last($throughput))" unit="/s">
-                <div class="spark"><x-torque::viz.sparkline :data="$throughput" :w="116" :h="38"/></div>
+            <x-torque::stat label="Throughput" :value="Format::int($metrics['throughputPerMinute'])" unit="/min">
+                <div class="spark"><x-torque::viz.mini-bars :data="array_slice($minuteHistory, -20)" :w="116" :h="38"/></div>
             </x-torque::stat>
-            <x-torque::stat label="Memory" :value="Format::int($last($memory))" unit="MB">
-                <div class="spark"><x-torque::viz.sparkline :data="$memory" :w="116" :h="38" color="var(--info)"/></div>
+            <x-torque::stat label="Memory" :value="Format::int($metrics['memoryMb'])" unit="MB">
+                <div class="spark"><x-torque::viz.sparkline :data="$series['memory']" :w="116" :h="38" color="var(--info)"/></div>
             </x-torque::stat>
         </div>
     </div>
 
     {{-- charts --}}
-    <div class="grid mt16" style="grid-template-columns: minmax(0,2fr) minmax(0,1fr);">
+    <div class="grid-2-chart mt16">
         <div class="card">
             <div class="card-head">
                 <h3>Throughput</h3>
-                <span class="sub">jobs / second · last 200s</span>
+                <span class="sub">{{ $rangeLabels[$range] ?? $rangeLabels['1h'] }}</span>
                 <div class="grow"></div>
-                <div class="row gap16">
-                    <span class="row gap6"><span style="width: 9px; height: 9px; border-radius: 3px; background: var(--accent);"></span><span class="mono faint" style="font-size: 11px;">completed</span></span>
-                    <span class="row gap6"><span style="width: 9px; height: 9px; border-radius: 3px; background: var(--bad);"></span><span class="mono faint" style="font-size: 11px;">failed</span></span>
+                {{-- Server-rendered range switch: a Livewire property rather than
+                     Alpine state, so the poll cycle cannot reset it. --}}
+                <div class="seg">
+                    @foreach (array_keys($rangeLabels) as $key)
+                        <button type="button" wire:click="setRange('{{ $key }}')" @class(['on' => $range === $key])>{{ $key }}</button>
+                    @endforeach
                 </div>
             </div>
             <div class="card-pad" style="padding-top: 14px;">
                 <div style="height: 132px;">
-                    <x-torque::viz.sparkline :data="$throughput" :w="760" :h="132" full color="var(--accent)" :stroke-w="2" :dot="false"/>
+                    <x-torque::viz.mini-bars :data="$history" :w="760" :h="132" color="var(--accent)"/>
                 </div>
             </div>
         </div>
@@ -84,10 +101,10 @@
             </div>
             <div class="card-pad">
                 <div class="row between" style="align-items: flex-end;">
-                    <div class="mono" style="font-size: 34px; font-weight: 700; color: {{ $last($failRate) > 1.5 ? 'var(--warn)' : 'var(--ok)' }};">
-                        {{ Format::num($last($failRate), 2) }}<span style="font-size: 16px; color: var(--text-faint);">%</span>
+                    <div class="mono" style="font-size: 34px; font-weight: 700; color: {{ $metrics['failRate'] > 1.5 ? 'var(--warn)' : 'var(--ok)' }};">
+                        {{ Format::num($metrics['failRate'], 2) }}<span style="font-size: 16px; color: var(--text-faint);">%</span>
                     </div>
-                    <x-torque::viz.sparkline :data="$failRate" :w="150" :h="56" color="var(--warn)"/>
+                    <x-torque::viz.sparkline :data="$series['failRate']" :w="150" :h="56" color="var(--warn)"/>
                 </div>
                 <hr class="hr mt16">
                 <div class="row between mt12">
@@ -101,7 +118,7 @@
     </div>
 
     {{-- workers + recent --}}
-    <div class="grid mt16" style="grid-template-columns: minmax(0,1fr) minmax(0,1.3fr);">
+    <div class="grid-2-narrow mt16">
         <div class="card">
             <div class="card-head">
                 <h3>Workers</h3>
@@ -136,26 +153,28 @@
                 <div class="grow"></div>
                 <a href="{{ route('torque.feed') }}" wire:navigate class="btn sm">Open feed <x-torque::icon name="chevR" :size="13"/></a>
             </div>
-            <table class="tbl">
-                <tbody>
-                    @forelse ($live as $j)
-                        <tr class="clickable" @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
-                            <td style="width: 30px;"><x-torque::badge :status="$j['status']" tiny/></td>
-                            <td><x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/></td>
-                            <td class="muted mono" style="font-size: 11.5px;">{{ $j['queue'] }}</td>
-                            <td class="r" style="width: 120px;">
-                                @if ($j['status'] === 'running')
-                                    <div class="bar" style="width: 80px; margin-left: auto;"><i style="width: {{ round(($j['progress'] ?? 0) * 100) }}%;"></i></div>
-                                @else
-                                    <span class="mono faint" style="font-size: 11px;">{{ Format::ago($j['ts']) }}</span>
-                                @endif
-                            </td>
-                        </tr>
-                    @empty
-                        <tr><td><div class="empty"><span class="mono">no recent activity</span></div></td></tr>
-                    @endforelse
-                </tbody>
-            </table>
+            <div class="tbl-wrap">
+                <table class="tbl">
+                    <tbody>
+                        @forelse ($live as $j)
+                            <tr class="clickable" @click="Livewire.navigate('{{ route('torque.inspector.job', ['uuid' => $j['id']]) }}')">
+                                <td style="width: 30px;"><x-torque::badge :status="$j['status']" tiny/></td>
+                                <td class="job"><x-torque::jobname :ns="$j['ns']" :cls="$j['cls']"/></td>
+                                <td class="muted mono" style="font-size: 11.5px;">{{ $j['queue'] }}</td>
+                                <td class="r" style="width: 120px;">
+                                    @if ($j['status'] === 'running')
+                                        <div class="bar" style="width: 80px; margin-left: auto;"><i style="width: {{ round(($j['progress'] ?? 0) * 100) }}%;"></i></div>
+                                    @else
+                                        <span class="mono faint" style="font-size: 11px;">{{ Format::ago($j['ts']) }}</span>
+                                    @endif
+                                </td>
+                            </tr>
+                        @empty
+                            <tr><td><div class="empty"><span class="mono">no recent activity</span></div></td></tr>
+                        @endforelse
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 </x-torque::shell>

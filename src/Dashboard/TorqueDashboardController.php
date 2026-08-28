@@ -10,6 +10,7 @@ use Webpatser\Torque\Dashboard\Http\Middleware\Authorize;
 use Webpatser\Torque\Dashboard\Livewire\Dead;
 use Webpatser\Torque\Dashboard\Livewire\Feed;
 use Webpatser\Torque\Dashboard\Livewire\Inspector;
+use Webpatser\Torque\Dashboard\Livewire\Jobs;
 use Webpatser\Torque\Dashboard\Livewire\Overview;
 use Webpatser\Torque\Dashboard\Livewire\Queues;
 use Webpatser\Torque\Dashboard\Livewire\Workers;
@@ -66,6 +67,7 @@ final class TorqueDashboardController
                     Route::get('queues', Queues::class)->name('torque.queues');
                     Route::get('feed', Feed::class)->name('torque.feed');
                     Route::get('inspector', Inspector::class)->name('torque.inspector');
+                    Route::get('jobs', Jobs::class)->name('torque.jobs');
                     Route::get('jobs/{uuid}', Inspector::class)->name('torque.inspector.job');
                     Route::get('dead', Dead::class)->name('torque.dead');
                 });

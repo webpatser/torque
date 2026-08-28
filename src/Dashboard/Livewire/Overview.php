@@ -21,42 +21,41 @@ final class Overview extends Component
 {
     use WithDashboardChrome;
 
-    /** @var list<float|int> */
-    public array $throughput = [];
+    /**
+     * Throughput chart range: 1h, 24h, 7d or 90d.
+     *
+     * Server-rendered rather than Alpine state, so the polled re-render cannot
+     * lose it and the seg buttons morph cleanly.
+     */
+    public string $range = '1h';
 
-    /** @var list<float|int> */
-    public array $latency = [];
-
-    /** @var list<float|int> */
-    public array $concurrent = [];
-
-    /** @var list<float|int> */
-    public array $memory = [];
-
-    /** @var list<float|int> */
-    public array $failRate = [];
-
-    /** @var list<float|int> */
-    public array $pending = [];
+    /**
+     * Switch the throughput chart range from the card-head seg buttons.
+     */
+    public function setRange(string $range): void
+    {
+        if (OverviewData::isValidRange($range)) {
+            $this->range = $range;
+        }
+    }
 
     public function render()
     {
-        $data = rescue(fn (): array => app(OverviewData::class)->get(), $this->emptyOverview(), false);
+        $data = rescue(fn (): array => app(OverviewData::class)->get($this->range), $this->emptyOverview(), false);
 
         $totals = $data['totals'];
         $metrics = $data['metrics'];
 
-        // Accumulate rolling histories for the sparklines.
-        $this->throughput = $this->pushHistory($this->throughput, (float) $metrics['throughput']);
-        $this->latency = $this->pushHistory($this->latency, (float) $metrics['latencyMs'] / 1000);
-        $this->concurrent = $this->pushHistory($this->concurrent, (int) $metrics['concurrent']);
-        $this->memory = $this->pushHistory($this->memory, (float) $metrics['memoryMb']);
-        $this->failRate = $this->pushHistory($this->failRate, (float) $metrics['failRate']);
-        $this->pending = $this->pushHistory($this->pending, (int) $totals['pending']);
-
+        // Every sparkline on this screen is served from the persisted rollups,
+        // so nothing here accumulates in component state: a reload shows the
+        // same hour of history the previous tab was showing.
         return view('torque::dashboard.overview', [
             'totals' => $totals,
             'metrics' => $metrics,
+            'history' => $data['history'],
+            'series' => $data['series'],
+            'minuteHistory' => $data['minuteHistory'],
+            'range' => $this->range,
             'live' => array_slice($data['live'], 0, 6),
             'deadCount' => $data['deadCount'],
             'workers' => rescue(fn (): array => app(WorkersData::class)->get()['workers'], [], false),
@@ -69,8 +68,11 @@ final class Overview extends Component
     private function emptyOverview(): array
     {
         return [
-            'totals' => ['slots' => 0, 'busy' => 0, 'pending' => 0, 'delayed' => 0, 'rpm' => 0, 'util' => 0],
-            'metrics' => ['throughput' => 0, 'concurrent' => 0, 'latencyMs' => 0, 'memoryMb' => 0, 'failRate' => 0, 'jobsTotal' => 0, 'workers' => 0],
+            'totals' => ['slots' => 0, 'busy' => 0, 'pending' => 0, 'delayed' => 0, 'rpm' => 0, 'gaugeMax' => 100, 'util' => 0],
+            'metrics' => ['throughput' => 0, 'throughputPerMinute' => 0, 'jobsLastHour' => 0, 'concurrent' => 0, 'latencyMs' => 0, 'memoryMb' => 0, 'failRate' => 0, 'jobsTotal' => 0, 'workers' => 0],
+            'history' => [],
+            'minuteHistory' => [],
+            'series' => ['latency' => [], 'concurrent' => [], 'memory' => [], 'memoryPeak' => [], 'pending' => [], 'delayed' => [], 'failRate' => []],
             'live' => [],
             'deadCount' => 0,
         ];
