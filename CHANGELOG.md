@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.5] - 2026-08-30
+
 ### Fixed
 - **Rotating workers no longer sleep out the drain window with nothing to drain.** After `max_jobs_per_worker` / `max_worker_lifetime` (or a stop signal) the reader Fibers stop polling, but the hard-exit timer still waited the full `drain_grace_seconds` before exiting, even with every slot idle. With a grace sized for long jobs (7200 s on scrpr) that parked each rotated worker, and the draining master behind a deploy, for two hours. The timer now exits as soon as no slot is processing a job; the window only applies while a job is actually in flight.
 
