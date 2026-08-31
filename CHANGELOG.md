@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.6] - 2026-08-31
+
+### Fixed
+- **A draining master no longer sleeps out the drain window with an idle fleet.** `MasterProcess::handleDrainTick()` had the same defect 0.16.5 fixed in the worker: after SIGUSR2 it paused pickup and then waited the full `drain_grace_seconds` regardless of whether anything was still running, so on an installation sizing the grace for long jobs (7200 s on scrpr) every `torque:reload` parked the queue for two hours. It now escalates as soon as the fleet's own heartbeats report no active slot, and falls back to the timer when those heartbeats cannot be read (no metrics publisher, Redis unreachable) so a blip can never cut a drain short. `drain_grace_seconds` is a ceiling on both sides now, not a wait.
+- **A corrupt job payload leaked one active slot per occurrence.** The discard branch acknowledged the message and continued without ever balancing its `recordJobStarted()`, so `activeSlots` climbed for the life of the process. That inflated the dashboard's concurrency and, with the new master-side check reading the same gauge, would have kept a drain waiting forever on any worker that had seen one.
+
+### Added
+- **`max_worker_lifetime_jitter`** (`TORQUE_MAX_LIFETIME_JITTER`, default `0.1`). The master forks its whole fleet inside one second, so an unjittered lifetime expires on every worker in the same second and the fleet rotates in lockstep: on scrpr all 16 workers started at 18:23:17 and all 16 hit their 24 h lifetime at 18:23:17 the next day, taking the queue down together. Each worker now subtracts a random slice of up to this ratio from its own lifetime. It only ever subtracts, so an effective lifetime never exceeds the configured one, which the master's stale-consumer threshold depends on. Set to `0.0` for the old behaviour.
+
+### Changed
+- The limit check the reader Fibers run is now `hasReachedLimits()` itself rather than a duplicated inline copy of it, so the stop condition exists in exactly one place.
+- `drain_grace_seconds` is documented as a ceiling, and its guidance is now "size it for the longest job you are willing to wait for", not for how long a rotation or deploy should take.
+
 ## [0.16.5] - 2026-08-30
 
 ### Fixed

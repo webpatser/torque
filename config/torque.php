@@ -54,16 +54,36 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Max worker lifetime jitter (ratio of the lifetime)
+    |--------------------------------------------------------------------------
+    | The master forks its whole fleet within the same second, so without
+    | jitter every worker reaches max_worker_lifetime in the same second too
+    | and the fleet rotates in lockstep. Each worker subtracts a random slice
+    | of up to this ratio from its own lifetime, spreading the rotations.
+    |
+    | Only ever subtracts, so an effective lifetime never exceeds the
+    | configured one; the master's stale-consumer threshold depends on that.
+    | Set to 0.0 to disable and have every worker use the exact lifetime.
+    */
+    'max_worker_lifetime_jitter' => (float) env('TORQUE_MAX_LIFETIME_JITTER', 0.1),
+
+    /*
+    |--------------------------------------------------------------------------
     | Drain grace (seconds)
     |--------------------------------------------------------------------------
     | Once limits are reached (max jobs, max lifetime, or stop signal), Fibers
-    | get this many seconds to finish in-flight jobs before the worker forces
-    | exit(0). Guarantees the master sees SIGCHLD and respawns even if a Fiber
-    | is stuck inside processMessage() or a half-open Redis socket.
+    | get up to this many seconds to finish in-flight jobs before the worker
+    | forces exit(0). Guarantees the master sees SIGCHLD and respawns even if
+    | a Fiber is stuck inside processMessage() or a half-open Redis socket.
+    |
+    | It is a ceiling, not a wait: a worker whose slots are all idle exits
+    | immediately, and so does a draining master whose fleet is idle. Size it
+    | for the longest job you are willing to wait for, not for how long you
+    | want a rotation or a deploy to take.
     |
     | Also reused by `torque:reload`: when the master receives SIGUSR2, it
-    | pauses pickup, waits this many seconds for in-flight jobs to clear,
-    | and then signals workers to stop.
+    | pauses pickup, waits up to this many seconds for in-flight jobs to
+    | clear, and then signals workers to stop.
     */
     'drain_grace_seconds' => (int) env('TORQUE_DRAIN_GRACE', 10),
 

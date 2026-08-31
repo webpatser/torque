@@ -507,10 +507,16 @@ LUA;
      *
      * On the first tick after a SIGUSR2, write the Redis `paused` key so
      * workers stop picking up new jobs (they observe the key on their own
-     * 2s poll) and start the grace timer. Once `drain_grace_seconds` has
-     * elapsed, escalate to the same SIGTERM path `torque:stop` uses; the
-     * workers' own `drain_grace_seconds` then caps how long they wait for
-     * their current job before hard-exiting.
+     * 2s poll) and start the grace timer. Escalation to the same SIGTERM path
+     * `torque:stop` uses happens as soon as the fleet reports nothing in
+     * flight, or when `drain_grace_seconds` runs out, whichever comes first;
+     * the workers' own grace then caps how long they wait for their current
+     * job before hard-exiting.
+     *
+     * The grace is a ceiling, not a wait. Sleeping it out unconditionally kept
+     * pickup paused across an idle fleet for the whole window, which on an
+     * installation sizing the grace for long jobs (7200 s on scrpr) meant a
+     * `torque:reload` parked the queue for two hours.
      */
     public function handleDrainTick(): void
     {
@@ -522,14 +528,69 @@ LUA;
 
         if ($this->draining && ! $this->shouldStop) {
             $grace = (int) ($this->config['drain_grace_seconds'] ?? 10);
+            $idle = $this->fleetIsIdle();
 
-            if ((microtime(true) - $this->drainStartedAt) >= $grace) {
-                ($this->logger)('Drain grace elapsed, signaling workers to stop.');
+            if ($idle || (microtime(true) - $this->drainStartedAt) >= $grace) {
+                ($this->logger)($idle
+                    ? 'Fleet reports no jobs in flight, signaling workers to stop.'
+                    : 'Drain grace elapsed, signaling workers to stop.');
                 $this->shouldStop = true;
                 $this->signalChildren(SIGTERM);
                 $this->draining = false;
             }
         }
+    }
+
+    /**
+     * Ask Redis whether any of our own workers still has a slot busy.
+     *
+     * Best-effort by design: without a metrics publisher, or with Redis
+     * unreachable, this reports "not idle" so the drain falls back to the
+     * grace timer. Cutting a drain short on a Redis blip would kill in-flight
+     * jobs; waiting one window too long only costs time.
+     */
+    private function fleetIsIdle(): bool
+    {
+        if ($this->metricsPublisher === null) {
+            return false;
+        }
+
+        try {
+            $workers = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return self::fleetDrainComplete($workers);
+    }
+
+    /**
+     * True when every worker in the snapshot reports zero active slots.
+     *
+     * An empty snapshot is deliberately *not* drain-complete: it means the
+     * heartbeats could not be read (Redis down, metrics disabled, keys expired
+     * mid-drain), not that the fleet is idle. A fleet that genuinely has no
+     * children left is handled by the monitor loop's reaper instead.
+     *
+     * `active_slots` is the publish-interval peak rather than the instant
+     * value, so it lags towards "still busy" for up to one tick. That is the
+     * safe direction to be wrong in.
+     *
+     * @param  array<string, array<string, string>>  $workers  Worker id => Redis heartbeat hash.
+     */
+    public static function fleetDrainComplete(array $workers): bool
+    {
+        if ($workers === []) {
+            return false;
+        }
+
+        foreach ($workers as $data) {
+            if ((int) ($data['active_slots'] ?? 0) > 0) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

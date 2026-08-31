@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Metrics\WorkerSnapshot;
 use Webpatser\Torque\Process\MasterProcess;
 
 /*
@@ -119,4 +121,142 @@ it('sets the paused key with an expiry so a drained-away master cannot leave the
         ->and($value)->toBe('drain:'.getmypid());
 
     $redis->execute('DEL', 'torque-drain-test:paused');
+});
+
+/*
+ * The grace is a ceiling, not a wait. Before this, a draining master kept
+ * pickup paused for the whole drain_grace_seconds even with an idle fleet, so
+ * on an installation sizing the grace for long jobs (7200s on scrpr) every
+ * `torque:reload` parked the queue for two hours.
+ */
+
+it('reports the fleet drain complete when every worker is idle', function () {
+    expect(MasterProcess::fleetDrainComplete([
+        'host-1-aa' => ['active_slots' => '0', 'total_slots' => '4'],
+        'host-2-bb' => ['active_slots' => '0', 'total_slots' => '4'],
+    ]))->toBeTrue();
+});
+
+it('keeps draining while any worker still has a slot busy', function () {
+    expect(MasterProcess::fleetDrainComplete([
+        'host-1-aa' => ['active_slots' => '0', 'total_slots' => '4'],
+        'host-2-bb' => ['active_slots' => '2', 'total_slots' => '4'],
+    ]))->toBeFalse();
+});
+
+it('treats an unreadable fleet snapshot as still busy', function () {
+    // Empty means the heartbeats could not be read, not that work is done.
+    // Erring towards "busy" costs one grace window; erring the other way
+    // SIGTERMs jobs that were still running.
+    expect(MasterProcess::fleetDrainComplete([]))->toBeFalse();
+});
+
+it('counts a heartbeat without a slot count as idle', function () {
+    // publishWorkerMetrics() has always written active_slots, so a row missing
+    // it is a partial hash mid-write rather than a busy worker.
+    expect(MasterProcess::fleetDrainComplete(['host-1-aa' => []]))->toBeTrue();
+});
+
+it('falls back to the grace timer when there is no metrics publisher', function () {
+    $master = makeMasterUnderTest(['drain_grace_seconds' => 300]);
+    setMasterPrivate($master, 'draining', true);
+    setMasterPrivate($master, 'drainStartedAt', microtime(true));
+
+    $master->handleDrainTick();
+
+    expect(getMasterPrivate($master, 'shouldStop'))->toBeFalse()
+        ->and(getMasterPrivate($master, 'draining'))->toBeTrue();
+});
+
+it('sees an idle fleet through the metrics publisher', function () {
+    $prefix = 'torque-drain-idle-test:';
+    $workerId = 'testhost-4242-abcdef01';
+
+    $publisher = new MetricsPublisher(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: $prefix,
+    );
+
+    try {
+        $publisher->publishWorkerMetrics($workerId, new WorkerSnapshot(
+            jobsProcessed: 100,
+            jobsFailed: 0,
+            activeSlots: 0,
+            totalSlots: 4,
+            averageLatencyMs: 12.0,
+            slotUsageRatio: 0.0,
+            memoryBytes: 1024,
+            timestamp: time(),
+        ));
+    } catch (Throwable $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+
+    $master = makeMasterUnderTest([
+        'redis' => ['uri' => 'redis://127.0.0.1:6379/15', 'prefix' => $prefix],
+        'drain_grace_seconds' => 7200,
+    ]);
+    setMasterPrivate($master, 'metricsPublisher', $publisher);
+    setMasterPrivate($master, 'workerPids', [4242 => true]);
+
+    $idle = (new ReflectionMethod($master, 'fleetIsIdle'))->invoke($master);
+
+    // Same fleet, one busy slot: the drain must keep waiting.
+    $publisher->publishWorkerMetrics($workerId, new WorkerSnapshot(
+        jobsProcessed: 100,
+        jobsFailed: 0,
+        activeSlots: 3,
+        totalSlots: 4,
+        averageLatencyMs: 12.0,
+        slotUsageRatio: 0.75,
+        memoryBytes: 1024,
+        timestamp: time(),
+    ));
+
+    $busy = (new ReflectionMethod($master, 'fleetIsIdle'))->invoke($master);
+
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis->execute('DEL', $prefix.'worker:'.$workerId);
+
+    expect($idle)->toBeTrue()
+        ->and($busy)->toBeFalse();
+});
+
+it('ignores heartbeats from workers that are not its own children', function () {
+    $prefix = 'torque-drain-foreign-test:';
+    $workerId = 'testhost-5151-beefcafe';
+
+    $publisher = new MetricsPublisher(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: $prefix,
+    );
+
+    try {
+        $publisher->publishWorkerMetrics($workerId, new WorkerSnapshot(
+            jobsProcessed: 1,
+            jobsFailed: 0,
+            activeSlots: 0,
+            totalSlots: 4,
+            averageLatencyMs: 1.0,
+            slotUsageRatio: 0.0,
+            memoryBytes: 1024,
+            timestamp: time(),
+        ));
+    } catch (Throwable $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+
+    $master = makeMasterUnderTest([
+        'redis' => ['uri' => 'redis://127.0.0.1:6379/15', 'prefix' => $prefix],
+    ]);
+    setMasterPrivate($master, 'metricsPublisher', $publisher);
+    // A foreign fleet's idle worker must not read as our drain being done.
+    setMasterPrivate($master, 'workerPids', [9999 => true]);
+
+    $result = (new ReflectionMethod($master, 'fleetIsIdle'))->invoke($master);
+
+    $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
+    $redis->execute('DEL', $prefix.'worker:'.$workerId);
+
+    expect($result)->toBeFalse();
 });

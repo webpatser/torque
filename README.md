@@ -284,7 +284,8 @@ All options are in `config/torque.php`. Key settings:
 | `coroutines_per_worker` | 50 | Concurrent job slots per worker |
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
-| `drain_grace_seconds` | 10 | Seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM |
+| `max_worker_lifetime_jitter` | 0.1 | Random slice each worker subtracts from its own lifetime, as a ratio. The master forks the fleet inside one second, so without this every worker rotates in the same second. Only ever subtracts; `0.0` disables |
+| `drain_grace_seconds` | 10 | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation, and on how long a draining master waits before stopping its fleet. An idle worker or fleet exits immediately, so size this for the longest job you are willing to wait for. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM |
 | `takeover_ready_timeout` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
 | `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
 | `metrics.retention` | 86400 | Seconds of per-minute history kept (about 20 bytes per minute) |

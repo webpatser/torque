@@ -28,6 +28,7 @@ use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsCollector;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Pool\RedisPool;
+use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
@@ -135,7 +136,13 @@ LUA;
         $concurrency = (int) ($this->config['coroutines_per_worker'] ?? 50);
         $pollInterval = ((int) ($this->config['block_for'] ?? 2000)) / 1000.0;
         $maxJobs = (int) ($this->config['max_jobs_per_worker'] ?? 10_000);
-        $maxLifetime = (int) ($this->config['max_worker_lifetime'] ?? 3600);
+        // Jitter here and nowhere else: $this->maxLifetime and the per-Fiber
+        // capture below both read this local, so one call keeps every limit
+        // check in this process on the same deadline.
+        $maxLifetime = self::jitteredLifetime(
+            (int) ($this->config['max_worker_lifetime'] ?? 3600),
+            (float) ($this->config['max_worker_lifetime_jitter'] ?? 0.1),
+        );
         $poolSize = (int) ($this->config['pools']['redis']['size'] ?? 30);
         /** @var string[] $queues */
         $queues = (array) ($this->config['queues'] ?? ['default']);
@@ -345,9 +352,6 @@ LUA;
                 $prefix,
                 $consumerGroup,
                 $pollInterval,
-                $maxJobs,
-                $maxLifetime,
-                $startTime,
                 $streamQueue,
                 $events,
                 $connectionName,
@@ -368,7 +372,7 @@ LUA;
                 $loopCount = 0;
 
                 while (true) {
-                    if ($this->stopRequested || $this->jobsProcessed >= $maxJobs || (time() - $startTime) >= $maxLifetime) {
+                    if ($this->hasReachedLimits()) {
                         return;
                     }
 
@@ -447,7 +451,14 @@ LUA;
 
                     if (! StreamQueue::isValidPayload($message['payload'])) {
                         // Corrupt payload, unrecognized format: acknowledge and discard.
+                        // recordJobFailed() balances the recordJobStarted() above;
+                        // without it every corrupt payload leaks one activeSlot for
+                        // the life of the process, so the gauge never returns to 0.
                         $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
+                        $metrics->recordJobFailed(
+                            (hrtime(true) - $jobStartTime) / 1_000_000,
+                            $queueName,
+                        );
                         unset($slotStarts[$fiberIndex]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
@@ -499,8 +510,10 @@ LUA;
         });
 
         // Metrics publishing timer — pushes worker snapshot to Redis for the dashboard.
-        // Keeps publishing during the drain window so the dashboard does not blink
-        // to "0 workers" before the hard-exit deadline fires.
+        // Keeps publishing while draining so the dashboard does not blink to
+        // "0 workers" before the exit. An idle worker now exits within a tick, so
+        // this normally publishes once more; it still matters for a worker held
+        // open by an in-flight job for the full grace.
         $metricsInterval = (float) ($this->config['metrics']['publish_interval'] ?? 1);
         EventLoop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
             $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
@@ -814,9 +827,6 @@ LUA;
     }
 
     /**
-     * Check if the worker should stop due to any reason: signal, max jobs, or max lifetime.
-     */
-    /**
      * True when no slot is processing a job, i.e. a draining worker may exit now.
      *
      * @param  array<int, int>  $slotStarts  Fiber index => start timestamp of its current job.
@@ -826,6 +836,37 @@ LUA;
         return $slotStarts === [];
     }
 
+    /**
+     * Shorten a worker's lifetime by a random slice of up to $ratio.
+     *
+     * The master forks its whole fleet inside one second, so an unjittered
+     * lifetime expires on every worker in the same second and the entire fleet
+     * drains at once (scrpr 2026-08-31: 16 workers, one second apart at boot,
+     * one second apart 24 h later). Subtracting a random slice turns that into
+     * a rolling rotation.
+     *
+     * Only subtracts, never adds: {@see MasterProcess}
+     * prunes stream consumers idle for longer than a full worker lifetime, and
+     * that threshold assumes no worker outlives the configured value.
+     */
+    public static function jitteredLifetime(int $base, float $ratio): int
+    {
+        if ($base <= 1 || $ratio <= 0.0) {
+            return $base;
+        }
+
+        $spread = (int) round($base * min($ratio, 1.0));
+
+        if ($spread <= 0) {
+            return $base;
+        }
+
+        return max(1, $base - random_int(0, min($spread, $base - 1)));
+    }
+
+    /**
+     * Check if the worker should stop due to any reason: signal, max jobs, or max lifetime.
+     */
     private function hasReachedLimits(): bool
     {
         return $this->stopRequested
