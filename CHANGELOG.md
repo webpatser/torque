@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-01
+
+### Changed
+- **A publish tick touches the host index once instead of twice.** `recordHostOutcomes()` and `recordHostGauges()` both index the hosts they saw, and the master calls them back to back with the same fleet, so the second `ZADD` on `metrics:hosts` repeated what the first had just written. The touch is now skipped for an identical host set inside the same second. The guard keys on the set, never on the clock alone, so a host that only the gauges carry still reaches the index, and the documented cost of the per-host rollups (seven round trips a tick) is now what the code actually does.
+
+### Fixed
+- **The 0.17.0 note about the glued Blade directives described a bug that was never released.** `ago@endif` and `dead@if` were introduced and fixed inside 0.17.0's own work, so no tag ever carried them. What did ship, from 0.12.0 to 0.16.7, was `@endif@if` on the workers screen, and that one was latent rather than fatal: Livewire's morph pass appends its `<!--[if ENDBLOCK]-->` machinery straight after an `@endif`, which un-glues the directive behind it before Blade's own pass gets there. Hence a green suite and a working screen for five releases. The entry now says that.
+- **The glued-directive test walks the whole view tree.** Its directory list had already lost `views/dashboard.blade.php`, the root layout, which is exactly the file a hand-kept list loses first. It now recurses from the views root and asserts the layout is among the files it checked.
+- **The `metrics` config comment claimed three round trips a tick for the per-host rollups**, against the seven the 0.17.0 notes claimed and the eight the code did. All three now agree on seven, with the split spelled out (three tiers of counters, three of gauges, one index touch).
+- **The per-host gauge constants documented a key per host** (`metrics:gauge:{tier}:host:{host}`), contradicting the one-hash-per-tier design two lines below them. The key is `metrics:gauge:{tier}:host` with the host inside the field, which is what makes the write cost independent of fleet size.
+
+
 ## [0.17.0] - 2026-09-01
 
 ### Added
@@ -16,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **The overview throughput chart no longer spills out from under its card.** `mini-bars` rendered a literal `width="760"`, and the card's grid track is fluid while `.card` carries `min-width: 0` and must never clip (that would cut off the popovers), so on any viewport narrower than 760px the bars ran on under the neighbouring card. The component gains the `full` prop `sparkline` has had all along: `width="100%"` over the same `viewBox`, so the bars scale to whatever track they are given.
-- Two Blade directives were glued to the word before them (`ago@endif`, `dead@if`). Blade only compiles a directive at a non-word boundary, so those `@endif`s rendered as literal text while their `@if` stayed open, and the page died with a PHP parse error a long way from the cause. Both are fixed and a test now asserts the whole view tree against it.
+- Two Blade directives glued to the word before them (`ago@endif`, `dead@if`) in markup written for this release. Blade only compiles a directive at a non-word boundary, so those `@endif`s stayed literal text while their `@if` stayed open, and the screen died with a PHP parse error a long way from the cause. Caught before tagging, so no release carried them, and a test now asserts the views against the whole class of mistake.
 
 ### Changed
 - **The workers screen is a card per host, not per worker process**, with the live processes listed inside it. `WorkersData::get()` takes a range and returns `hosts`; the ranged columns come from the per-host rollups and the live columns (busy slots, memory now, pid) still come from the heartbeat hashes. A host that ran inside the range but has no live worker shows as `gone` with its last-seen time instead of disappearing. `Workers::$history` and `Queues::$history`, the last two client-accumulated arrays on the dashboard, are gone.
@@ -440,7 +452,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/webpatser/torque/compare/v0.17.0...v0.17.1
 [0.13.0]: https://github.com/webpatser/torque/compare/v0.12.0...v0.13.0
 [0.6.0]: https://github.com/webpatser/torque/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/webpatser/torque/compare/v0.5.1...v0.5.2
