@@ -975,6 +975,53 @@ it('lists only the hosts seen inside the requested range', function () {
     }
 });
 
+/**
+ * A publish tick records outcomes and then gauges for the same fleet, so the
+ * index touch would run twice for one tick's worth of information. The guard
+ * keys on the host set, not on the clock, so a host the first call did not
+ * carry still reaches the index.
+ */
+it('touches the host index once for a tick that records both outcomes and gauges', function () {
+    $prefix = 'torque-host-touch-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $redis = (new ReflectionClass($publisher))
+            ->getMethod('getRedis')
+            ->invoke($publisher);
+
+        $publisher->recordHostOutcomes(['web-01' => [1, 0]], $now);
+
+        expect(array_keys($publisher->hostsSeen(0)))->toBe(['web-01']);
+
+        // Drop the index, so a second ZADD would be visible as the key coming
+        // back. Same fleet, same second: the recorder must not issue one.
+        $redis->execute('DEL', $prefix.'metrics:hosts');
+
+        $publisher->recordHostGauges([
+            'web-01' => [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 2],
+        ], $now);
+
+        expect($publisher->hostsSeen(0))->toBe([]);
+
+        // A host the outcomes call never carried is a different set, so the
+        // touch runs and both hosts land in the index.
+        $publisher->recordHostGauges([
+            'web-01' => [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 2],
+            'web-02' => [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 5],
+        ], $now);
+
+        expect(array_keys($publisher->hostsSeen(0)))->toBe(['web-01', 'web-02']);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
 it('makes a hostname safe to use inside a colon-delimited field', function () {
     // A colon would silently invent a field segment, and glob characters would
     // break the SCAN patterns housekeeping matches on.

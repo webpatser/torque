@@ -202,15 +202,35 @@ it('remembers the chosen interval in the session and rejects unlisted values', f
 });
 
 /**
- * Blade only compiles a directive at a non-word boundary, so `ago@endif`
- * renders as literal text while its `@if` stays open. The page then dies with a
- * PHP parse error a long way from the line that caused it, and only for the
- * branch that renders that markup. Cheaper to assert than to debug twice.
+ * Blade only compiles a directive at a non-word boundary, so a directive glued
+ * to the word before it is left as literal text.
+ *
+ * Glued to prose (`ago@endif`) that is immediate: the `@if` stays open and the
+ * page dies with a PHP parse error a long way from the line that caused it.
+ * Glued to another directive (`@endif@if`) it is worse, because it looks fine.
+ * Livewire's morph pass appends its `<!--[if ENDBLOCK]-->` machinery straight
+ * after the `@endif`, which un-glues the `@if` before Blade's own pass reaches
+ * it, so the view renders and the bug sits there for releases. One lived in the
+ * workers screen from 0.12.0 to 0.16.7 that way.
+ *
+ * The pattern below catches both shapes, over every view rather than a hand-kept
+ * list of directories. Cheaper to assert than to debug twice.
  */
 it('never glues a Blade directive to the word before it', function () {
-    $views = glob(__DIR__.'/../../../src/Dashboard/resources/views/{dashboard,components,components/viz}/*.blade.php', GLOB_BRACE);
+    $root = __DIR__.'/../../../src/Dashboard/resources/views';
 
-    expect($views)->not->toBeEmpty();
+    $views = [];
+
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root)) as $file) {
+        if ($file->isFile() && str_ends_with($file->getFilename(), '.blade.php')) {
+            $views[] = $file->getPathname();
+        }
+    }
+
+    // A walk that quietly stops matching would pass every assertion below, and
+    // the directory list this replaced had already lost the root-level layout.
+    expect(count($views))->toBeGreaterThanOrEqual(20);
+    expect($views)->toContain($root.'/dashboard.blade.php');
 
     foreach ($views as $view) {
         expect(file_get_contents($view))

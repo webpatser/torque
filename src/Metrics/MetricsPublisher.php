@@ -214,7 +214,11 @@ LUA;
     public const string GAUGE_DELAYED = 'delayed';
 
     /**
-     * Per-host gauges, written to `{prefix}metrics:gauge:{tier}:host:{host}`.
+     * Per-host gauges. Every host shares one hash per tier,
+     * `{prefix}metrics:gauge:{tier}:host`, under field
+     * `{bucket}:{host}:{metric}` holding "sum,count,max"; the host is part of
+     * the field, not of the key, so a publish tick costs one round trip per
+     * tier however large the fleet is.
      *
      * Slots and memory sum across the host's workers; the peak is the largest
      * single worker on the box. `workers` is the fleet size there, which is
@@ -249,6 +253,16 @@ LUA;
      * @var array<string, int>
      */
     private array $lastPrunedBucket = [];
+
+    /**
+     * The last host-index touch, as `[epoch, sorted hosts]`.
+     *
+     * A publish tick records outcomes and gauges for the same fleet, so without
+     * this the second of the two repeats the ZADD the first just made.
+     *
+     * @var array{0: int, 1: list<string>}|null
+     */
+    private ?array $lastHostIndexTouch = null;
 
     /** Whether the one-time legacy key migration has been attempted. */
     private bool $legacyMigrated = false;
@@ -816,6 +830,11 @@ LUA;
      * `GT` so two masters on the same box during a reload takeover cannot walk
      * a score backwards.
      *
+     * Both recorders call this, and a tick calls both with the same fleet, so an
+     * identical host set inside the same second is skipped. The comparison is on
+     * the set itself, never on the clock alone: a host the first call did not
+     * carry still reaches the index in the second.
+     *
      * @param  list<string>  $hosts
      */
     private function touchHostIndex(array $hosts, int $now): void
@@ -823,6 +842,14 @@ LUA;
         if ($hosts === []) {
             return;
         }
+
+        sort($hosts);
+
+        if ($this->lastHostIndexTouch === [$now, $hosts]) {
+            return;
+        }
+
+        $this->lastHostIndexTouch = [$now, $hosts];
 
         $args = [];
 

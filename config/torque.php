@@ -291,8 +291,9 @@ return [
          *
          * Per host it is the same 4300 counter fields plus five gauge series,
          * so roughly 3 MB per machine. Hosts share one hash per tier (field
-         * `{bucket}:{host}`), which keeps the write cost at three round trips a
-         * tick whatever the fleet size, but the storage still scales with the
+         * `{bucket}:{host}`), which keeps the write cost at seven round trips a
+         * tick whatever the fleet size (three tiers of counters, three of
+         * gauges, one index touch), but the storage still scales with the
          * number of distinct hostnames seen inside the retention window. On
          * Kubernetes the hostname is the pod name and changes on every rollout,
          * so that window can hold a lot more hosts than there are machines.
