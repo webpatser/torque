@@ -12,47 +12,37 @@ use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 /**
  * Queues screen: per-stream depth over the configured Redis Streams.
  *
- * Per-stream pending-depth histories accumulate on the component across polls
- * to drive the depth mini-bars.
+ * Everything the screen draws now comes from the per-stream rollups over the
+ * global range, so nothing accumulates in component state and a reload shows
+ * the same history the previous tab was showing.
  */
 #[Layout('torque::dashboard.layout')]
 final class Queues extends Component
 {
     use WithDashboardChrome;
 
-    /** @var array<string, list<int|float>> */
-    public array $history = [];
-
     public function render()
     {
-        $queues = rescue(fn (): array => app(QueuesData::class)->get()['queues'], [], false);
-
-        $names = [];
-        foreach ($queues as &$q) {
-            $name = $q['name'];
-            $names[$name] = true;
-            $this->history[$name] = $this->pushHistory($this->history[$name] ?? [], (int) $q['pending']);
-            $q['history'] = $this->history[$name];
-        }
-        unset($q);
-        $this->history = array_intersect_key($this->history, $names);
+        $window = $this->range();
+        $queues = rescue(fn (): array => app(QueuesData::class)->get($window->key)['queues'], [], false);
 
         $totals = [
             'pending' => array_sum(array_column($queues, 'pending')),
             'delayed' => array_sum(array_column($queues, 'delayed')),
-            'today' => array_sum(array_map(fn ($q) => (int) ($q['processedToday'] ?? 0), $queues)),
-            'failed' => array_sum(array_map(fn ($q) => (int) ($q['failedToday'] ?? 0), $queues)),
+            'processed' => array_sum(array_map(fn ($q) => (int) ($q['processed'] ?? 0), $queues)),
+            'failed' => array_sum(array_map(fn ($q) => (int) ($q['failed'] ?? 0), $queues)),
         ];
 
         return view('torque::dashboard.queues', [
             'queues' => $queues,
             'totals' => $totals,
-            'hasToday' => collect($queues)->contains(fn ($q) => $q['processedToday'] !== null),
+            'window' => $window,
+            'hasProcessed' => collect($queues)->contains(fn ($q) => $q['processed'] !== null),
             'hasThroughput' => collect($queues)->contains(fn ($q) => $q['throughput'] !== null),
             'hasWait' => collect($queues)->contains(fn ($q) => $q['wait'] !== null),
             // Unlike the others this is a "> 0" test: a permanently visible
             // column of zeros would be noise on a healthy cluster.
-            'hasFailed' => collect($queues)->contains(fn ($q) => (int) ($q['failedToday'] ?? 0) > 0),
+            'hasFailed' => collect($queues)->contains(fn ($q) => (int) ($q['failed'] ?? 0) > 0),
             'deadCount' => $this->chrome()['deadCount'],
             'workerCount' => $this->chrome()['workerCount'],
         ]);

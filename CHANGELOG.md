@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **One time range for the whole dashboard, in the topbar.** The 1h / 24h / 7d / 90d switch used to sit inside two card heads, each driving only its own card and neither remembered anywhere. It is now a picker next to the refresh interval, remembered for the session, and every screen reads it: the throughput chart and its sparklines, the jobs table, the queues counters, the workers cards, the live feed and the dead-letter list. Like the refresh selector it is a `wire:ignore`'d panel driven by the nonce'd chrome script through `Livewire.find().call()`, because a `wire:click` carrying an argument is the one thing Livewire's CSP-safe build cannot be relied on to interpret. The `set-poll` hook is generalised into one `data-torque-action="call"` that both pickers use.
+- **Per-host metric rollups, so the workers screen has a history.** The master now records processed/failed and slot, memory and fleet-size gauges per host into the same minute / hour / day tiers the cluster and per-stream rollups use. History hangs off the host, not the worker id: a worker mints a fresh `{host}-{pid}-{hex}` name on every start, so with a 24 hour lifetime a 16-worker fleet would produce some 5800 of them a year. Every host shares one hash per tier (field `{bucket}:{host}`), which keeps a publish tick at seven extra round trips whatever the fleet size, and a `metrics:hosts` sorted set scored by last-seen answers "which hosts were alive in this range" in one call. `MetricsPublisher::recordHostOutcomes()`, `recordHostGauges()`, `hostsSeen()`, `hostSeriesMulti()` and `hostGaugeSeriesMulti()` expose it.
+- The queues screen's per-stream sparkline is real for the first time. `QueuesData` returned `'history' => []` and the Livewire component filled it in one poll at a time; it now reads the per-stream rollup that has always been written but never read, so it survives a reload.
+
+### Fixed
+- **The overview throughput chart no longer spills out from under its card.** `mini-bars` rendered a literal `width="760"`, and the card's grid track is fluid while `.card` carries `min-width: 0` and must never clip (that would cut off the popovers), so on any viewport narrower than 760px the bars ran on under the neighbouring card. The component gains the `full` prop `sparkline` has had all along: `width="100%"` over the same `viewBox`, so the bars scale to whatever track they are given.
+- Two Blade directives were glued to the word before them (`ago@endif`, `dead@if`). Blade only compiles a directive at a non-word boundary, so those `@endif`s rendered as literal text while their `@if` stayed open, and the page died with a PHP parse error a long way from the cause. Both are fixed and a test now asserts the whole view tree against it.
+
+### Changed
+- **The workers screen is a card per host, not per worker process**, with the live processes listed inside it. `WorkersData::get()` takes a range and returns `hosts`; the ranged columns come from the per-host rollups and the live columns (busy slots, memory now, pid) still come from the heartbeat hashes. A host that ran inside the range but has no live worker shows as `gone` with its last-seen time instead of disappearing. `Workers::$history` and `Queues::$history`, the last two client-accumulated arrays on the dashboard, are gone.
+- The queues screen's `processedToday` / `failedToday` are now `processed` / `failed` over the selected range, and `throughput` is jobs per minute across that range rather than a fixed five-minute window, so the column reads the same at 1h as at 90d (matching the jobs screen).
+- The live feed and the dead-letter list apply the range in Redis (`ZREVRANGEBYSCORE` on the job index, which is scored by timestamp; a millisecond-epoch low id on the dead-letter stream) rather than filtering after the fact. Both are bounded by their own retention, which the card headers now say.
+- The range table lived twice, in `OverviewData` and `JobMetricsData`, with the labels inlined in two Blade files on top. It is now one `Dashboard\Support\Range` that owns the tier, bucket count, window length and copy; both read models delegate to it.
+- `StreamHousekeeper::deepClean()` reports a `host_index` count and sweeps hosts the rollups have not seen inside the day tier's retention, catching up an index a master never got round to.
+- The `metrics` config comment's memory estimate is corrected: hashes this size are never listpack-encoded, so the real cost is roughly 100 bytes per field, not the ~14 a payload count suggests.
+
+
 ## [0.16.7] - 2026-09-01
 
 ### Fixed

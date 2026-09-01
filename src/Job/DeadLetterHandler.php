@@ -146,16 +146,48 @@ final class DeadLetterHandler
      * List entries in the dead-letter stream, newest first.
      *
      * @param  int  $count  Maximum number of entries to return.
+     * @param  int|null  $sinceMs  Millisecond epoch; drop entries older than it.
      * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
      */
+    /**
+     * Number of entries no older than a millisecond epoch.
+     *
+     * `XLEN` cannot take a range, so this is an `XRANGE` with the ids only.
+     * Callers that want the whole stream should keep using {@see count()},
+     * which stays O(1).
+     */
     #[\NoDiscard]
-    public function list(int $count = 50): array
+    public function countSince(int $sinceMs): int
     {
+        $entries = $this->redis->execute(
+            'XRANGE',
+            $this->deadLetterStream,
+            self::lowId($sinceMs),
+            '+',
+        );
+
+        return is_array($entries) ? count($entries) : 0;
+    }
+
+    /**
+     * The low bound of an `XRANGE`: a millisecond epoch as a stream id, or the
+     * beginning of the stream when no window was asked for.
+     */
+    private static function lowId(?int $sinceMs): string
+    {
+        return $sinceMs === null ? '-' : max(0, $sinceMs).'-0';
+    }
+
+    #[\NoDiscard]
+    public function list(int $count = 50, ?int $sinceMs = null): array
+    {
+        // Stream ids are `{millisecond epoch}-{seq}`, so a time window is just
+        // a low id: no scanning, no post-filtering.
         $entries = $this->redis->execute(
             'XREVRANGE',
             $this->deadLetterStream,
             '+',
-            '-',
+            self::lowId($sinceMs),
             'COUNT',
             (string) $count,
         );
@@ -189,10 +221,11 @@ final class DeadLetterHandler
      *
      * @param  string  $beforeId  The exclusive upper bound message ID.
      * @param  int  $count  Maximum number of entries to return.
+     * @param  int|null  $sinceMs  Millisecond epoch; drop entries older than it.
      * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
      */
     #[\NoDiscard]
-    public function listBefore(string $beforeId, int $count = 50): array
+    public function listBefore(string $beforeId, int $count = 50, ?int $sinceMs = null): array
     {
         // Fetch one extra so we can exclude the cursor entry itself,
         // then take only $count entries that are strictly older.
@@ -200,7 +233,7 @@ final class DeadLetterHandler
             'XREVRANGE',
             $this->deadLetterStream,
             $beforeId,
-            '-',
+            self::lowId($sinceMs),
             'COUNT',
             (string) ($count + 1),
         );

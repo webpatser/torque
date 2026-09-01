@@ -111,6 +111,23 @@ LUA;
      */
     private ?array $lastAggregatePerJob = null;
 
+    /**
+     * Per-worker cumulative counters at the previous publish, keyed by worker id.
+     *
+     * Per-host deltas are folded from per-worker deltas rather than diffed from
+     * a host total. A host runs many workers, and one of them rotating resets
+     * its counters, which drops the host sum; clamping that at zero would
+     * silently drop this host's jobs for as long as the sum took to climb back.
+     * With `max_worker_lifetime` at a day that happens daily.
+     *
+     * A worker id seen for the first time records a baseline and contributes
+     * nothing, so a master taking over a running fleet does not dump every
+     * worker's lifetime counter into a single bucket.
+     *
+     * @var array<string, array{0: int, 1: int}>|null
+     */
+    private ?array $lastWorkerCounters = null;
+
     /** Stream depth probe for the pending gauge, opened once and reused. */
     private ?StreamQueue $depthProbe = null;
 
@@ -1079,11 +1096,20 @@ LUA;
                 );
 
                 $this->metricsPublisher->recordJobOutcomes($this->perJobDeltas($perJob));
+
+                ['deltas' => $hostDeltas, 'counters' => $workerCounters] = self::hostDeltas(
+                    $workers,
+                    $this->lastWorkerCounters ?? [],
+                );
+
+                $this->metricsPublisher->recordHostOutcomes($hostDeltas);
+                $this->lastWorkerCounters = $workerCounters;
             }
 
             // Gauges are point-in-time, so unlike the counters they are sampled
             // on every tick including the first.
             $this->metricsPublisher->recordGauges($this->gaugeSamples($aggregate));
+            $this->metricsPublisher->recordHostGauges($this->hostGaugeSamples($workers));
 
             $this->lastAggregateJobsTotal = $jobsTotal;
             $this->lastAggregateJobsFailed = $jobsFailed;
@@ -1152,6 +1178,129 @@ LUA;
         }
 
         return $deltas;
+    }
+
+    /**
+     * The host a worker runs on: the published field, or the host half of the
+     * `{host}-{pid}-{hex}` id for rows written by older code.
+     *
+     * @param  array<string, mixed>  $worker
+     */
+    private static function hostOf(string $workerId, array $worker): string
+    {
+        $host = trim((string) ($worker['host'] ?? ''));
+
+        return $host !== '' ? $host : WorkerId::parse($workerId)->host;
+    }
+
+    /**
+     * Fold per-worker counter deltas into per-host outcome deltas.
+     *
+     * `ownWorkerMetrics()` has already narrowed the input to this master's own
+     * children, so on a multi-host cluster every master writes only its own
+     * host and no two ever contend for the same field.
+     *
+     * Pure and static so the fold can be tested without a fleet or a Redis,
+     * the way {@see drainWorstCaseSeconds()} is.
+     *
+     * @param  array<string, array<string, mixed>>  $workers  Raw worker hashes, this tick.
+     * @param  array<string, array{0: int, 1: int}>  $previous  The same map, previous tick.
+     * @return array{deltas: array<string, array{0: int, 1: int}>, counters: array<string, array{0: int, 1: int}>}
+     */
+    #[\NoDiscard]
+    public static function hostDeltas(array $workers, array $previous): array
+    {
+        $deltas = [];
+        $counters = [];
+
+        foreach ($workers as $workerId => $worker) {
+            $workerId = (string) $workerId;
+            $processed = (int) ($worker['jobs_processed'] ?? 0);
+            $failed = (int) ($worker['jobs_failed'] ?? 0);
+
+            // Rebuilt from this tick's ids only, so a rotated worker's id falls
+            // out and the map stays bounded by the live fleet.
+            $counters[$workerId] = [$processed, $failed];
+
+            // First sighting: record the baseline, contribute nothing.
+            if (! isset($previous[$workerId])) {
+                continue;
+            }
+
+            $host = self::hostOf($workerId, $worker);
+
+            if ($host === '') {
+                continue;
+            }
+
+            [$lastProcessed, $lastFailed] = $previous[$workerId];
+
+            $processedDelta = max(0, $processed - (int) $lastProcessed);
+            $failedDelta = max(0, $failed - (int) $lastFailed);
+
+            if ($processedDelta === 0 && $failedDelta === 0) {
+                continue;
+            }
+
+            [$hostProcessed, $hostFailed] = $deltas[$host] ?? [0, 0];
+            $deltas[$host] = [$hostProcessed + $processedDelta, $hostFailed + $failedDelta];
+        }
+
+        return ['deltas' => $deltas, 'counters' => $counters];
+    }
+
+    /**
+     * Per-host gauge samples for this tick.
+     *
+     * Slot pressure is what the workers screen exists to show, worker count is
+     * the "that box lost half its fleet at 02:00" signal that slots alone
+     * cannot give when workers have different slot counts, and memory is what
+     * decides a recycle.
+     *
+     * Latency is deliberately absent: a worker's `avg_latency_ms` is an average
+     * over its whole life, so bucketing it would draw a nearly flat line that
+     * reads like a measurement and is not one. That needs a windowed latency in
+     * the collector first.
+     *
+     * @param  array<string, array<string, mixed>>  $workers
+     * @return array<string, array<string, float>>
+     */
+    private static function hostGaugeSamples(array $workers): array
+    {
+        $hosts = [];
+
+        foreach ($workers as $workerId => $worker) {
+            $host = self::hostOf((string) $workerId, $worker);
+
+            if ($host === '') {
+                continue;
+            }
+
+            $memoryMb = ((float) ($worker['memory_bytes'] ?? 0)) / 1_048_576;
+
+            $sample = $hosts[$host] ?? [
+                MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 0.0,
+                MetricsPublisher::GAUGE_HOST_TOTAL_SLOTS => 0.0,
+                MetricsPublisher::GAUGE_HOST_MEMORY => 0.0,
+                MetricsPublisher::GAUGE_HOST_WORKER_MEMORY_PEAK => 0.0,
+                MetricsPublisher::GAUGE_HOST_WORKERS => 0.0,
+            ];
+
+            $sample[MetricsPublisher::GAUGE_HOST_BUSY_SLOTS] += (float) ($worker['active_slots'] ?? 0);
+            $sample[MetricsPublisher::GAUGE_HOST_TOTAL_SLOTS] += (float) ($worker['total_slots'] ?? 0);
+            $sample[MetricsPublisher::GAUGE_HOST_MEMORY] += $memoryMb;
+            // Slots and memory sum across the box; the peak is the largest
+            // single worker, which is the number a recycle threshold is set on.
+            $sample[MetricsPublisher::GAUGE_HOST_WORKER_MEMORY_PEAK] = max(
+                $sample[MetricsPublisher::GAUGE_HOST_WORKER_MEMORY_PEAK],
+                $memoryMb,
+            );
+            $sample[MetricsPublisher::GAUGE_HOST_WORKERS]++;
+
+            $hosts[$host] = $sample;
+        }
+
+        return $hosts;
     }
 
     /**

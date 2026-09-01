@@ -83,7 +83,7 @@ it('builds the overview shape with correct types', function () {
     }
 });
 
-it('builds workers with the documented keys and null sub-widgets', function () {
+it('groups live workers under their host with the documented keys', function () {
     $publisher = new MetricsPublisher(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
 
     try {
@@ -98,25 +98,32 @@ it('builds workers with the documented keys and null sub-widgets', function () {
             timestamp: time(),
         ));
 
-        $workers = app(WorkersData::class)->get()['workers'];
+        // Rows are per host, not per worker process: a worker mints a fresh id
+        // on every start, so only the host has a history to range over.
+        $host = collect(app(WorkersData::class)->get()['hosts'])->firstWhere('host', 'web-01');
 
-        $worker = collect($workers)->firstWhere('id', 'web-01-5123-a1b2c3d4');
+        expect($host)->not->toBeNull()
+            ->and($host)->toHaveKeys([
+                'host', 'workers', 'status', 'lastSeen', 'slots', 'busy', 'stalled', 'memMb',
+                'memPeakMb', 'processed', 'failed', 'failRate', 'rpm', 'history', 'busyHistory',
+                'slotHistory', 'pools', 'uptime',
+            ])
+            ->and($host['status'])->toBe('active')
+            ->and($host['slots'])->toBe(50)
+            ->and($host['busy'])->toBe(38)
+            ->and($host['stalled'])->toBe(0)
+            ->and($host['pools'])->toBeNull()
+            ->and($host['uptime'])->toBeNull();
+
+        // The live process sits inside its host's row, keyed by pid; its
+        // counters stay lifetime-since-start, unlike the host's ranged ones.
+        $worker = collect($host['workers'])->firstWhere('id', 'web-01-5123-a1b2c3d4');
 
         expect($worker)->not->toBeNull()
-            ->and($worker)->toHaveKeys(['id', 'host', 'pid', 'slots', 'busy', 'stalled', 'memMb', 'memPeakMb', 'processed', 'failed', 'rpm', 'latencyMs', 'uptime', 'status', 'pools', 'history'])
-            ->and($worker['host'])->toBe('web-01')
+            ->and($worker)->toHaveKeys(['id', 'pid', 'slots', 'busy', 'stalled', 'memMb', 'processed', 'failed', 'latencyMs', 'status'])
             ->and($worker['pid'])->toBe(5123)
-            ->and($worker['slots'])->toBe(50)
-            ->and($worker['busy'])->toBe(38)
             ->and($worker['processed'])->toBe(18_234)
-            ->and($worker['failed'])->toBe(12)
-            ->and($worker['stalled'])->toBe(0)
-            ->and($worker['status'])->toBe('active')
-            ->and($worker['pools'])->toBeNull()
-            ->and($worker['rpm'])->toBeNull()
-            ->and($worker['uptime'])->toBeNull()
-            ->and($worker['memPeakMb'])->toBeNull()
-            ->and($worker['history'])->toBe([]);
+            ->and($worker['failed'])->toBe(12);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     } finally {
@@ -139,15 +146,16 @@ it('builds one queue entry per configured stream', function () {
 
         $default = collect($queues)->firstWhere('name', 'default');
 
-        expect($default)->toHaveKeys(['name', 'pending', 'delayed', 'reserved', 'processedToday', 'failedToday', 'throughput', 'wait', 'history', 'paused', 'circuit'])
+        expect($default)->toHaveKeys(['name', 'pending', 'delayed', 'reserved', 'processed', 'failed', 'throughput', 'wait', 'history', 'paused', 'circuit'])
             ->and($default['pending'])->toBeInt()
             ->and($default['delayed'])->toBeInt()
             ->and($default['reserved'])->toBeInt()
-            // Counts and throughput now come from the per-stream rollups; only
-            // queue wait time still has no collector.
+            // Counts, throughput and the sparkline all come from the per-stream
+            // rollups over the selected range; only wait has no collector.
             ->and($default['throughput'])->toBeFloat()
-            ->and($default['processedToday'])->toBeInt()
-            ->and($default['failedToday'])->toBeInt()
+            ->and($default['processed'])->toBeInt()
+            ->and($default['failed'])->toBeInt()
+            ->and($default['history'])->toHaveCount(60)
             ->and($default['wait'])->toBeNull()
             ->and($default['circuit'])->toBeNull()
             ->and($default['paused'])->toBeFalse();

@@ -2,6 +2,42 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so. `torque:status` shows the recorded data version next to the installed one.
 
+## 0.16.x to 0.17.0
+
+### Automatic
+
+- Nothing to migrate. The per-host rollups are new keys, so an installation simply starts collecting them on the first `torque:start` after the deploy; until then the workers screen shows its live columns and an empty history.
+- The dashboard's time range moves into the topbar and is remembered per session. Nothing persists server-side beyond the session, so there is no stored state to convert.
+
+### New config keys (all optional, defaults apply when absent)
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `dashboard.default_range` | `'1h'` | Range the dashboard opens on: `1h`, `24h`, `7d` or `90d` (no env var; it is a per-session choice in the topbar) |
+
+### Behaviour changes
+
+- **One range for the whole dashboard.** The 1h / 24h / 7d / 90d control used to sit in two card heads (the overview throughput chart and the jobs table) and drove only that card. It is now a topbar picker next to the refresh interval, remembered for the session, and every screen reads it: the throughput chart and its sparklines, the jobs table, the queues counters, the workers cards, the live feed and the dead-letter list.
+- **The queues screen is range-scoped.** `processedToday` / `failedToday` are now `processed` / `failed` over the selected range, `throughput` is jobs per minute across that range instead of a fixed five-minute window, and the per-stream sparkline is finally real: it reads the `metrics:rollup:{tier}:{queue}` history that has always been written but never read, so it survives a reload.
+- **The workers screen is grouped by host.** A card per machine instead of a card per worker process, with the live processes listed inside it. Worker ids are re-minted on every start, so a per-process row has no history to range over; the host does. `processed` / `failed` / `throughput` on a host row are range-scoped, while the per-process rows keep the lifetime counters straight off the heartbeat hash. A host that ran inside the range but has no live worker now shows as `gone` with its last-seen time rather than disappearing.
+- **The live feed and the dead-letter list honour the range**, applied in Redis (`ZREVRANGEBYSCORE` on the job index, a millisecond-epoch low id on the dead-letter stream). Both sources are bounded by their own retention, so a 90d range shows what retention holds, not a guaranteed 90 days. The dead-letter header shows both the in-range count and the stream total.
+- The job inspector has no fleet-wide time dimension, so the picker is not rendered there.
+
+### API changes
+
+- `WorkersData::get(string $range = '1h')` returns `['hosts' => ...]` instead of `['workers' => ...]`; each host row carries its live processes under `workers`.
+- `QueuesData::get(string $range = '1h')`; the `processedToday` / `failedToday` keys are now `processed` / `failed`.
+- `DeadLetterHandler::list()` and `listBefore()` take an optional `$sinceMs`; new `countSince(int $sinceMs)`.
+- `JobStream::recentJobs()` and `JobsData::list()` take an optional `$since` (unix timestamp).
+- New on `MetricsPublisher`: `recordHostOutcomes()`, `recordHostGauges()`, `hostsSeen()`, `hostSeriesMulti()`, `hostGaugeSeriesMulti()`, `normaliseHost()`, `tierSeconds()`.
+- New `Webpatser\Torque\Dashboard\Support\Range`; `OverviewData::isValidRange()` and `JobMetricsData::isValidRange()` delegate to it.
+
+### Redis side
+
+Three new keys per tier plus an index: `metrics:rollup:{tier}:host` (field `{bucket}:{host}`), `metrics:gauge:{tier}:host` (field `{bucket}:{host}:{metric}`) and the `metrics:hosts` sorted set. Every host shares one hash per tier, so a publish tick costs seven extra round trips whatever the fleet size, but storage grows with the number of distinct hostnames seen inside the retention window: roughly 3 MB per host at the defaults.
+
+On Kubernetes `gethostname()` is the pod name, which is re-minted on every rollout, so that window can hold far more hosts than you have machines. The workers screen stays readable either way (the index is scored by last-seen, so only hosts active inside the selected range are listed), but if that footprint matters, shorten `metrics.rollups.daily_days`.
+
 ## 0.15.x to 0.16.0
 
 ### Automatic

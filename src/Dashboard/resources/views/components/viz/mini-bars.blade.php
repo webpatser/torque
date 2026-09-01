@@ -3,6 +3,7 @@
     'w' => 120,
     'h' => 34,
     'color' => 'var(--accent)',
+    'full' => false,
 ])
 @php
     $series = array_values($data);
@@ -13,7 +14,13 @@
         $count = count($series);
         $bw = $w / $count;
     @endphp
-    <svg width="{{ $w }}" height="{{ $h }}" viewBox="0 0 {{ $w }} {{ $h }}" preserveAspectRatio="none">
+    {{-- `full` renders a fluid chart: the viewBox keeps the bar geometry while
+         the element itself is 100% of its container, so a card whose grid track
+         is narrower than $w scales the bars down instead of letting them spill
+         out from under the card (.card carries min-width: 0 and must never
+         clip, or it would cut off the popovers). Mirrors sparkline's `full`. --}}
+    <svg width="{{ $full ? '100%' : $w }}" height="{{ $h }}" viewBox="0 0 {{ $w }} {{ $h }}"
+        preserveAspectRatio="none" @if ($full) style="display: block;" @endif>
         @foreach ($series as $i => $v)
             @php
                 $bh = max(1.5, ($v / $max) * ($h - 2));

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Dashboard\Data;
 
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
+use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 
 /**
@@ -19,18 +20,6 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
  */
 final class JobMetricsData
 {
-    /**
-     * Buckets per range, mirroring the overview's chart ranges.
-     *
-     * @var array<string, array{tier: string, count: int, minutes: int}>
-     */
-    private const array RANGES = [
-        '1h' => ['tier' => MetricsPublisher::TIER_MINUTE, 'count' => 60, 'minutes' => 60],
-        '24h' => ['tier' => MetricsPublisher::TIER_HOUR, 'count' => 24, 'minutes' => 1440],
-        '7d' => ['tier' => MetricsPublisher::TIER_HOUR, 'count' => 168, 'minutes' => 10080],
-        '90d' => ['tier' => MetricsPublisher::TIER_DAY, 'count' => 90, 'minutes' => 129600],
-    ];
-
     /** Sort keys the screen offers, mapped to the row field they order by. */
     private const array SORTS = [
         'throughput' => 'throughput',
@@ -46,12 +35,12 @@ final class JobMetricsData
      */
     public function get(string $range = '1h', string $sort = 'throughput', string $direction = 'desc'): array
     {
-        $window = self::RANGES[$range] ?? self::RANGES['1h'];
-        $isMinuteTier = $window['tier'] === MetricsPublisher::TIER_MINUTE;
+        $window = Range::make($range);
+        $isMinuteTier = $window->tier === MetricsPublisher::TIER_MINUTE;
         $jobs = [];
 
         foreach ($this->metrics->jobClasses() as $class) {
-            $series = $this->metrics->jobSeries($class, $window['tier'], $window['count']);
+            $series = $this->metrics->jobSeries($class, $window->tier, $window->count);
 
             $processed = 0;
             $failed = 0;
@@ -87,7 +76,7 @@ final class JobMetricsData
                 'cls' => $cls,
                 // Jobs per minute across the whole selected range, so the
                 // column means the same thing at 1h and at 90d.
-                'throughput' => round($finished / $window['minutes'], 2),
+                'throughput' => round($finished / $window->minutes, 2),
                 'processed' => $processed,
                 'failed' => $failed,
                 'failRate' => round($failed / $finished * 100, 2),
@@ -136,7 +125,7 @@ final class JobMetricsData
     #[\NoDiscard]
     public static function isValidRange(string $range): bool
     {
-        return array_key_exists($range, self::RANGES);
+        return Range::isValid($range);
     }
 
     #[\NoDiscard]

@@ -21,27 +21,12 @@ final class Overview extends Component
 {
     use WithDashboardChrome;
 
-    /**
-     * Throughput chart range: 1h, 24h, 7d or 90d.
-     *
-     * Server-rendered rather than Alpine state, so the polled re-render cannot
-     * lose it and the seg buttons morph cleanly.
-     */
-    public string $range = '1h';
-
-    /**
-     * Switch the throughput chart range from the card-head seg buttons.
-     */
-    public function setRange(string $range): void
-    {
-        if (OverviewData::isValidRange($range)) {
-            $this->range = $range;
-        }
-    }
-
     public function render()
     {
-        $data = rescue(fn (): array => app(OverviewData::class)->get($this->range), $this->emptyOverview(), false);
+        // The range is the dashboard-wide one from the topbar picker; the
+        // component owns none of its own.
+        $window = $this->range();
+        $data = rescue(fn (): array => app(OverviewData::class)->get($window->key), $this->emptyOverview(), false);
 
         $totals = $data['totals'];
         $metrics = $data['metrics'];
@@ -55,10 +40,10 @@ final class Overview extends Component
             'history' => $data['history'],
             'series' => $data['series'],
             'minuteHistory' => $data['minuteHistory'],
-            'range' => $this->range,
+            'window' => $window,
             'live' => array_slice($data['live'], 0, 6),
             'deadCount' => $data['deadCount'],
-            'workers' => rescue(fn (): array => app(WorkersData::class)->get()['workers'], [], false),
+            'hosts' => rescue(fn (): array => app(WorkersData::class)->get($window->key)['hosts'], [], false),
         ]);
     }
 

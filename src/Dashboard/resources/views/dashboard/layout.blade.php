@@ -101,12 +101,16 @@
                     return;
                 }
 
-                // Refresh interval: highlight the picked option right away (the panel
-                // is wire:ignore'd, so the server render never repaints it) and call
-                // the component directly. Livewire.find() returns the $wire proxy and
-                // .call() is plain JS, so this works without expression evaluation
-                // under a CSP without unsafe-eval, where wire:click="method(arg)" may not.
-                if (action === 'set-poll') {
+                // Topbar pickers (refresh interval, time range): highlight the picked
+                // option right away (the panel is wire:ignore'd, so the server render
+                // never repaints it) and call the component directly. Livewire.find()
+                // returns the $wire proxy and .call() is plain JS, so this works
+                // without expression evaluation under a CSP without unsafe-eval,
+                // where wire:click="method(arg)" may not.
+                if (action === 'call') {
+                    var method = hook.getAttribute('data-torque-method');
+                    if (! method) return;
+
                     var owner = hook.closest('.popover');
                     if (owner) {
                         owner.querySelectorAll('.popover-item.active').forEach(function (item) {
@@ -116,11 +120,14 @@
                     }
                     closePopovers();
 
+                    var raw = hook.getAttribute('data-torque-value');
+                    var value = hook.getAttribute('data-torque-cast') === 'int' ? Number(raw) : raw;
+
                     var root = hook.closest('[wire\\:id]');
                     var id = root && root.getAttribute('wire:id');
                     var component = id && window.Livewire && window.Livewire.find(id);
                     if (component) {
-                        component.call('setPollInterval', Number(hook.getAttribute('data-torque-value')));
+                        component.call(method, value);
                     }
                     return;
                 }

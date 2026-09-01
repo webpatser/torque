@@ -5,13 +5,16 @@
     $segments = [['all', 'all'], ['active', 'active'], ['queued', 'queued'], ['completed', 'done'], ['failed', 'failed']];
 @endphp
 <x-torque::shell title="Live feed" crumb="torque:tail · real-time activity" active="feed"
-    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
+    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
     <div class="grid-2-wide">
         <div class="card">
             <div class="card-head">
                 <span class="livedot"></span>
                 <h3>Live jobs</h3>
+                {{-- The job index is a rolling tail, so a long range shows what
+                     retention holds rather than a guaranteed window. --}}
+                <span class="sub">{{ $window->short }} · newest first</span>
                 <div class="grow"></div>
                 <div class="seg">
                     @foreach ($segments as [$key, $label])

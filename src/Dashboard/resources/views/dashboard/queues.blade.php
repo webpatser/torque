@@ -6,24 +6,26 @@
     $columns = 6 + (int) $hasThroughput + (int) $hasWait + (int) $hasFailed;
 @endphp
 <x-torque::shell title="Queues &amp; Streams" crumb="Redis Streams · consumer groups" active="queues"
-    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
+    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
-    <div class="grid mb16" style="grid-template-columns: repeat({{ 3 + (int) $hasToday + (int) $hasFailed }},1fr);">
+    <div class="grid mb16" style="grid-template-columns: repeat({{ 3 + (int) $hasProcessed + (int) $hasFailed }},1fr);">
         <x-torque::stat label="Streams" :value="count($queues)"/>
         <x-torque::stat label="Total pending" :value="Format::int($totals['pending'])"/>
         <x-torque::stat label="Delayed" :value="Format::int($totals['delayed'])"/>
-        @if ($hasToday)
-            <x-torque::stat label="Processed today" :value="Format::int($totals['today'])"/>
+        @if ($hasProcessed)
+            <x-torque::stat label="Processed" :value="Format::int($totals['processed'])"/>
         @endif
         @if ($hasFailed)
-            <x-torque::stat label="Failed today" :value="Format::int($totals['failed'])"/>
+            <x-torque::stat label="Failed" :value="Format::int($totals['failed'])"/>
         @endif
     </div>
 
     <div class="card">
         <div class="card-head">
             <h3>Redis Streams</h3>
-            <span class="sub">XREADGROUP · consumer group "torque"</span>
+            {{-- Depth, pause and breaker state are point-in-time by nature;
+                 the counter columns follow the topbar range. --}}
+            <span class="sub">XREADGROUP · consumer group "torque" · {{ $window->short }}</span>
         </div>
         <div class="tbl-wrap">
             <table class="tbl">
@@ -34,9 +36,9 @@
                         <th class="r">Delayed</th>
                         <th class="r">Reserved</th>
                         @if ($hasThroughput)<th class="r">Throughput</th>@endif
-                        @if ($hasFailed)<th class="r">Failed today</th>@endif
+                        @if ($hasFailed)<th class="r">Failed</th>@endif
                         @if ($hasWait)<th class="r">Wait</th>@endif
-                        <th style="width: 150px;">Depth · 200s</th>
+                        <th style="width: 150px;">Processed</th>
                         <th style="width: 90px;"></th>
                     </tr>
                 </thead>
@@ -71,15 +73,15 @@
                             @if ($hasThroughput)<td class="r mono" style="color: var(--accent);">{{ $q['throughput'] !== null ? Format::num($q['throughput'], 1).'/min' : '–' }}</td>@endif
                             @if ($hasFailed)
                                 <td class="r mono">
-                                    @if (($q['failedToday'] ?? 0) > 0)
-                                        <span style="color: var(--bad);">{{ Format::int($q['failedToday']) }}</span>
+                                    @if (($q['failed'] ?? 0) > 0)
+                                        <span style="color: var(--bad);">{{ Format::int($q['failed']) }}</span>
                                     @else
                                         <span class="muted">–</span>
                                     @endif
                                 </td>
                             @endif
                             @if ($hasWait)<td class="r mono muted">{{ $q['wait'] !== null ? Format::num($q['wait'], 2).'s' : '–' }}</td>@endif
-                            <td><x-torque::viz.mini-bars :data="$q['history']" :w="140" :h="30" :color="$q['pending'] > 300 ? 'var(--warn)' : 'var(--accent)'"/></td>
+                            <td><x-torque::viz.mini-bars :data="$q['history']" :w="140" :h="30" :color="$q['pending'] > 300 ? 'var(--warn)' : 'var(--accent)'" full/></td>
                             <td class="r"><x-torque::icon name="chevR" :size="15"/></td>
                         </tr>
                     @empty

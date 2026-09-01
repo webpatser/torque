@@ -15,17 +15,18 @@ final class JobsData
     public function __construct(private readonly JobStream $jobStream) {}
 
     /**
-     * List recent jobs, optionally filtered by status.
+     * List recent jobs, optionally filtered by status and by a time window.
      *
+     * @param  int|null  $since  Unix timestamp; null lists the whole tail.
      * @return list<array<string, mixed>>
      */
-    public function list(string $filter = 'all'): array
+    public function list(string $filter = 'all', ?int $since = null): array
     {
         $jobs = match ($filter) {
-            'active', 'queued' => $this->jobStream->recentJobs('active', 100),
-            'completed' => $this->jobStream->recentJobs('completed', 100),
-            'failed' => $this->jobStream->recentJobs('failed', 100),
-            default => $this->jobStream->recentJobs(null, 100),
+            'active', 'queued' => $this->jobStream->recentJobs('active', 100, $since),
+            'completed' => $this->jobStream->recentJobs('completed', 100, $since),
+            'failed' => $this->jobStream->recentJobs('failed', 100, $since),
+            default => $this->jobStream->recentJobs(null, 100, $since),
         };
 
         $summaries = array_map(

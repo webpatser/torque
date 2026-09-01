@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire\Concerns;
 
+use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 
@@ -11,7 +12,8 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
  * Shared dashboard chrome state for the full-page Livewire screens.
  *
  * Owns the live-refresh interval (driven by the topbar poll selector and
- * consumed by `wire:poll` in the shell) and the sidebar badge counts.
+ * consumed by `wire:poll` in the shell), the global time range every screen
+ * reads, and the sidebar badge counts.
  */
 trait WithDashboardChrome
 {
@@ -29,6 +31,20 @@ trait WithDashboardChrome
     private const string POLL_SESSION_KEY = 'torque.poll_interval';
 
     /**
+     * Global time range key; null until the boot hook seeds it.
+     *
+     * Server-rendered rather than browser state: every screen polls, and a
+     * morph would be free to reset whatever the client was holding.
+     */
+    public ?string $range = null;
+
+    /**
+     * Session key that remembers the chosen range across screens and reloads,
+     * the same way the poll interval is remembered.
+     */
+    private const string RANGE_SESSION_KEY = 'torque.range';
+
+    /**
      * Seed the poll interval on first load: the interval chosen earlier in this
      * session wins, then the configured default.
      */
@@ -41,6 +57,37 @@ trait WithDashboardChrome
                 ? $remembered
                 : (int) config('torque.dashboard.default_poll_interval', 2000);
         }
+
+        if ($this->range === null) {
+            $remembered = session(self::RANGE_SESSION_KEY);
+
+            $this->range = is_string($remembered) && Range::isValid($remembered)
+                ? $remembered
+                : (string) config('torque.dashboard.default_range', Range::DEFAULT);
+        }
+    }
+
+    /**
+     * Update the global time range from the topbar picker and remember it for
+     * the rest of the session. An unknown key is ignored rather than trusted
+     * into the read model.
+     */
+    public function setRange(string $range): void
+    {
+        if (! Range::isValid($range)) {
+            return;
+        }
+
+        $this->range = $range;
+        session([self::RANGE_SESSION_KEY => $range]);
+    }
+
+    /**
+     * The resolved range for this request, for the render methods.
+     */
+    protected function range(): Range
+    {
+        return Range::make($this->range);
     }
 
     /**

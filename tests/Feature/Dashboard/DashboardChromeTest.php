@@ -61,14 +61,18 @@ it('drives the chrome through delegated data-torque-action hooks', function () {
         ->toContain('data-torque-action="toggle-nav"')
         ->toContain('data-torque-action="toggle-theme"')
         ->toContain('data-torque-action="toggle-popover"')
-        ->toContain('data-torque-action="set-poll"');
+        // Both topbar pickers go through one generic component-call hook.
+        ->toContain('data-torque-action="call"')
+        ->toContain('data-torque-method="setPollInterval"')
+        ->toContain('data-torque-method="setRange"');
 });
 
 it('renders the refresh popover closed and shielded from the morph', function () {
     $html = $this->actingAs(torqueTestUser())->get('/torque')->assertOk()->getContent();
 
-    // The panel opts out of morphing, so an open panel survives a poll tick.
-    expect($html)->toContain('wire:ignore class="popover"');
+    // Both panels opt out of morphing, so an open panel survives a poll tick.
+    expect($html)->toContain('wire:ignore class="popover"')
+        ->and(substr_count($html, 'wire:ignore class="popover"'))->toBe(2);
 
     // Closed by default: `open` is added by the script, never rendered.
     expect($html)
@@ -78,13 +82,13 @@ it('renders the refresh popover closed and shielded from the morph', function ()
     // Options call the component through Livewire.find().call() from the chrome
     // script: no wire:click expression, so nothing for a CSP interpreter to reject.
     expect($html)
-        ->toContain('data-torque-action="set-poll"')
+        ->toContain('data-torque-method="setPollInterval"')
         ->toContain('data-torque-value="5000"')
         ->and($html)->not->toContain('wire:click="setPollInterval(')
         ->and($html)->not->toContain('$wire.setPollInterval(');
 
     // The script resolves the component id and calls the method by name.
-    expect($html)->toContain("component.call('setPollInterval'");
+    expect($html)->toContain('component.call(method, value)');
 
     // The polled region is keyed by the interval so the morph replaces it and
     // Livewire starts a fresh wire:poll timer instead of keeping the old one.
@@ -195,4 +199,41 @@ it('remembers the chosen interval in the session and rejects unlisted values', f
         ->assertSet('pollInterval', 0);
 
     expect(session('torque.poll_interval'))->toBe(0);
+});
+
+/**
+ * Blade only compiles a directive at a non-word boundary, so `ago@endif`
+ * renders as literal text while its `@if` stays open. The page then dies with a
+ * PHP parse error a long way from the line that caused it, and only for the
+ * branch that renders that markup. Cheaper to assert than to debug twice.
+ */
+it('never glues a Blade directive to the word before it', function () {
+    $views = glob(__DIR__.'/../../../src/Dashboard/resources/views/{dashboard,components,components/viz}/*.blade.php', GLOB_BRACE);
+
+    expect($views)->not->toBeEmpty();
+
+    foreach ($views as $view) {
+        expect(file_get_contents($view))
+            ->not->toMatch('/\w@(?:if|else|elseif|endif|foreach|endforeach|forelse|empty|endforelse|php|endphp)\b/');
+    }
+});
+
+/**
+ * A viz component inside a fluid card must scale with its grid track. The
+ * throughput chart shipped a literal width="760", and `.card` carries
+ * min-width: 0 and must never clip (that would cut off the popovers), so on any
+ * viewport narrower than that the bars spilled out from under the card.
+ */
+it('renders the throughput chart at the width of its card', function () {
+    // Asserted on the source: the SVG only renders once there is a series, so
+    // a data-free environment would pass an assertion on the markup by default.
+    expect(torqueDashboardView('overview'))
+        ->toMatch('/viz\.mini-bars[^>]*:w="760"[^>]*\bfull\b/');
+
+    // And the component honours it.
+    $svg = (string) file_get_contents(
+        __DIR__.'/../../../src/Dashboard/resources/views/components/viz/mini-bars.blade.php',
+    );
+
+    expect($svg)->toContain('$full ? \'100%\' : $w');
 });

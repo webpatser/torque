@@ -115,13 +115,13 @@ it('sorts server-side and flips direction on a repeated column', function () {
 it('switches the metric range without touching client state', function () {
     $component = Livewire::test(Jobs::class)
         ->assertSet('range', '1h')
-        ->assertSee('last 60 minutes');
+        ->assertSee('jobs / minute · last 60 min', escape: false);
 
     // 600 jobs in the last hour is 10 a minute; over 24 hours the same 600 jobs
     // average out far lower, which is what makes the column comparable.
     expect(collect($component->viewData('jobs'))->firstWhere('cls', 'Busy')['throughput'])->toBe(10.0);
 
-    $component->call('setRange', '24h')->assertSee('last 24 hours');
+    $component->call('setRange', '24h')->assertSee('jobs / hour · last 24 hours', escape: false);
 
     expect(collect($component->viewData('jobs'))->firstWhere('cls', 'Busy')['throughput'])->toBe(0.42);
 

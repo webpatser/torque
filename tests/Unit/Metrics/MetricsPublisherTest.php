@@ -812,3 +812,178 @@ it('sums per-class counters across workers and keeps the largest runtime', funct
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
+
+/**
+ * Delete the per-host rollups, gauges and the host index.
+ */
+function cleanupHosts(MetricsPublisher $publisher, string $prefix): void
+{
+    $redis = (new ReflectionClass($publisher))
+        ->getMethod('getRedis')
+        ->invoke($publisher);
+
+    foreach (['minute', 'hour', 'day'] as $tier) {
+        $redis->execute('DEL', $prefix.'metrics:rollup:'.$tier.':host');
+        $redis->execute('DEL', $prefix.'metrics:gauge:'.$tier.':host');
+    }
+
+    $redis->execute('DEL', $prefix.'metrics:hosts');
+}
+
+it('records per-host outcomes into every tier under one key per tier', function () {
+    $prefix = 'torque-host-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $publisher->recordHostOutcomes(['web-01' => [3, 1], 'web-02' => [5, 0]], $now);
+
+        $redis = (new ReflectionClass($publisher))
+            ->getMethod('getRedis')
+            ->invoke($publisher);
+
+        // Host lives in the field, not the key, so one hash per tier holds the
+        // whole fleet and a write costs three evals whatever its size.
+        $bucket = intdiv($now, 60) * 60;
+
+        expect($redis->execute('HGET', $prefix.'metrics:rollup:minute:host', $bucket.':web-01'))->toBe('3,1')
+            ->and($redis->execute('HGET', $prefix.'metrics:rollup:minute:host', $bucket.':web-02'))->toBe('5,0');
+
+        // The same jobs land in the hour and day tiers, so a 90d view sees them.
+        $day = intdiv($now, 86400) * 86400;
+        expect($redis->execute('HGET', $prefix.'metrics:rollup:day:host', $day.':web-01'))->toBe('3,1');
+
+        // Read back gap-filled: one entry per bucket, newest last.
+        $series = $publisher->hostSeriesMulti(['web-01', 'web-02'], MetricsPublisher::TIER_MINUTE, 3, $now);
+
+        expect($series['web-01'])->toHaveCount(3)
+            ->and(end($series['web-01']))->toBe(['processed' => 3, 'failed' => 1])
+            ->and(reset($series['web-01']))->toBe(['processed' => 0, 'failed' => 0])
+            ->and(end($series['web-02']))->toBe(['processed' => 5, 'failed' => 0]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
+it('keeps per-host counters out of the cluster and per-stream rollups', function () {
+    $prefix = 'torque-host-scope-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $publisher->recordHostOutcomes(['web-01' => [7, 0]], $now);
+
+        // The workers screen must not double-count into the overview.
+        $cluster = $publisher->series(MetricsPublisher::TIER_MINUTE, 2, null, $now);
+
+        expect(array_sum(array_column($cluster, 'processed')))->toBe(0);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+        (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher)
+            ->execute('DEL', $prefix.'metrics:rollup:minute');
+    }
+});
+
+it('clamps a negative per-host delta instead of indexing the host', function () {
+    $prefix = 'torque-host-clamp-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $publisher->recordHostOutcomes(['web-01' => [-5, -2]], $now);
+
+        expect($publisher->hostsSeen(0))->toBe([]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
+it('folds per-host gauges into sum, count and max under a host-scoped field', function () {
+    $prefix = 'torque-host-gauge-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $publisher->recordHostGauges([
+            'web-01' => [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 10],
+            'web-02' => [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 4],
+        ], $now);
+        $publisher->recordHostGauges([
+            'web-01' => [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 30],
+        ], $now);
+
+        $redis = (new ReflectionClass($publisher))
+            ->getMethod('getRedis')
+            ->invoke($publisher);
+
+        $bucket = intdiv($now, 60) * 60;
+
+        expect($redis->execute('HGET', $prefix.'metrics:gauge:minute:host', $bucket.':web-01:busy_slots'))->toBe('40,2,30')
+            // The second sample must not touch the neighbour's field.
+            ->and($redis->execute('HGET', $prefix.'metrics:gauge:minute:host', $bucket.':web-02:busy_slots'))->toBe('4,1,4');
+
+        $series = $publisher->hostGaugeSeriesMulti(
+            [MetricsPublisher::GAUGE_HOST_BUSY_SLOTS],
+            ['web-01'],
+            MetricsPublisher::TIER_MINUTE,
+            2,
+            $now,
+        );
+
+        expect(end($series['web-01'][MetricsPublisher::GAUGE_HOST_BUSY_SLOTS]))->toBe(['avg' => 20.0, 'max' => 30.0]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
+it('lists only the hosts seen inside the requested range', function () {
+    $prefix = 'torque-host-index-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $publisher->recordHostOutcomes(['web-new' => [1, 0]], $now);
+        $publisher->recordHostOutcomes(['web-old' => [1, 0]], $now - 172_800);
+
+        // The index is scored by last-seen, so a host that stopped reporting
+        // longer ago than the range never reaches the read model.
+        expect(array_keys($publisher->hostsSeen($now - 3600)))->toBe(['web-new'])
+            ->and(array_keys($publisher->hostsSeen($now - 604_800)))->toBe(['web-new', 'web-old'])
+            ->and($publisher->hostsSeen($now - 3600)['web-new'])->toBe($now);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
+it('makes a hostname safe to use inside a colon-delimited field', function () {
+    // A colon would silently invent a field segment, and glob characters would
+    // break the SCAN patterns housekeeping matches on.
+    expect(MetricsPublisher::normaliseHost('web-01'))->toBe('web-01')
+        ->and(MetricsPublisher::normaliseHost('web:01'))->not->toContain(':')
+        ->and(MetricsPublisher::normaliseHost('web*01'))->not->toContain('*')
+        // Two machines whose names clean to the same string stay distinct.
+        ->and(MetricsPublisher::normaliseHost('web:01'))->not->toBe(MetricsPublisher::normaliseHost('web*01'))
+        ->and(MetricsPublisher::normaliseHost(''))->toBe('unknown')
+        ->and(MetricsPublisher::normaliseHost('   '))->toBe('unknown')
+        ->and(strlen(MetricsPublisher::normaliseHost(str_repeat('h', 200))))->toBeLessThanOrEqual(56);
+});

@@ -73,7 +73,16 @@ final class Dead extends Component
 
     public function render()
     {
-        $data = rescue(fn (): array => app(DeadLetterData::class)->list(null, 50), ['count' => 0, 'jobs' => []], false);
+        $window = $this->range();
+
+        // Dead-letter ids are millisecond epochs, so the window is a low id on
+        // the XREVRANGE rather than a filter after the fact. It is still capped
+        // by the stream's own TTL and MAXLEN, not by the range.
+        $data = rescue(
+            fn (): array => app(DeadLetterData::class)->list(null, 50, $window->sinceMs()),
+            ['count' => 0, 'total' => 0, 'jobs' => []],
+            false,
+        );
 
         $needle = trim(mb_strtolower($this->search));
         $list = array_values(array_filter($data['jobs'], function ($j) use ($needle) {
@@ -93,7 +102,10 @@ final class Dead extends Component
             'shown' => $shown,
             'total' => count($list),
             'perPage' => self::PER_PAGE,
+            'window' => $window,
+            // In range for the header, whole stream for the sidebar badge.
             'deadCount' => $data['count'],
+            'deadTotal' => $data['total'],
             'workerCount' => $this->chrome()['workerCount'],
         ]);
     }

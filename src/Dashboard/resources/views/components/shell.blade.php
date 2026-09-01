@@ -5,6 +5,7 @@
     'deadCount' => 0,
     'workerCount' => null,
     'pollInterval' => 2000,
+    'range' => null,
 ])
 @php
     $nav = [
@@ -24,6 +25,12 @@
         ['v' => 0, 'l' => 'paused'],
     ];
     $curPoll = collect($pollOpts)->firstWhere('v', $pollInterval) ?? $pollOpts[1];
+
+    // A null range means this screen has no time dimension (the job inspector
+    // shows one job's own event stream), so the picker is left out rather than
+    // rendered inert next to data it does not touch.
+    $rangeOpts = $range === null ? [] : \Webpatser\Torque\Dashboard\Support\Range::options();
+    $curRange = $range === null ? null : \Webpatser\Torque\Dashboard\Support\Range::make($range);
     $version = rescue(fn () => \Composer\InstalledVersions::getPrettyVersion('webpatser/torque'), 'dev', false);
     $cspWarning = rescue(fn () => cache()->get(\Webpatser\Torque\Dashboard\Http\Middleware\DetectCspMismatch::CACHE_KEY), null, false);
 @endphp
@@ -95,6 +102,34 @@
                  component through Livewire.find().call(), a plain JS call that
                  needs no wire:click expression evaluation (the CSP build of
                  Livewire interprets expressions and is the fragile part). --}}
+            {{-- Time range picker. One global window for every card on every
+                 screen, remembered in the session, so the dashboard never shows
+                 two ranges at once. Same shape as the poll selector below: a
+                 wire:ignore'd panel driven by the chrome script, because a
+                 wire:click carrying an argument is the one thing Livewire's
+                 CSP-safe build cannot be relied on to interpret. --}}
+            @if ($curRange !== null)
+                <div class="popover-anchor">
+                    <button type="button" class="btn sm range-trigger" data-torque-action="toggle-popover" aria-expanded="false">
+                        <x-torque::icon name="clock" :size="13"/>
+                        <span class="mono range-label">{{ $curRange->short }}</span>
+                        <x-torque::icon name="chevD" :size="13"/>
+                    </button>
+                    <div wire:ignore class="popover">
+                        <div class="eyebrow">Range</div>
+                        @foreach ($rangeOpts as $o)
+                            <button type="button" @class(['popover-item', 'mono', 'active' => $o['key'] === $curRange->key])
+                                data-torque-action="call"
+                                data-torque-method="setRange"
+                                data-torque-value="{{ $o['key'] }}">
+                                <x-torque::icon name="clock" :size="12"/>
+                                {{ $o['short'] }}
+                            </button>
+                        @endforeach
+                    </div>
+                </div>
+            @endif
+
             <div class="popover-anchor">
                 <button type="button" class="btn sm poll-trigger" data-torque-action="toggle-popover" aria-expanded="false">
                     @if ($pollInterval === 0)
@@ -109,7 +144,9 @@
                     <div class="eyebrow">Refresh</div>
                     @foreach ($pollOpts as $o)
                         <button type="button" @class(['popover-item', 'mono', 'active' => $o['v'] === $pollInterval])
-                            data-torque-action="set-poll"
+                            data-torque-action="call"
+                            data-torque-method="setPollInterval"
+                            data-torque-cast="int"
                             data-torque-value="{{ $o['v'] }}">
                             <x-torque::icon :name="$o['v'] === 0 ? 'pause' : 'refresh'" :size="12"/>
                             {{ $o['l'] }}

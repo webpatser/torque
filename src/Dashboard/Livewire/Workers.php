@@ -11,47 +11,36 @@ use Webpatser\Torque\Dashboard\Data\WorkersData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 
 /**
- * Workers screen: per-worker slot pressure, pools, throughput and memory.
+ * Workers screen: slot pressure, throughput and memory per host.
  *
- * Per-worker slot-usage histories accumulate on the component across polls so
- * each worker's sparkline keeps its live feel.
+ * Grouped by host because that is the identity with a history; see
+ * {@see WorkersData}. Nothing accumulates in component state any more: the
+ * sparkline is the per-host rollup over the global range, so it survives a
+ * reload instead of filling up one poll at a time.
  */
 #[Layout('torque::dashboard.layout')]
 final class Workers extends Component
 {
     use WithDashboardChrome;
 
-    /** @var array<string, list<float>> */
-    public array $history = [];
-
     public function render()
     {
-        $workers = rescue(fn (): array => app(WorkersData::class)->get()['workers'], [], false);
+        $window = $this->range();
+        $hosts = rescue(fn (): array => app(WorkersData::class)->get($window->key)['hosts'], [], false);
         $totals = rescue(
-            fn (): array => app(OverviewData::class)->get()['totals'],
+            fn (): array => app(OverviewData::class)->get($window->key)['totals'],
             ['slots' => 0, 'busy' => 0, 'pending' => 0, 'delayed' => 0, 'rpm' => 0, 'util' => 0],
             false,
         );
 
-        // Accumulate per-worker slot-usage history, pruning vanished workers.
-        $ids = [];
-        foreach ($workers as &$w) {
-            $id = $w['id'];
-            $ids[$id] = true;
-            $frac = $w['slots'] > 0 ? $w['busy'] / $w['slots'] : 0;
-            $this->history[$id] = $this->pushHistory($this->history[$id] ?? [], $frac);
-            $w['history'] = array_map(fn ($v) => $v * 100, $this->history[$id]);
-        }
-        unset($w);
-        $this->history = array_intersect_key($this->history, $ids);
-
-        $active = count(array_filter($workers, fn ($w) => ($w['status'] ?? 'active') === 'active'));
+        $chrome = $this->chrome();
 
         return view('torque::dashboard.workers', [
-            'workers' => $workers,
+            'hosts' => $hosts,
             'totals' => $totals,
-            'active' => $active,
-            'deadCount' => $this->chrome()['deadCount'],
+            'window' => $window,
+            'deadCount' => $chrome['deadCount'],
+            'workerCount' => $chrome['workerCount'],
         ]);
     }
 }

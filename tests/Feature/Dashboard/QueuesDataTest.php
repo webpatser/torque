@@ -49,7 +49,7 @@ afterEach(function () {
     }, null, false);
 });
 
-it('reports per-stream daily counts and a per-minute throughput', function () {
+it('reports per-stream counts and throughput over the selected range', function () {
     $now = time();
 
     app(MetricsPublisher::class)->recordOutcomes(12, 2, ['default' => [12, 2]], $now);
@@ -58,16 +58,36 @@ it('reports per-stream daily counts and a per-minute throughput', function () {
     $default = collect($queues)->firstWhere('name', 'default');
 
     expect($default)->toHaveKeys([
-        'name', 'pending', 'delayed', 'reserved', 'processedToday', 'failedToday',
+        'name', 'pending', 'delayed', 'reserved', 'processed', 'failed',
         'throughput', 'wait', 'history', 'paused', 'circuit',
     ])
-        ->and($default['processedToday'])->toBe(12)
-        ->and($default['failedToday'])->toBe(2)
-        // Jobs per minute over the 5-minute window, not per second.
-        ->and($default['throughput'])->toBeGreaterThan(0.0)
+        ->and($default['processed'])->toBe(12)
+        ->and($default['failed'])->toBe(2)
+        // Jobs per minute across the range, not per second: 14 in an hour.
+        ->and($default['throughput'])->toBe(0.2)
+        // The sparkline is the per-stream rollup, one point per bucket, so it
+        // survives a reload instead of accumulating in the component.
+        ->and($default['history'])->toHaveCount(60)
+        ->and(array_sum($default['history']))->toBe(12)
         // No collector for queue wait time yet, so the column stays hidden.
         ->and($default['wait'])->toBeNull()
         ->and($default['circuit'])->toBeNull();
+});
+
+it('rescopes the per-stream counters to the range it is asked for', function () {
+    $now = time();
+
+    app(MetricsPublisher::class)->recordOutcomes(12, 2, ['default' => [12, 2]], $now);
+
+    $hour = collect(app(QueuesData::class)->get('1h')['queues'])->firstWhere('name', 'default');
+    $quarter = collect(app(QueuesData::class)->get('90d')['queues'])->firstWhere('name', 'default');
+
+    // The same 14 jobs, read off a different tier and divided by a different
+    // window: one bucket per minute against one per day.
+    expect($hour['history'])->toHaveCount(60)
+        ->and($quarter['history'])->toHaveCount(90)
+        ->and($quarter['processed'])->toBe(12)
+        ->and($quarter['throughput'])->toBeLessThan($hour['throughput']);
 });
 
 it('exposes an open circuit breaker with the seconds until it resumes', function () {

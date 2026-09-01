@@ -12,30 +12,20 @@ use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 /**
  * Jobs screen: throughput, runtime and failure rate per job class.
  *
- * Range and sort are plain Livewire properties rather than Alpine state. The
- * screen polls, and a morph is free to reset anything the browser was holding
- * on its own, so the server has to own both.
+ * Sort is a plain Livewire property rather than Alpine state, and the range
+ * comes from the shared chrome. The screen polls, and a morph is free to reset
+ * anything the browser was holding on its own, so the server owns both.
  */
 #[Layout('torque::dashboard.layout')]
 final class Jobs extends Component
 {
     use WithDashboardChrome;
 
-    /** Range of the throughput column and the sparklines: 1h, 24h, 7d or 90d. */
-    public string $range = '1h';
-
     /** Sort key: throughput, runtime, failures or name. */
     public string $sort = 'throughput';
 
     /** Sort direction: desc or asc. */
     public string $direction = 'desc';
-
-    public function setRange(string $range): void
-    {
-        if (JobMetricsData::isValidRange($range)) {
-            $this->range = $range;
-        }
-    }
 
     /**
      * Sort by a column, flipping the direction when it is already the sort key.
@@ -59,8 +49,10 @@ final class Jobs extends Component
 
     public function render()
     {
+        $window = $this->range();
+
         $data = rescue(
-            fn (): array => app(JobMetricsData::class)->get($this->range, $this->sort, $this->direction),
+            fn (): array => app(JobMetricsData::class)->get($window->key, $this->sort, $this->direction),
             ['jobs' => [], 'totals' => ['classes' => 0, 'processed' => 0, 'failed' => 0, 'slowest' => 0.0]],
             false,
         );
@@ -70,7 +62,7 @@ final class Jobs extends Component
         return view('torque::dashboard.jobs', [
             'jobs' => $data['jobs'],
             'totals' => $data['totals'],
-            'range' => $this->range,
+            'window' => $window,
             'sort' => $this->sort,
             'direction' => $this->direction,
             'deadCount' => $chrome['deadCount'],

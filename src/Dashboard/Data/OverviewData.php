@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Dashboard\Data;
 
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
+use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Stream\JobStream;
@@ -26,19 +27,7 @@ final class OverviewData
     ) {}
 
     /**
-     * Chart ranges: how many buckets of which tier the throughput chart covers.
-     *
-     * @var array<string, array{tier: string, count: int}>
-     */
-    private const array RANGES = [
-        '1h' => ['tier' => MetricsPublisher::TIER_MINUTE, 'count' => 60],
-        '24h' => ['tier' => MetricsPublisher::TIER_HOUR, 'count' => 24],
-        '7d' => ['tier' => MetricsPublisher::TIER_HOUR, 'count' => 168],
-        '90d' => ['tier' => MetricsPublisher::TIER_DAY, 'count' => 90],
-    ];
-
-    /**
-     * @param  string  $range  One of the {@see RANGES} keys; the chart range only.
+     * @param  string  $range  A {@see Range} key; the dashboard's global window.
      * @return array<string, mixed>
      */
     public function get(string $range = '1h'): array
@@ -59,8 +48,8 @@ final class OverviewData
         $buckets = $this->metrics->minuteBuckets(60);
         $jobsLastHour = array_sum($buckets);
 
-        $chart = self::RANGES[$range] ?? self::RANGES['1h'];
-        $counters = $this->metrics->series($chart['tier'], $chart['count']);
+        $window = Range::make($range);
+        $counters = $this->metrics->series($window->tier, $window->count);
 
         $history = array_map(
             static fn (array $outcome): int => $outcome['processed'],
@@ -78,7 +67,7 @@ final class OverviewData
             MetricsPublisher::GAUGE_WORKER_MEMORY_PEAK,
             MetricsPublisher::GAUGE_PENDING,
             MetricsPublisher::GAUGE_DELAYED,
-        ], $chart['tier'], $chart['count']);
+        ], $window->tier, $window->count);
 
         $series = [
             'latency' => array_map(
@@ -192,7 +181,7 @@ final class OverviewData
     #[\NoDiscard]
     public static function isValidRange(string $range): bool
     {
-        return array_key_exists($range, self::RANGES);
+        return Range::isValid($range);
     }
 
     #[\NoDiscard]

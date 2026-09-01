@@ -153,9 +153,10 @@ final class JobStream
      *
      * @param  string|null  $status  Filter: 'active', 'completed', 'failed', or null for all.
      * @param  int  $limit  Maximum number of jobs to return.
+     * @param  int|null  $since  Unix timestamp; drop jobs indexed before it.
      * @return array<int, array{uuid: string, first_event: array, last_event: array}>
      */
-    public function recentJobs(?string $status = null, int $limit = 100): array
+    public function recentJobs(?string $status = null, int $limit = 100, ?int $since = null): array
     {
         $redis = $this->getRedis();
         $indexKey = $this->prefix.'jobs:recent';
@@ -163,9 +164,31 @@ final class JobStream
         // Pull an oversized window so post-filtering by status can still
         // produce a full page for statuses that match only some of the jobs.
         $window = max($limit * 3, 300);
-        $uuids = $redis->execute('ZREVRANGE', $indexKey, '0', (string) ($window - 1));
+
+        // The index is scored by timestamp (see JobStreamRecorder), so the
+        // dashboard's range is applied in Redis rather than after the fact.
+        // The count cap still applies: this index is a rolling tail, so a long
+        // range shows whatever the tail holds, not a guaranteed 90 days.
+        $uuids = $since === null
+            ? $redis->execute('ZREVRANGE', $indexKey, '0', (string) ($window - 1))
+            : $redis->execute(
+                'ZREVRANGEBYSCORE',
+                $indexKey,
+                '+inf',
+                (string) $since,
+                'LIMIT',
+                '0',
+                (string) $window,
+            );
 
         if (! is_array($uuids) || $uuids === []) {
+            // The SCAN fallback is for installs whose recorder never wrote the
+            // index; it knows nothing about the window, so an empty *ranged*
+            // read must only fall through when the index really is empty.
+            if ($since !== null && (int) $redis->execute('ZCARD', $indexKey) > 0) {
+                return [];
+            }
+
             return $this->scanRecentJobs($status, $limit);
         }
 

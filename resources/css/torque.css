@@ -353,6 +353,8 @@ html.nav-collapsed .app { grid-template-columns: 68px 1fr; }
 
 .poll-trigger { min-width: 92px; }
 .poll-trigger .poll-label { font-size: 12px; }
+.range-trigger { min-width: 118px; }
+.range-trigger .range-label { font-size: 12px; }
 .livedot.sm { width: 7px; height: 7px; }
 /* Theme toggle: both icons render, CSS shows the one for the active theme.
    Driven by the <html data-theme> attribute, so no JS expression is involved. */

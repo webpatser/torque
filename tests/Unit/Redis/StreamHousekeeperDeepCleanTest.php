@@ -153,7 +153,7 @@ it('reports every category and changes nothing on a dry run', function () {
     $counts = ($this->housekeeper)()->deepClean(dryRun: true);
 
     expect(array_keys($counts))
-        ->toBe(['job_streams', 'index_members', 'dead_letter', 'consumers', 'legacy_keys'])
+        ->toBe(['job_streams', 'index_members', 'dead_letter', 'consumers', 'legacy_keys', 'host_index'])
         ->and($counts['job_streams'])->toBe(1)
         ->and($counts['index_members'])->toBe(1)
         ->and($counts['legacy_keys'])->toBe(1)
@@ -170,5 +170,6 @@ it('reports zeroes on a clean install', function () {
         'dead_letter' => 0,
         'consumers' => 0,
         'legacy_keys' => 0,
+        'host_index' => 0,
     ]);
 });

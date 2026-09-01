@@ -6,7 +6,7 @@
     $to = min($total, $page * $perPage + $perPage);
 @endphp
 <x-torque::shell title="Dead-letter" crumb="torque:stream:dead-letter" active="dead"
-    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
+    :dead-count="$deadTotal" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
     <div class="card mb16" style="border-color: {{ $deadCount ? 'color-mix(in oklab, var(--bad) 22%, var(--border))' : 'var(--border)' }};">
         <div class="card-pad row between wrap gap16">
@@ -15,10 +15,12 @@
                     <x-torque::icon name="dead" :size="20"/>
                     <span style="font-size: 17px; font-weight: 600;">Dead-letter stream</span>
                 </div>
-                <span class="mono faint" style="font-size: 11.5px;">torque:stream:dead-letter · jobs that exhausted all retries</span>
+                <span class="mono faint" style="font-size: 11.5px;">torque:stream:dead-letter · jobs that exhausted all retries · {{ $window->short }}</span>
             </div>
             <div class="row gap8">
-                <span class="mono" style="font-size: 13px; color: var(--bad); font-weight: 600;">{{ $deadCount }} dead</span>
+                <span class="mono" style="font-size: 13px; color: var(--bad); font-weight: 600;">
+                    {{ $deadCount }} <span>dead</span>@if ($deadTotal > $deadCount)<span class="faint"> / {{ $deadTotal }} total</span>@endif
+                </span>
             </div>
         </div>
     </div>

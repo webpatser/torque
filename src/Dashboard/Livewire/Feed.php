@@ -28,7 +28,11 @@ final class Feed extends Component
 
     public function render()
     {
-        $live = rescue(fn (): array => app(JobsData::class)->list('all'), [], false);
+        $window = $this->range();
+
+        // The index behind this is a rolling tail, so the window narrows what
+        // is shown but a long range still shows only what the tail holds.
+        $live = rescue(fn (): array => app(JobsData::class)->list('all', $window->sinceEpoch()), [], false);
 
         $counts = [
             'all' => count($live),
@@ -57,6 +61,7 @@ final class Feed extends Component
             'jobs' => $jobs,
             'counts' => $counts,
             'tail' => $tail,
+            'window' => $window,
             'deadCount' => $this->chrome()['deadCount'],
             'workerCount' => $this->chrome()['workerCount'],
         ]);

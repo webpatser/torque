@@ -57,6 +57,16 @@ final class MetricsPublisher
     ];
 
     /**
+     * Bucket width of a tier in seconds, for callers that need to align a
+     * window to the same boundaries the series readers use.
+     */
+    #[\NoDiscard]
+    public static function tierSeconds(string $tier): int
+    {
+        return self::TIER_SECONDS[$tier] ?? self::TIER_SECONDS[self::TIER_MINUTE];
+    }
+
+    /**
      * Pre-rollup key that held minute counts as bare integers keyed by minute
      * index. Migrated into the minute tier on first use, then deleted.
      */
@@ -103,6 +113,31 @@ LUA;
      * KEYS[1] gauge hash   ARGV[1] bucket epoch
      * ARGV[2..] metric name / value pairs
      */
+    /**
+     * Several fields of one outcome hash in a single call, for the per-host
+     * scope where one eval covers the whole fleet.
+     *
+     * ARGV comes in triples: field, processed, failed.
+     */
+    private const string LUA_ADD_OUTCOMES = <<<'LUA'
+for i = 1, #ARGV, 3 do
+    local current = redis.call('HGET', KEYS[1], ARGV[i])
+    local processed, failed = 0, 0
+
+    if current then
+        local p, f = string.match(current, '^(%d+),(%d+)$')
+        if p then
+            processed, failed = tonumber(p), tonumber(f)
+        end
+    end
+
+    redis.call('HSET', KEYS[1], ARGV[i],
+        (processed + tonumber(ARGV[i + 1])) .. ',' .. (failed + tonumber(ARGV[i + 2])))
+end
+
+return 1
+LUA;
+
     private const string LUA_ADD_GAUGES = <<<'LUA'
 for i = 2, #ARGV, 2 do
     local field = ARGV[1] .. ':' .. ARGV[i]
@@ -177,6 +212,25 @@ LUA;
 
     /** Jobs scheduled for later across every configured stream. */
     public const string GAUGE_DELAYED = 'delayed';
+
+    /**
+     * Per-host gauges, written to `{prefix}metrics:gauge:{tier}:host:{host}`.
+     *
+     * Slots and memory sum across the host's workers; the peak is the largest
+     * single worker on the box. `workers` is the fleet size there, which is
+     * what lets a reader tell an idle host from one whose workers went away.
+     * No latency: a worker's average is over its whole life, so bucketing it
+     * would draw a flat line that reads like a measurement and is not one.
+     */
+    public const string GAUGE_HOST_BUSY_SLOTS = 'busy_slots';
+
+    public const string GAUGE_HOST_TOTAL_SLOTS = 'total_slots';
+
+    public const string GAUGE_HOST_MEMORY = 'memory_mb';
+
+    public const string GAUGE_HOST_WORKER_MEMORY_PEAK = 'worker_memory_peak_mb';
+
+    public const string GAUGE_HOST_WORKERS = 'workers';
 
     /**
      * Weight of the newest sample in the smoothed throughput EMA. At the
@@ -512,6 +566,297 @@ LUA;
 
             $this->pruneJobIndex(intdiv($now, self::TIER_SECONDS[self::TIER_DAY]) * self::TIER_SECONDS[self::TIER_DAY]);
         }
+    }
+
+    /**
+     * Record the outcomes finished since the previous tick, per host.
+     *
+     * History hangs off the host, not the worker id. A worker mints a fresh
+     * `{host}-{pid}-{hex}` name on every start, so with a 24 hour lifetime a
+     * 16-worker fleet would produce some 5800 ids a year, each with three tiers
+     * of keys and a row in a 90 day view nobody wants to read. Hosts are
+     * machines: bounded, stable across rotation, and already what the workers
+     * screen presents as the identity.
+     *
+     * Every host lives in one hash per tier (field `{bucket}:{host}`) rather
+     * than in a key of its own, which is what keeps the write cost independent
+     * of fleet size: three evals a tick whether there are two hosts or fifty,
+     * against the per-stream scope's three per stream. The workers screen wants
+     * every host at once anyway, so it reads two hashes instead of two per host.
+     *
+     * On Kubernetes the hostname is the pod name, which is re-minted on every
+     * rollout. The index below bounds what the screen shows, but the keys still
+     * grow with pods per retention window; see the note in config/torque.php.
+     *
+     * @param  array<string, array{0: int, 1: int}>  $perHost  Host => [processed, failed] delta.
+     */
+    public function recordHostOutcomes(array $perHost, ?int $now = null): void
+    {
+        if (! $this->metricsEnabled() || $perHost === []) {
+            return;
+        }
+
+        $scopes = [];
+
+        foreach ($perHost as $host => $outcome) {
+            $host = self::normaliseHost((string) $host);
+            $outcome = array_values((array) $outcome);
+            $processed = max(0, (int) ($outcome[0] ?? 0));
+            $failed = max(0, (int) ($outcome[1] ?? 0));
+
+            if ($processed > 0 || $failed > 0) {
+                $scopes[$host] = [$processed, $failed];
+            }
+        }
+
+        if ($scopes === []) {
+            return;
+        }
+
+        $now ??= time();
+        $redis = $this->getRedis();
+
+        foreach (self::TIER_SECONDS as $tier => $seconds) {
+            $bucket = intdiv($now, $seconds) * $seconds;
+            $key = $this->hostRollupKey($tier);
+            $args = [];
+
+            foreach ($scopes as $host => [$processed, $failed]) {
+                $args[] = $bucket.':'.$host;
+                $args[] = $processed;
+                $args[] = $failed;
+            }
+
+            $redis->eval(self::LUA_ADD_OUTCOMES, [$key], $args);
+
+            $this->pruneKey($key, $tier, $bucket);
+        }
+
+        $this->touchHostIndex(array_keys($scopes), $now);
+    }
+
+    /**
+     * Record one gauge sample per metric per host into every tier.
+     *
+     * Same "sum,count,max" fold as {@see recordGauges()} under a host-scoped
+     * field, so it reuses that script unchanged and costs one round trip per
+     * tier however many hosts and metrics there are.
+     *
+     * During a reload takeover two masters on the same box each see half the
+     * fleet, so for those few seconds a host's gauge is the mean of two partial
+     * samples rather than the whole. The counters above are unaffected (they
+     * add), and widening the script to distinguish concurrent publishers is not
+     * worth it for a window that short.
+     *
+     * @param  array<string, array<string, float|int>>  $samples  Host => metric => value.
+     */
+    public function recordHostGauges(array $samples, ?int $now = null): void
+    {
+        if (! $this->metricsEnabled() || $samples === []) {
+            return;
+        }
+
+        $now ??= time();
+        $redis = $this->getRedis();
+        $hosts = [];
+
+        foreach (self::TIER_SECONDS as $tier => $seconds) {
+            $bucket = intdiv($now, $seconds) * $seconds;
+            $key = $this->hostGaugeKey($tier);
+            $args = [(string) $bucket];
+
+            foreach ($samples as $host => $metrics) {
+                $host = self::normaliseHost((string) $host);
+
+                if ($host === '' || ! is_array($metrics) || $metrics === []) {
+                    continue;
+                }
+
+                $hosts[$host] = true;
+
+                foreach ($metrics as $metric => $value) {
+                    $args[] = $host.':'.$metric;
+                    $args[] = (string) round((float) $value, 3);
+                }
+            }
+
+            if (count($args) < 3) {
+                return;
+            }
+
+            $redis->eval(self::LUA_ADD_GAUGES, [$key], $args);
+
+            $this->pruneKey($key, $tier, $bucket);
+        }
+
+        $this->touchHostIndex(array_keys($hosts), $now);
+    }
+
+    /**
+     * Hosts the rollups saw at or after an epoch, with the epoch they were
+     * last seen at.
+     *
+     * The index is scored by last-seen, so "which hosts were alive in the
+     * selected range" is one call rather than a read of every host's series.
+     * A host gone for longer than the range simply is not returned.
+     *
+     * @return array<string, int> Host => last-seen unix epoch.
+     */
+    #[\NoDiscard]
+    public function hostsSeen(int $sinceEpoch = 0): array
+    {
+        if (! $this->metricsEnabled()) {
+            return [];
+        }
+
+        $members = $this->getRedis()->execute(
+            'ZRANGEBYSCORE',
+            $this->hostIndexKey(),
+            (string) max(0, $sinceEpoch),
+            '+inf',
+            'WITHSCORES',
+        );
+
+        if (! is_array($members)) {
+            return [];
+        }
+
+        // Flat [member, score, member, score, ...] reply.
+        $hosts = [];
+        $count = count($members);
+
+        for ($i = 0; $i + 1 < $count; $i += 2) {
+            $hosts[(string) $members[$i]] = (int) $members[$i + 1];
+        }
+
+        ksort($hosts);
+
+        return $hosts;
+    }
+
+    /**
+     * Per-bucket outcomes for several hosts, oldest first and gap-filled.
+     *
+     * Reads exactly the fields the range covers rather than the whole hash:
+     * the minute tier holds a full day for every host at once, so a HGETALL
+     * here would pull a day of every machine on every dashboard poll.
+     *
+     * @param  list<string>  $hosts
+     * @return array<string, array<int, array{processed: int, failed: int}>>
+     */
+    #[\NoDiscard]
+    public function hostSeriesMulti(array $hosts, string $tier, int $count, ?int $now = null): array
+    {
+        $buckets = self::bucketRange($tier, $count, $now);
+        $hosts = array_values(array_unique(array_map(self::normaliseHost(...), $hosts)));
+        $fields = [];
+
+        foreach ($hosts as $host) {
+            foreach ($buckets as $bucket) {
+                $fields[] = $bucket.':'.$host;
+            }
+        }
+
+        $raw = $this->metricsEnabled() ? $this->readFields($this->hostRollupKey($tier), $fields) : [];
+        $series = [];
+
+        foreach ($hosts as $host) {
+            $series[$host] = [];
+
+            foreach ($buckets as $bucket) {
+                $series[$host][$bucket] = self::parseOutcome($raw[$bucket.':'.$host] ?? null);
+            }
+        }
+
+        return $series;
+    }
+
+    /**
+     * Several gauges for several hosts, off a single read of the tier's hash.
+     *
+     * @param  list<string>  $metrics
+     * @param  list<string>  $hosts
+     * @return array<string, array<string, array<int, array{avg: float, max: float}>>> Host => metric => series.
+     */
+    #[\NoDiscard]
+    public function hostGaugeSeriesMulti(array $metrics, array $hosts, string $tier, int $count, ?int $now = null): array
+    {
+        $buckets = self::bucketRange($tier, $count, $now);
+        $hosts = array_values(array_unique(array_map(self::normaliseHost(...), $hosts)));
+        $metrics = array_map(strval(...), $metrics);
+        $fields = [];
+
+        foreach ($hosts as $host) {
+            foreach ($metrics as $metric) {
+                foreach ($buckets as $bucket) {
+                    $fields[] = $bucket.':'.$host.':'.$metric;
+                }
+            }
+        }
+
+        $raw = $this->metricsEnabled() ? $this->readFields($this->hostGaugeKey($tier), $fields) : [];
+        $series = [];
+
+        foreach ($hosts as $host) {
+            foreach ($metrics as $metric) {
+                $series[$host][$metric] = [];
+
+                foreach ($buckets as $bucket) {
+                    $series[$host][$metric][$bucket] = self::parseGauge($raw[$bucket.':'.$host.':'.$metric] ?? null);
+                }
+            }
+        }
+
+        return $series;
+    }
+
+    /**
+     * Note every host that reported this tick, and sweep the index once a day.
+     *
+     * `GT` so two masters on the same box during a reload takeover cannot walk
+     * a score backwards.
+     *
+     * @param  list<string>  $hosts
+     */
+    private function touchHostIndex(array $hosts, int $now): void
+    {
+        if ($hosts === []) {
+            return;
+        }
+
+        $args = [];
+
+        foreach ($hosts as $host) {
+            $args[] = (string) $now;
+            $args[] = $host;
+        }
+
+        $this->getRedis()->execute('ZADD', $this->hostIndexKey(), 'GT', ...$args);
+
+        $this->pruneHostIndex(intdiv($now, self::TIER_SECONDS[self::TIER_DAY]) * self::TIER_SECONDS[self::TIER_DAY]);
+    }
+
+    /**
+     * The bucket start epochs a (tier, count) window covers, oldest first.
+     *
+     * @return list<int>
+     */
+    private static function bucketRange(string $tier, int $count, ?int $now = null): array
+    {
+        $seconds = self::TIER_SECONDS[$tier]
+            ?? throw new \InvalidArgumentException("Unknown metrics tier [{$tier}].");
+
+        $count = max(1, $count);
+        $now ??= time();
+        $current = intdiv($now, $seconds) * $seconds;
+
+        $buckets = [];
+
+        for ($bucket = $current - ($count - 1) * $seconds; $bucket <= $current; $bucket += $seconds) {
+            $buckets[] = $bucket;
+        }
+
+        return $buckets;
     }
 
     /**
@@ -1197,6 +1542,71 @@ LUA;
     }
 
     /**
+     * Drop hosts from the index once they are older than the day tier keeps.
+     *
+     * A ZSET scored by last-seen, so unlike {@see pruneJobIndex()} this is one
+     * command rather than an EXISTS per member. Swept at most once a day.
+     */
+    private function pruneHostIndex(int $currentDayBucket): void
+    {
+        $indexKey = $this->hostIndexKey();
+
+        if (($this->lastPrunedBucket[$indexKey] ?? null) === $currentDayBucket) {
+            return;
+        }
+
+        $this->lastPrunedBucket[$indexKey] = $currentDayBucket;
+
+        $retention = $this->tierRetentionSeconds(self::TIER_DAY);
+
+        // Retention 0 means the day tier keeps everything, so the index does too.
+        if ($retention === 0) {
+            return;
+        }
+
+        $this->getRedis()->execute(
+            'ZREMRANGEBYSCORE',
+            $indexKey,
+            '-inf',
+            '('.($currentDayBucket - $retention),
+        );
+    }
+
+    /**
+     * Read named fields of a hash, omitting the ones that are not set.
+     *
+     * The per-host hashes hold a full retention window for the whole fleet, so
+     * a range read names its fields instead of pulling everything back.
+     *
+     * @param  list<string>  $fields
+     * @return array<string, string>
+     */
+    private function readFields(string $key, array $fields): array
+    {
+        if ($fields === []) {
+            return [];
+        }
+
+        $values = $this->getRedis()->execute('HMGET', $key, ...$fields);
+
+        if (! is_array($values)) {
+            return [];
+        }
+
+        $result = [];
+
+        foreach ($fields as $i => $field) {
+            $value = $values[$i] ?? null;
+
+            if ($value !== null && $value !== false) {
+                $result[$field] = (string) $value;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * @return array{avg: float, max: float}
      */
     private static function parseGauge(?string $value): array
@@ -1275,6 +1685,52 @@ LUA;
     private function jobIndexKey(): string
     {
         return $this->prefix.'metrics:jobs';
+    }
+
+    /**
+     * Per-host rollup and gauge keys: one hash per tier holding every host,
+     * fields `{bucket}:{host}` and `{bucket}:{host}:{metric}`.
+     *
+     * The host is in the field rather than the key so a write covers the whole
+     * fleet in one eval. `pruneKey()` reads the leading epoch off either shape
+     * with an int cast, exactly as it already does for the cluster gauges.
+     */
+    private function hostRollupKey(string $tier): string
+    {
+        return $this->prefix.'metrics:rollup:'.$tier.':host';
+    }
+
+    private function hostGaugeKey(string $tier): string
+    {
+        return $this->prefix.'metrics:gauge:'.$tier.':host';
+    }
+
+    private function hostIndexKey(): string
+    {
+        return $this->prefix.'metrics:hosts';
+    }
+
+    /**
+     * Make a hostname safe to use inside a colon-delimited field.
+     *
+     * A colon in a host would silently invent a field segment, and `*`, `?`,
+     * `[` break the SCAN patterns housekeeping matches on. Anything outside
+     * `[A-Za-z0-9._-]` is replaced, and a short digest is appended whenever the
+     * replacement changed something, so two machines whose names clean to the
+     * same string can never collapse into one row.
+     */
+    #[\NoDiscard]
+    public static function normaliseHost(string $host): string
+    {
+        $clean = preg_replace('/[^A-Za-z0-9._-]/', '_', trim($host)) ?? '';
+
+        if ($clean === '') {
+            return 'unknown';
+        }
+
+        $clean = substr($clean, 0, 48);
+
+        return $clean === $host ? $clean : $clean.'~'.substr(sha1($host), 0, 6);
     }
 
     /**

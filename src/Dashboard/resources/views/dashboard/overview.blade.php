@@ -1,18 +1,11 @@
 @php
     use Webpatser\Torque\Dashboard\Support\Format;
 
-    $rangeLabels = [
-        '1h' => 'jobs / minute · last 60 min',
-        '24h' => 'jobs / hour · last 24 hours',
-        '7d' => 'jobs / hour · last 7 days',
-        '90d' => 'jobs / day · last 90 days',
-    ];
-
     $util = (float) ($totals['util'] ?? 0);
-    $workerCount = $metrics['workers'] ?? count($workers);
+    $workerCount = $metrics['workers'] ?? array_sum(array_map(fn ($h) => count($h['workers']), $hosts));
 @endphp
 <x-torque::shell title="Overview" crumb="torque:status · cluster health" active="overview"
-    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
+    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
     {{-- hero --}}
     <div class="grid-2-hero">
@@ -78,19 +71,17 @@
         <div class="card">
             <div class="card-head">
                 <h3>Throughput</h3>
-                <span class="sub">{{ $rangeLabels[$range] ?? $rangeLabels['1h'] }}</span>
-                <div class="grow"></div>
-                {{-- Server-rendered range switch: a Livewire property rather than
-                     Alpine state, so the poll cycle cannot reset it. --}}
-                <div class="seg">
-                    @foreach (array_keys($rangeLabels) as $key)
-                        <button type="button" wire:click="setRange('{{ $key }}')" @class(['on' => $range === $key])>{{ $key }}</button>
-                    @endforeach
-                </div>
+                {{-- The range is the topbar's, shared with every other card;
+                     this is its readout, not a second control. --}}
+                <span class="sub">{{ $window->label }}</span>
             </div>
             <div class="card-pad" style="padding-top: 14px;">
                 <div style="height: 132px;">
-                    <x-torque::viz.mini-bars :data="$history" :w="760" :h="132" color="var(--accent)"/>
+                    {{-- `full` so the bars scale to the card's grid track. A
+                         fixed 760 spilled out from under the card on any
+                         viewport narrower than that, and .card must not clip
+                         (it would cut off the popovers). --}}
+                    <x-torque::viz.mini-bars :data="$history" :w="760" :h="132" color="var(--accent)" full/>
                 </div>
             </div>
         </div>
@@ -122,21 +113,19 @@
         <div class="card">
             <div class="card-head">
                 <h3>Workers</h3>
-                <span class="sub">slot pressure</span>
+                <span class="sub">slot pressure · per host</span>
                 <div class="grow"></div>
                 <a href="{{ route('torque.workers') }}" wire:navigate class="btn sm">View all <x-torque::icon name="chevR" :size="13"/></a>
             </div>
             <div class="card-pad" style="display: grid; grid-template-columns: 1fr 1fr; gap: 18px;">
-                @forelse ($workers as $w)
-                    <a href="{{ route('torque.workers') }}" wire:navigate class="row gap12" style="cursor: pointer; color: inherit; text-decoration: none;">
-                        <x-torque::viz.slot-ring :busy="$w['busy']" :slots="$w['slots']" :stalled="$w['stalled']" :size="70" :thick="7"/>
+                @forelse ($hosts as $h)
+                    <a href="{{ route('torque.workers') }}" wire:navigate class="row gap12" style="cursor: pointer; color: inherit; text-decoration: none;" @style(['opacity: 0.62' => $h['status'] === 'gone'])>
+                        <x-torque::viz.slot-ring :busy="$h['busy']" :slots="$h['slots']" :stalled="$h['stalled']" :size="70" :thick="7"/>
                         <div class="col" style="gap: 4px; min-width: 0;">
-                            <span class="mono" style="font-size: 12.5px; font-weight: 600; white-space: nowrap;">{{ $w['host'] }}</span>
-                            @if ($w['rpm'] !== null)
-                                <span class="mono" style="font-size: 11.5px; color: var(--accent); white-space: nowrap;">{{ $w['rpm'] }} <span class="faint">rpm</span></span>
-                            @endif
-                            @if ($w['stalled'] > 0)
-                                <span class="mono" style="font-size: 10px; color: var(--warn); white-space: nowrap;">{{ $w['stalled'] }} stalled</span>
+                            <span class="mono" style="font-size: 12.5px; font-weight: 600; white-space: nowrap;">{{ $h['host'] }}</span>
+                            <span class="mono" style="font-size: 11.5px; color: var(--accent); white-space: nowrap;">{{ $h['rpm'] }} <span class="faint">rpm</span></span>
+                            @if ($h['stalled'] > 0)
+                                <span class="mono" style="font-size: 10px; color: var(--warn); white-space: nowrap;">{{ $h['stalled'] }} stalled</span>
                             @endif
                         </div>
                     </a>

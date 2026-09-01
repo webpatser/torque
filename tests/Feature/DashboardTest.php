@@ -51,7 +51,7 @@ it('serves the workers screen', function () {
     $this->actingAs(torqueTestUser())
         ->get('/torque/workers')
         ->assertOk()
-        ->assertSee('Active workers');
+        ->assertSee('Hosts');
 });
 
 it('denies the dashboard when the gate denies', function () {

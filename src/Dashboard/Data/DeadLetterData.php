@@ -21,13 +21,18 @@ final class DeadLetterData
     /**
      * List dead-letter entries (newest first), cursor-paginated via `$before`.
      *
-     * @return array{count: int, jobs: list<array<string, mixed>>}
+     * `count` is the number in the window when one is given, so the pager and
+     * the header agree; `total` is always the whole stream, which is what the
+     * sidebar badge means.
+     *
+     * @param  int|null  $sinceMs  Millisecond epoch; null lists the whole stream.
+     * @return array{count: int, total: int, jobs: list<array<string, mixed>>}
      */
-    public function list(?string $before = null, int $limit = 50): array
+    public function list(?string $before = null, int $limit = 50, ?int $sinceMs = null): array
     {
         $entries = is_string($before) && $before !== ''
-            ? $this->handler->listBefore($before, $limit)
-            : $this->handler->list($limit);
+            ? $this->handler->listBefore($before, $limit, $sinceMs)
+            : $this->handler->list($limit, $sinceMs);
 
         $jobs = array_map(static function (array $entry): array {
             ['ns' => $ns, 'cls' => $cls, 'name' => $name] = JobPresenter::splitName(
@@ -49,7 +54,13 @@ final class DeadLetterData
             ];
         }, $entries);
 
-        return ['count' => $this->handler->count(), 'jobs' => $jobs];
+        $total = $this->handler->count();
+
+        return [
+            'count' => $sinceMs === null ? $total : $this->handler->countSince($sinceMs),
+            'total' => $total,
+            'jobs' => $jobs,
+        ];
     }
 
     /**

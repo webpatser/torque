@@ -1,13 +1,6 @@
 @php
     use Webpatser\Torque\Dashboard\Support\Format;
 
-    $rangeLabels = [
-        '1h' => 'last 60 minutes',
-        '24h' => 'last 24 hours',
-        '7d' => 'last 7 days',
-        '90d' => 'last 90 days',
-    ];
-
     $columns = [
         'name' => ['label' => 'Job class', 'align' => ''],
         'throughput' => ['label' => 'Per minute', 'align' => 'r'],
@@ -15,7 +8,7 @@
     ];
 @endphp
 <x-torque::shell title="Jobs" crumb="per-class throughput and runtime" active="jobs"
-    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
+    :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
     <div class="grid mb16" style="grid-template-columns: repeat(4,1fr);">
         <x-torque::stat label="Job classes" :value="Format::int($totals['classes'])"/>
@@ -28,14 +21,9 @@
         <div class="card-head">
             <x-torque::icon name="layers" :size="15"/>
             <h3>Jobs</h3>
-            <span class="sub">{{ $rangeLabels[$range] ?? $rangeLabels['1h'] }}</span>
-            <div class="grow"></div>
-            {{-- Range and sort are server state, so both survive the poll. --}}
-            <div class="seg">
-                @foreach (array_keys($rangeLabels) as $key)
-                    <button type="button" wire:click="setRange('{{ $key }}')" @class(['on' => $range === $key])>{{ $key }}</button>
-                @endforeach
-            </div>
+            {{-- Readout of the topbar range; sort is this screen's own server
+                 state and survives the poll the same way. --}}
+            <span class="sub">{{ $window->label }}</span>
         </div>
         <div class="tbl-wrap">
             <table class="tbl">
@@ -83,7 +71,7 @@
                                 @endif
                             </td>
                             <td>
-                                <x-torque::viz.mini-bars :data="$job['history']" :w="140" :h="30"
+                                <x-torque::viz.mini-bars :data="$job['history']" :w="140" :h="30" full
                                     :color="$job['failRate'] >= 10 ? 'var(--bad)' : 'var(--accent)'"/>
                             </td>
                         </tr>

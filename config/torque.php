@@ -281,12 +281,24 @@ return [
          *
          * Cluster-wide at the defaults below:
          *   1440 minute fields (24h) + 2160 hour fields (90d) + 730 day fields
-         *   (2y) = ~4300 fields, about 60 KB with hash overhead.
+         *   (2y) = ~4300 fields. Hashes this size are never listpack-encoded,
+         *   so the real cost is the dictEntry plus two sds allocations per
+         *   field, roughly 100 bytes: budget ~430 KB, not the ~60 KB a payload
+         *   count suggests.
          *
-         * The same set exists per stream, so budget another ~60 KB per stream.
+         * The same set exists per stream and per job class, so budget another
+         * ~430 KB for each.
+         *
+         * Per host it is the same 4300 counter fields plus five gauge series,
+         * so roughly 3 MB per machine. Hosts share one hash per tier (field
+         * `{bucket}:{host}`), which keeps the write cost at three round trips a
+         * tick whatever the fleet size, but the storage still scales with the
+         * number of distinct hostnames seen inside the retention window. On
+         * Kubernetes the hostname is the pod name and changes on every rollout,
+         * so that window can hold a lot more hosts than there are machines.
          *
          * `daily_days` at 0 keeps the daily tier forever (it costs 365 fields,
-         * roughly 7 KB, per year).
+         * roughly 36 KB, per year).
          */
         'rollups' => [
             'hourly_days' => 90,
@@ -305,6 +317,14 @@ return [
         'middleware' => ['web', 'auth'],
         'poll_intervals' => [0, 1000, 2000, 5000, 10000, 30000],
         'default_poll_interval' => 1000,
+
+        /*
+         * Time range the dashboard opens on: 1h, 24h, 7d or 90d. One global
+         * window drives every screen (the topbar picker sets it and the session
+         * remembers it), so the throughput chart, the queues table and the
+         * workers cards always show the same period.
+         */
+        'default_range' => '1h',
 
         /*
          * Ceiling of the overview throughput gauge, in jobs per minute.

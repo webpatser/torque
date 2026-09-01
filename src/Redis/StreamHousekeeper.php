@@ -61,6 +61,7 @@ final class StreamHousekeeper
      * @param  list<string>  $queues  Queue names whose consumer groups get swept.
      * @param  int  $maxEntries  Extra hard cap applied after the handler's own policy. 0 = handler only.
      * @param  int  $jobStreamTtl  `job_streams.ttl`, the basis for the orphaned-stream cutoff.
+     * @param  int  $dailyRetentionDays  `metrics.rollups.daily_days`; 0 keeps the day tier forever.
      */
     public function __construct(
         private readonly string $redisUri,
@@ -71,6 +72,7 @@ final class StreamHousekeeper
         private readonly int $maxEntries = 0,
         private readonly bool $cluster = false,
         private readonly int $jobStreamTtl = 300,
+        private readonly int $dailyRetentionDays = 730,
     ) {}
 
     /**
@@ -108,6 +110,7 @@ final class StreamHousekeeper
             maxEntries: $cap,
             cluster: (bool) ($config['redis']['cluster'] ?? false),
             jobStreamTtl: (int) ($config['job_streams']['ttl'] ?? 300),
+            dailyRetentionDays: (int) ($config['metrics']['rollups']['daily_days'] ?? 730),
         );
     }
 
@@ -204,6 +207,8 @@ final class StreamHousekeeper
      *  - `legacy_keys`: the pre-rollup `metrics:buckets` hash (only once its
      *    replacement exists, so the migration cannot be short-circuited) and
      *    worker hashes without a recent heartbeat.
+     *  - `host_index`: hosts the per-host rollups have not seen inside the day
+     *    tier's retention.
      *
      * @param  int  $consumerIdleSeconds  Idle threshold for the consumer sweep.
      * @return array<string, int>
@@ -222,8 +227,46 @@ final class StreamHousekeeper
         $deadLetter = $this->pruneDeadLetter($dryRun);
         $counts['dead_letter'] = max(0, $deadLetter['before'] - $deadLetter['after']);
         $counts['consumers'] = array_sum($this->pruneConsumers($consumerIdleSeconds, $dryRun));
+        $counts['host_index'] = $this->pruneHostIndex($dryRun);
 
         return $counts;
+    }
+
+    /**
+     * Drop hosts the per-host rollups have not seen inside the day tier's
+     * retention.
+     *
+     * The publisher sweeps this index itself once a day, and every per-host key
+     * carries an EXPIRE, so this is a catch-up for an index a master never got
+     * round to: after a long outage, or after an upgrade from a version that
+     * did not write one.
+     */
+    private function pruneHostIndex(bool $dryRun): int
+    {
+        $indexKey = $this->prefix.'metrics:hosts';
+        $retentionDays = max(0, $this->dailyRetentionDays);
+
+        // Zero means the day tier keeps everything, so the index does too.
+        if ($retentionDays === 0) {
+            return 0;
+        }
+
+        $cutoff = time() - $retentionDays * 86400;
+
+        try {
+            if ($dryRun) {
+                $stale = $this->redis()->execute('ZCOUNT', $indexKey, '-inf', '('.$cutoff);
+
+                return is_int($stale) ? $stale : 0;
+            }
+
+            $removed = $this->redis()->execute('ZREMRANGEBYSCORE', $indexKey, '-inf', '('.$cutoff);
+
+            return is_int($removed) ? $removed : 0;
+        } catch (\Throwable) {
+            // Best-effort, like every other sweep here.
+            return 0;
+        }
     }
 
     /**
