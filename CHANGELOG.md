@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-01
+
 ### Added
 - **One time range for the whole dashboard, in the topbar.** The 1h / 24h / 7d / 90d switch used to sit inside two card heads, each driving only its own card and neither remembered anywhere. It is now a picker next to the refresh interval, remembered for the session, and every screen reads it: the throughput chart and its sparklines, the jobs table, the queues counters, the workers cards, the live feed and the dead-letter list. Like the refresh selector it is a `wire:ignore`'d panel driven by the nonce'd chrome script through `Livewire.find().call()`, because a `wire:click` carrying an argument is the one thing Livewire's CSP-safe build cannot be relied on to interpret. The `set-poll` hook is generalised into one `data-torque-action="call"` that both pickers use.
 - **Per-host metric rollups, so the workers screen has a history.** The master now records processed/failed and slot, memory and fleet-size gauges per host into the same minute / hour / day tiers the cluster and per-stream rollups use. History hangs off the host, not the worker id: a worker mints a fresh `{host}-{pid}-{hex}` name on every start, so with a 24 hour lifetime a 16-worker fleet would produce some 5800 of them a year. Every host shares one hash per tier (field `{bucket}:{host}`), which keeps a publish tick at seven extra round trips whatever the fleet size, and a `metrics:hosts` sorted set scored by last-seen answers "which hosts were alive in this range" in one call. `MetricsPublisher::recordHostOutcomes()`, `recordHostGauges()`, `hostsSeen()`, `hostSeriesMulti()` and `hostGaugeSeriesMulti()` expose it.
