@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.7] - 2026-09-01
+
+### Fixed
+- **The shutdown commands no longer carry deadlines shorter than the drain they wait for.** `torque:reload` waited `--timeout` (30) + 5 seconds and then signalled regardless, `torque:stop` waited a hard-coded 30 seconds, and `torque:supervisor` wrote a fixed `stopwaitsecs=60`. None of the three knew about `drain_grace_seconds`, which is the same class of bug 0.16.5 and 0.16.6 fixed inside the worker and the master. All three now derive their default from `MasterProcess::drainWorstCaseSeconds()`, which covers both halves of a drain (the master waiting for an idle fleet, then each worker finishing the job it holds) plus slack. At the default grace of 10 the numbers are unchanged.
+- **`torque:stop` was the only one of the three that actually killed jobs.** Its 30-second window ends in `SIGKILL` on the whole process group, so on an installation sizing the grace for long jobs every stop cut in-flight work off mid-job. It now waits out a full drain, with `--timeout` for operators who want a bounded stop and `--force` unchanged for an immediate kill.
+- **`stopwaitsecs` in a generated Supervisor config now scales with the grace.** With `killasgroup=true` supervisord SIGKILLs the fleet the moment it expires, so the fixed 60 had the same effect as the `torque:stop` window on any `supervisorctl restart`. 60 stays the floor.
+
+### Changed
+- **`torque:reload` only escalates to SIGTERM when the master is past its own ceiling.** A shorter explicit `--timeout` now means "stop watching", not "cut the drain short": the command reports that the master is still draining and returns successfully without signalling, leaving it to the `drain_grace_seconds` it already enforces. This is what a deploy wants when the deploy tool has a run timeout of its own. To be clear about the old behaviour: that SIGTERM did not kill jobs. It reached the master, which forwarded it to the workers, and a worker on SIGTERM still gets its own full grace to finish what it holds. What it did do was give up on a drain that was proceeding normally, while reporting success.
+- The magic `+ 5` on the reload deadline is now a named constant, and `--timeout` has no hard-coded default, so "not given" and "explicitly 30" are finally distinguishable.
+
 ## [0.16.6] - 2026-08-31
 
 ### Fixed

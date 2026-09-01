@@ -120,6 +120,29 @@ it('generates valid supervisor config with required directives', function () {
         ->toContain('killasgroup=true');
 });
 
+it('scales stopwaitsecs with drain_grace_seconds', function () {
+    // killasgroup means supervisord SIGKILLs the whole fleet the moment
+    // stopwaitsecs expires, so a fixed 60 cut through the drain on any
+    // installation that sized the grace for long jobs.
+    config()->set('torque.drain_grace_seconds', 300);
+
+    $this->artisan('torque:supervisor')
+        ->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('stopwaitsecs=615');
+});
+
+it('keeps 60 as the stopwaitsecs floor at the default grace', function () {
+    config()->set('torque.drain_grace_seconds', 10);
+
+    $this->artisan('torque:supervisor')
+        ->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('stopwaitsecs=60');
+});
+
 it('includes correct log path', function () {
     $expectedPath = storage_path('torque-supervisor.conf');
 

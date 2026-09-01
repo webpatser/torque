@@ -26,6 +26,12 @@ use Webpatser\Torque\Support\ProcessInspector;
  * briefly during the swap is harmless: the Redis queue claims jobs
  * atomically, so a job is processed by exactly one worker no matter how
  * many masters are alive at the moment.
+ *
+ * Two clocks are at play and they are not the same one. `--timeout` is how
+ * long *this command* waits before it stops watching; `drain_grace_seconds`
+ * is the ceiling the master and its workers hold themselves to. Left
+ * unset, `--timeout` derives from that ceiling, so the default can no
+ * longer be shorter than the drain it is waiting for.
  */
 #[AsCommand(name: 'torque:reload')]
 final class TorqueReloadCommand extends Command
@@ -35,7 +41,7 @@ final class TorqueReloadCommand extends Command
         {--drain : Only signal the running master to drain; do not spawn a replacement}
         {--if-running : Exit successfully when no master is running instead of failing (for deploy scripts)}
         {--force : Spawn a takeover master even when the running master is supervised}
-        {--timeout=30 : Seconds to wait for the old master to exit after the drain signal}
+        {--timeout= : Seconds to wait for the old master to exit after the drain signal (default: derived from drain_grace_seconds)}
         {--health-timeout=45 : Seconds to wait for the new master to take over the PID file (covers its worker-heartbeat readiness gate)}';
 
     /** @var string */
@@ -72,6 +78,13 @@ final class TorqueReloadCommand extends Command
 
     /** Where the spawned child's stderr is captured for diagnostics. */
     private ?string $stderrPath = null;
+
+    /**
+     * Slack added to an explicit `--timeout` so the operator's number means
+     * "wait this long for the drain" rather than "including the round trip
+     * of signalling and polling".
+     */
+    private const int SIGNAL_SLACK_SECONDS = 5;
 
     public function handle(): int
     {
@@ -113,7 +126,8 @@ final class TorqueReloadCommand extends Command
             return self::FAILURE;
         }
 
-        $drainTimeout = max(0, (int) $this->option('timeout'));
+        $timeoutOption = $this->option('timeout');
+        $drainTimeout = $timeoutOption === null ? null : max(0, (int) $timeoutOption);
         $healthTimeout = max(1, (int) $this->option('health-timeout'));
 
         if ($this->option('drain')) {
@@ -171,8 +185,15 @@ final class TorqueReloadCommand extends Command
 
     /**
      * Signal the old master to drain and wait for it to exit.
+     *
+     * `$timeout` is null when `--timeout` was not given, in which case the
+     * wait covers the master's own worst case and a master still alive past
+     * it is a wedged one, worth a SIGTERM. A shorter explicit timeout means
+     * the caller wanted its own deadline (a deploy tool with a run timeout,
+     * say), not a shorter drain: that path stops watching and leaves the
+     * master to the ceiling it already enforces.
      */
-    private function signalDrain(int $pid, int $timeout): int
+    private function signalDrain(int $pid, ?int $timeout): int
     {
         // The takeover master signals the old one itself the moment it takes
         // the PID file, so by the time this runs the old master may already
@@ -189,7 +210,12 @@ final class TorqueReloadCommand extends Command
             return self::FAILURE;
         }
 
-        $deadline = microtime(true) + $timeout + 5;
+        $worstCase = MasterProcess::drainWorstCaseSeconds(
+            (int) config('torque.drain_grace_seconds', 10),
+        );
+
+        $window = $timeout === null ? $worstCase : $timeout + self::SIGNAL_SLACK_SECONDS;
+        $deadline = microtime(true) + $window;
 
         while (microtime(true) < $deadline) {
             if (! @posix_kill($pid, 0)) {
@@ -201,7 +227,17 @@ final class TorqueReloadCommand extends Command
             usleep(200_000);
         }
 
-        $this->components->warn("Old master (PID: {$pid}) did not exit within the drain window; sending SIGTERM.");
+        if ($window < $worstCase) {
+            $this->components->info(
+                "Old master (PID: {$pid}) is still draining after {$window}s; leaving it to its own "
+                ."drain_grace_seconds ceiling ({$worstCase}s worst case). It stops accepting work "
+                .'from the moment it was signalled and exits on its own.',
+            );
+
+            return self::SUCCESS;
+        }
+
+        $this->components->warn("Old master (PID: {$pid}) did not exit within {$window}s, past its own drain ceiling; sending SIGTERM.");
         @posix_kill($pid, SIGTERM);
 
         return self::SUCCESS;

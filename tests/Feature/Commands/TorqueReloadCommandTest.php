@@ -138,6 +138,54 @@ it('signals SIGUSR2 to the running PID in drain-only mode', function () {
     }
 });
 
+it('leaves a master that is still draining alone when the timeout is shorter than the drain window', function () {
+    // A deploy tool with its own run timeout passes a short --timeout so the
+    // deploy does not block. That must mean "stop watching", not "cut the
+    // drain short": the master keeps the drain_grace_seconds ceiling it
+    // already enforces, so no SIGTERM may be sent.
+    config()->set('torque.drain_grace_seconds', 30);
+
+    $childPid = spawnDeafTorqueMaster(30, [SIGUSR2]);
+    writeMasterPidFile($childPid);
+
+    try {
+        $exit = Artisan::call('torque:reload', [
+            '--drain' => true,
+            '--timeout' => 0,
+        ]);
+
+        expect($exit)->toBe(0)
+            ->and(Artisan::output())->toContain('still draining')
+            ->and(torqueProcessIsAlive($childPid))->toBeTrue();
+    } finally {
+        posix_kill($childPid, SIGKILL);
+        pcntl_waitpid($childPid, $status);
+    }
+});
+
+it('escalates to SIGTERM once the master is past its own drain ceiling', function () {
+    // With the grace at 0 the worst case is the slack alone (15s), so a
+    // master still alive after it is a wedged one. This branch had no
+    // coverage while the deadline was a fixed 35s.
+    config()->set('torque.drain_grace_seconds', 0);
+
+    $childPid = spawnDeafTorqueMaster(60, [SIGUSR2]);
+    writeMasterPidFile($childPid);
+
+    try {
+        $exit = Artisan::call('torque:reload', ['--drain' => true]);
+
+        expect($exit)->toBe(0)
+            ->and(Artisan::output())->toContain('sending SIGTERM')
+            ->and(waitForTorqueExit($childPid, 2))->toBeTrue();
+    } finally {
+        if (torqueProcessIsAlive($childPid)) {
+            posix_kill($childPid, SIGKILL);
+            pcntl_waitpid($childPid, $status);
+        }
+    }
+});
+
 it('returns failure when the spawner reports a failure to spawn', function () {
     $childPid = spawnSleep(30);
     writeMasterPidFile($childPid);

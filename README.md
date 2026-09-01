@@ -285,7 +285,7 @@ All options are in `config/torque.php`. Key settings:
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
 | `max_worker_lifetime_jitter` | 0.1 | Random slice each worker subtracts from its own lifetime, as a ratio. The master forks the fleet inside one second, so without this every worker rotates in the same second. Only ever subtracts; `0.0` disables |
-| `drain_grace_seconds` | 10 | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation, and on how long a draining master waits before stopping its fleet. An idle worker or fleet exits immediately, so size this for the longest job you are willing to wait for. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM |
+| `drain_grace_seconds` | 10 | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation, and on how long a draining master waits before stopping its fleet. An idle worker or fleet exits immediately, so size this for the longest job you are willing to wait for. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM. `torque:reload`, `torque:stop` and the `stopwaitsecs` in a generated Supervisor config all derive their default deadline from it, so raising it never leaves a shutdown path waiting less than a full drain |
 | `takeover_ready_timeout` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
 | `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
 | `metrics.retention` | 86400 | Seconds of per-minute history kept (about 20 bytes per minute) |
@@ -574,6 +574,19 @@ php artisan torque:reload
 The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
 
 During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. Keep `TORQUE_DRAIN_GRACE` (default `10`) below the stream `retry_after` so the brief overlap cannot double-claim jobs. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
+
+#### Two clocks, one ceiling
+
+`--timeout` is how long `torque:reload` itself keeps watching; `drain_grace_seconds` is what the master and its workers hold themselves to. They are not the same number, and the worst case of a drain is twice the grace: the master waits for its fleet to report idle, SIGTERMs it, and then every worker gets the window again for the job it still holds.
+
+Left unset, `--timeout` is derived from that worst case, so the default can never be shorter than the drain it waits for. Passing it explicitly is for deploy tools with a run timeout of their own:
+
+```bash
+# Deployer's run() defaults to a 300s timeout; keep the reload inside it.
+php artisan torque:reload --drain --if-running --timeout=240
+```
+
+A short explicit timeout means "stop watching", not "cut the drain short". Past it the command reports that the master is still draining and returns successfully, without a signal: pickup has been paused since the SIGUSR2, and the master exits on its own once the fleet is idle or the grace runs out. The SIGTERM escalation is reserved for a master still alive past its own ceiling, which is a wedged one. `torque:stop` derives its pre-SIGKILL window the same way and takes the same `--timeout` override.
 
 A drain pause belongs to the master that wrote it, so a master starting into a `drain:<pid>` pause whose PID is no longer running deletes the key and logs it, instead of honouring the rest of its TTL (`drain_grace_seconds + 60`, hours on installations with a long grace) after a reload was killed mid-drain. A deliberate `torque:pause` is never cleared automatically, and `torque:status` names which of the two a pause is.
 

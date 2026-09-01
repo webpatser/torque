@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -20,15 +21,11 @@ final class TorqueStopCommand extends Command
 {
     /** @var string */
     protected $signature = 'torque:stop
-        {--force : Send SIGKILL instead of SIGTERM}';
+        {--force : Send SIGKILL instead of SIGTERM}
+        {--timeout= : Seconds to wait for a graceful shutdown before SIGKILL (default: derived from drain_grace_seconds)}';
 
     /** @var string */
     protected $description = 'Stop the Torque queue worker master process';
-
-    /**
-     * Maximum seconds to wait for the process to exit after SIGTERM.
-     */
-    private const int GRACEFUL_TIMEOUT = 30;
 
     /**
      * Polling interval in microseconds while waiting for process exit.
@@ -98,8 +95,15 @@ final class TorqueStopCommand extends Command
         // Wait for graceful shutdown after SIGTERM.
         $this->components->info('Waiting for graceful shutdown...');
 
+        // This is the one shutdown path that ends in SIGKILL on the whole
+        // process group, so its deadline must clear a full drain: the master
+        // waiting for its fleet, then each worker finishing the job it holds.
+        // A fixed 30s killed in-flight jobs on any installation that sized
+        // drain_grace_seconds for long work.
+        $gracefulTimeout = $this->gracefulTimeout();
+
         $waited = 0;
-        $maxWait = self::GRACEFUL_TIMEOUT * 1_000_000;
+        $maxWait = $gracefulTimeout * 1_000_000;
 
         while ($waited < $maxWait) {
             // posix_kill with signal 0 returns false when the process no longer exists.
@@ -116,7 +120,7 @@ final class TorqueStopCommand extends Command
 
         // Graceful shutdown timed out — escalate to SIGKILL on entire process group.
         $this->components->warn(
-            'Graceful shutdown timed out after '.self::GRACEFUL_TIMEOUT.' seconds. Sending SIGKILL...',
+            "Graceful shutdown timed out after {$gracefulTimeout} seconds. Sending SIGKILL...",
         );
 
         $this->killProcessGroup($pid);
@@ -125,6 +129,27 @@ final class TorqueStopCommand extends Command
         $this->components->info('Torque master and workers killed.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Seconds to wait for a graceful shutdown before escalating to SIGKILL.
+     *
+     * Derived from `drain_grace_seconds` unless `--timeout` says otherwise,
+     * so the wait can never be shorter than the drain the fleet is entitled
+     * to. Idle workers exit immediately (they have since 0.16.5), so a large
+     * ceiling costs nothing on a quiet fleet.
+     */
+    private function gracefulTimeout(): int
+    {
+        $option = $this->option('timeout');
+
+        if ($option !== null) {
+            return max(0, (int) $option);
+        }
+
+        return MasterProcess::drainWorstCaseSeconds(
+            (int) config('torque.drain_grace_seconds', 10),
+        );
     }
 
     /**

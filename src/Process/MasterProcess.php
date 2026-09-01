@@ -27,6 +27,12 @@ use function Fledge\Async\Redis\createRedisClient;
 final class MasterProcess
 {
     /**
+     * Slack added to a derived drain deadline: one monitor tick, one metrics
+     * publish interval, and signal latency between master and workers.
+     */
+    private const int DRAIN_DEADLINE_SLACK = 15;
+
+    /**
      * Compare-and-delete: remove the key only while it still holds the exact
      * value the caller judged. Used by {@see clearStaleDrainPause()} so a
      * drain (or a deliberate `torque:pause`) written between the read and the
@@ -591,6 +597,22 @@ LUA;
         }
 
         return true;
+    }
+
+    /**
+     * Worst case for a full drain, in seconds.
+     *
+     * A drain runs on two clocks that know nothing of each other: the master
+     * waits up to `drain_grace_seconds` for its fleet to report idle and then
+     * SIGTERMs it, after which every worker gets up to `drain_grace_seconds`
+     * again for the job it still has in flight. Any deadline shorter than the
+     * sum gives up while the fleet is still draining normally, which is why
+     * `torque:reload`, `torque:stop` and the generated `stopwaitsecs` all
+     * derive their default from this instead of carrying their own number.
+     */
+    public static function drainWorstCaseSeconds(int $graceSeconds): int
+    {
+        return 2 * max(0, $graceSeconds) + self::DRAIN_DEADLINE_SLACK;
     }
 
     /**

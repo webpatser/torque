@@ -71,3 +71,63 @@ it('cleans up PID file with non-numeric content', function () {
 
     expect(file_exists($pidFile))->toBeFalse();
 });
+
+/*
+ * The graceful window before SIGKILL is derived from `drain_grace_seconds`.
+ * This is the one shutdown path that ends in SIGKILL on the whole process
+ * group, so a window shorter than a full drain kills in-flight jobs. The
+ * fake master ignores SIGTERM so the command always reaches its deadline;
+ * the assertion is on the reported window, not on the kill, because the
+ * helper is not a process-group leader and the group signal never reaches it.
+ */
+
+it('derives the graceful window from drain_grace_seconds', function () {
+    config()->set('torque.drain_grace_seconds', 0);
+
+    $pid = spawnDeafTorqueMaster(60, [SIGTERM]);
+    file_put_contents(storage_path('torque.pid'), (string) $pid);
+
+    try {
+        $this->artisan('torque:stop')
+            ->assertSuccessful()
+            ->expectsOutputToContain('timed out after 15 seconds');
+    } finally {
+        posix_kill($pid, SIGKILL);
+        pcntl_waitpid($pid, $status);
+    }
+});
+
+it('lets an explicit --timeout override the derived window', function () {
+    config()->set('torque.drain_grace_seconds', 600);
+
+    $pid = spawnDeafTorqueMaster(60, [SIGTERM]);
+    file_put_contents(storage_path('torque.pid'), (string) $pid);
+
+    try {
+        $this->artisan('torque:stop', ['--timeout' => 0])
+            ->assertSuccessful()
+            ->expectsOutputToContain('timed out after 0 seconds');
+    } finally {
+        posix_kill($pid, SIGKILL);
+        pcntl_waitpid($pid, $status);
+    }
+});
+
+it('force-kills without waiting out the derived window', function () {
+    config()->set('torque.drain_grace_seconds', 600);
+
+    $pid = spawnDeafTorqueMaster(60, [SIGTERM]);
+    file_put_contents(storage_path('torque.pid'), (string) $pid);
+
+    $startedAt = microtime(true);
+
+    try {
+        $this->artisan('torque:stop', ['--force' => true])
+            ->assertSuccessful();
+
+        expect(microtime(true) - $startedAt)->toBeLessThan(5);
+    } finally {
+        posix_kill($pid, SIGKILL);
+        pcntl_waitpid($pid, $status);
+    }
+});
