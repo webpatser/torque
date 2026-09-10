@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-10
+
 ### Changed
 - **Laravel 13.31 `JobInterrupted` event.** After SIGTERM/SIGINT has been forwarded to an in-flight command implementing `Interruptible`, `WorkerProcess::notifyInterrupted()` now dispatches `Illuminate\Queue\Events\JobInterrupted` with the connection name, the `StreamJob` and the signal, once per command told, so listeners written for the stock worker (laravel/framework 13.31.0, PR #61412) fire the same way on Torque. A command whose `interrupted()` threw is logged and not announced, matching upstream where the exception skips the dispatch. The event class is guarded with `class_exists`, so the `illuminate/*` constraints stay at `^13.25` and the dispatch is a no-op on 13.25 through 13.30.
 
@@ -459,7 +461,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/webpatser/torque/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/webpatser/torque/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/webpatser/torque/compare/v0.16.7...v0.17.0
 [0.16.7]: https://github.com/webpatser/torque/compare/v0.16.6...v0.16.7
