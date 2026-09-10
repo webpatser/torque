@@ -6,6 +6,7 @@ use Illuminate\Bus\Dispatcher as BusDispatcher;
 use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Contracts\Queue\Interruptible;
 use Illuminate\Queue\CallQueuedHandler;
+use Illuminate\Queue\Events\JobInterrupted;
 use Illuminate\Queue\Events\WorkerInterrupted;
 use Illuminate\Queue\Jobs\Job as IlluminateJob;
 use Illuminate\Support\Facades\Event;
@@ -138,3 +139,47 @@ it('forwards to every in-flight Interruptible across slots without stopping on a
     expect($first->receivedSignal)->toBe(SIGTERM)
         ->and($third->receivedSignal)->toBe(SIGTERM);
 });
+
+it('dispatches JobInterrupted exactly once with the job and signal when interrupted() succeeds', function () {
+    Event::fake([JobInterrupted::class]);
+
+    $worker = new WorkerProcess(['redis' => ['uri' => 'redis://127.0.0.1:6379']]);
+
+    $command = new TorqueInterruptibleSpyJob;
+    $job = torque_make_stream_job_with_command($command);
+
+    $worker->notifyInterrupted(SIGTERM, [0 => $job], app(EventDispatcher::class), 'torque', 'default');
+
+    expect($command->receivedSignal)->toBe(SIGTERM);
+
+    Event::assertDispatchedTimes(JobInterrupted::class, 1);
+    Event::assertDispatched(JobInterrupted::class, fn (JobInterrupted $event) => $event->connectionName === 'torque'
+        && $event->job === $job
+        && $event->job->getJobId() === '1-0'
+        && $event->signal === SIGTERM);
+})->skip(
+    ! class_exists(JobInterrupted::class),
+    'Illuminate\Queue\Events\JobInterrupted is only available in illuminate/queue >= 13.31.0',
+);
+
+it('does not dispatch JobInterrupted when interrupted() throws', function () {
+    Event::fake([JobInterrupted::class]);
+
+    $worker = new WorkerProcess(['redis' => ['uri' => 'redis://127.0.0.1:6379']]);
+
+    $command = new class implements Interruptible
+    {
+        public function interrupted(int $signal): void
+        {
+            throw new RuntimeException('boom');
+        }
+    };
+    $job = torque_make_stream_job_with_command($command);
+
+    $worker->notifyInterrupted(SIGTERM, [0 => $job], app(EventDispatcher::class), 'torque', 'default');
+
+    Event::assertNotDispatched(JobInterrupted::class);
+})->skip(
+    ! class_exists(JobInterrupted::class),
+    'Illuminate\Queue\Events\JobInterrupted is only available in illuminate/queue >= 13.31.0',
+);

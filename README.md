@@ -517,6 +517,7 @@ Redis Streams (not LISTs like Horizon) provide:
 | Framework queue pause | `queue:pause` / `queue:pause --all` (13.25) | Honored: global pause stops the worker, per-queue pause skips that stream (keys on the `torque` connection); `torque:pause` stays independent |
 | Enum queue names | `\UnitEnum` accepted by all drivers (13.25) | Same on `StreamQueue` via `enum_value()` |
 | Queue inspection (`all*`) | `allPendingJobs` / `allReservedJobs` / `allDelayedJobs` (13.8) | Same API on `StreamQueue` |
+| Job interrupt event | `JobInterrupted` per `Interruptible` job on SIGTERM/SIGINT (13.31) | Same event per in-flight slot, carrying the `StreamJob` and signal |
 
 ## Production deployment
 

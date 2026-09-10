@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Laravel 13.31 `JobInterrupted` event.** After SIGTERM/SIGINT has been forwarded to an in-flight command implementing `Interruptible`, `WorkerProcess::notifyInterrupted()` now dispatches `Illuminate\Queue\Events\JobInterrupted` with the connection name, the `StreamJob` and the signal, once per command told, so listeners written for the stock worker (laravel/framework 13.31.0, PR #61412) fire the same way on Torque. A command whose `interrupted()` threw is logged and not announced, matching upstream where the exception skips the dispatch. The event class is guarded with `class_exists`, so the `illuminate/*` constraints stay at `^13.25` and the dispatch is a no-op on 13.25 through 13.30.
+
+### Parity
+- Reviewed the laravel/framework v13.31.0 changes to `Illuminate\Queue\Worker`, which `WorkerProcess` mirrors. The `JobInterrupted` dispatch is carried (see Changed). Its companion, PR #61408 (`WorkerStopping` carrying connection and queue when the SIGALRM timeout handler kills the worker), has no counterpart here: Torque has no per-job `pcntl_alarm`, the stalled-job watchdog only logs, and a worker exits through its drain timer without dispatching `WorkerStopping` at all. Noted as a possible standalone enhancement, not carried.
+- Reviewed Horizon v5.49.0 (2026-09-08) and the unreleased 5.x branch through 2026-09-10; no code changes required. Upstream #1811 (CSP nonce escaping) has been in place here since 0.13.0 (`Torque::cspNonce()` escapes with `e()`). Upstream #1814 (immutable/sass bumps) and #1817 (Redis Cluster CI tests) are asset and CI changes that never apply to Torque. Upstream #1815 adds a JSON logs option for the supervised `queue:work` processes (`SupervisorOptions::$json` / `QueueCommandString`); Torque spawns its own `torque:worker` and has no equivalent flag, so this is not parity work, but a JSON log mode for `torque:worker` is noted as a possible standalone enhancement. The only commit after v5.49.0 on 5.x is a changelog update.
+
 ## [0.17.1] - 2026-09-01
 
 ### Changed

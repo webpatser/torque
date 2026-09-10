@@ -12,6 +12,7 @@ use Illuminate\Contracts\Queue\Interruptible;
 use Illuminate\Queue\CallQueuedHandler;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobInterrupted;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Events\Looping;
@@ -265,10 +266,12 @@ LUA;
 
         // Install signal handlers for graceful shutdown.
         // On SIGTERM/SIGINT we (1) flag the worker to stop, (2) dispatch
-        // Laravel's WorkerInterrupted event once, and (3) forward the signal
-        // to every in-flight command implementing Interruptible. This matches
+        // Laravel's WorkerInterrupted event once, (3) forward the signal
+        // to every in-flight command implementing Interruptible and (4)
+        // dispatch JobInterrupted for each one that was told. This matches
         // the behaviour Illuminate\Queue\Worker added in laravel/framework
-        // 13.7.0 (PRs #59833, #59848), adapted for N concurrent fibers.
+        // 13.7.0 (PRs #59833, #59848) and extended in 13.31.0 with the
+        // JobInterrupted event, adapted for N concurrent fibers.
         $primaryQueue = $queues[0] ?? 'default';
         $shutdownHandler = function (int $signal) use ($events, $connectionName, $primaryQueue, &$slotJobs) {
             $this->stopRequested = true;
@@ -880,7 +883,11 @@ LUA;
      * Mirrors Illuminate\Queue\Worker's signal handling (laravel/framework 13.7.0,
      * PRs #59833 and #59848), broadened to N concurrent fibers: each slot's
      * StreamJob is inspected and any user command implementing Interruptible
-     * receives interrupted($signal). Public so the behaviour can be exercised
+     * receives interrupted($signal). Each command that was told is then
+     * announced with a JobInterrupted event carrying the StreamJob, as the
+     * stock worker does since 13.31.0 (PR #61412); a command whose
+     * interrupted() threw is not announced, matching upstream, where the
+     * exception skips the dispatch. Public so the behaviour can be exercised
      * in tests without spinning up the event loop.
      *
      * @param  array<int, StreamJob>  $slotJobs
@@ -915,7 +922,31 @@ LUA;
                 $command->interrupted($signal);
             } catch (\Throwable $e) {
                 fwrite(STDERR, "[torque:worker] Job interrupted({$signal}) threw: {$e->getMessage()}\n");
+
+                continue;
             }
+
+            $this->dispatchJobInterrupted($events, $job, $signal);
+        }
+    }
+
+    /**
+     * Announce a job that has just been told about a shutdown signal.
+     *
+     * The event class only exists from laravel/framework 13.31.0 (PR #61412),
+     * and the `illuminate/queue` constraint stays at `^13.25` so installs on
+     * 13.25 through 13.30 keep working; on those the dispatch is a no-op.
+     */
+    private function dispatchJobInterrupted(Dispatcher $events, StreamJob $job, int $signal): void
+    {
+        if (! class_exists(JobInterrupted::class)) {
+            return;
+        }
+
+        try {
+            $events->dispatch(new JobInterrupted($job->getConnectionName(), $job, $signal));
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] JobInterrupted dispatch failed: {$e->getMessage()}\n");
         }
     }
 
