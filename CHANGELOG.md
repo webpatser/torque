@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-09-10
+
+### Changed
+- Re-release of 0.17.2 with no code changes. The v0.17.2 tag was moved after it had been published, so Packagist saw two commits for one version; 0.17.3 is the clean tag to depend on.
+
 ## [0.17.2] - 2026-09-10
 
 ### Changed
@@ -461,7 +466,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.17.3...HEAD
+[0.17.3]: https://github.com/webpatser/torque/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/webpatser/torque/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/webpatser/torque/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/webpatser/torque/compare/v0.16.7...v0.17.0
