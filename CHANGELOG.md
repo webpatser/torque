@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Parity
+- Reviewed Horizon v5.49.0 and the unreleased 5.x branch through 2026-09-15: the logarithmic auto-scaling strategy (#1818) has no counterpart because Torque scales the fleet on coroutine-slot utilisation rather than per-queue process pools; the Vue "Delayed Until" fix (#1819) touches dashboard columns Torque does not have. Framework v13.32.0 widens `QueueManager::pause()/pauseFor()/resume()` to `UnitEnum|string` (Torque does not call them) and memoises `Job::payload()` with `once()` (`StreamJob` reads it once in its constructor). Nothing to port.
+
 ## [0.17.3] - 2026-09-10
 
 ### Changed
