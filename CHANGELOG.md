@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-30
+
+### Added
+- **Laravel 13.34 `JobProcessed::$duration`.** `WorkerProcess` times the handler (`$job->fire()` only, not event dispatch or the stream acknowledgement) per slot and passes the run time in milliseconds, rounded to two decimals, to `JobProcessed`, so listeners written for the stock worker get the same value on Torque.
+- **Laravel 13.34 `#[CountCrashesAsExceptions]`.** For a job carrying the flag and a `maxExceptions` limit, a processing marker (`job-processing:<uuid>` in the default cache store) is set before the handler runs and removed when the attempt ends, whether it completed, released or failed. Finding the marker on pickup means the previous worker died mid-job and the message came back through the PEL; that counts as one exception, and once `maxExceptions` is reached the job fails permanently with `MaxAttemptsExceededException` (dead letter, `failed()` callback, `JobFailed`) instead of taking down the next worker too, whatever `max_retries` the stream allows. Fitted to the coroutine-slot model: the marker stores the attempt number, so a job released with no delay and picked up by another slot before the releasing slot has cleaned up is not mistaken for a crash, and a late cleanup never clears a newer attempt's marker. A forced drain exit abandons its in-flight jobs on purpose, the way the stock worker's timeout kill does, and clears their markers so the redelivery is not counted. Thrown exceptions keep following the stream's `max_retries` as before. A cache outage skips the check rather than blocking the job. Unlike the stock worker, crashes have their own counter: thrown exceptions keep following the stream's `max_retries` and are not added to it. As with the stock worker's `retry_after`, a job still running past the stream's `retry_after` that another worker steals is counted as a crash.
+
+### Fixed
+- **A pending re-read no longer hands a running job to a second slot.** Every slot in a worker shares one consumer name, so reading this consumer's PEL from `0-0` (on a slot's first loop and every 50th idle one) could return a message another slot was still processing, and the job ran twice concurrently. The pending read now skips messages that are in flight or prefetched in this worker.
+
+### Changed
+- The `illuminate/*` constraints are now `^13.34` (the `JobProcessed` duration argument and the payload flag need it). The `class_exists` guard around the 13.31 `JobInterrupted` dispatch is gone, since the event now always exists.
+- `StreamJob::uuid()` and `maxExceptions()` read the payload decoded at construction instead of decoding the raw body again.
+
 ### Parity
-- Reviewed Horizon v5.50.0 and the unreleased 5.x branch through 2026-09-22: the logarithmic auto-scaling strategy (#1818) has no counterpart because Torque scales the fleet on coroutine-slot utilisation rather than per-queue process pools; the Vue "Delayed Until" fix (#1819) touches dashboard columns Torque does not have. Framework v13.33.0 adds `Worker::$killOnTimeout` and `Worker::killUsing()` around the SIGALRM job timeout; `WorkerProcess` has no per-job alarm or kill path (fibers share one process), so nothing to port.
+- Reviewed laravel/framework v13.34.0 against `WorkerProcess`: `JobProcessed::$duration` and `#[CountCrashesAsExceptions]` are carried (see Added). The SIGALRM handler now also notifies the job of the signal before failing it on timeout; Torque has no per-job alarm (fibers share one process), so there is nothing to mirror.
+- Reviewed Horizon v5.50.0 and the unreleased 5.x branch through 2026-09-30: changelog commit only, nothing to port. Earlier review through 2026-09-22: the logarithmic auto-scaling strategy (#1818) has no counterpart because Torque scales the fleet on coroutine-slot utilisation rather than per-queue process pools; the Vue "Delayed Until" fix (#1819) touches dashboard columns Torque does not have.
+- Framework v13.33.0 adds `Worker::$killOnTimeout` and `Worker::killUsing()` around the SIGALRM job timeout; `WorkerProcess` has no per-job alarm or kill path, so nothing to port.
 
 ## [0.17.3] - 2026-09-10
 
@@ -469,7 +484,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.17.3...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/webpatser/torque/compare/v0.17.3...v0.18.0
 [0.17.3]: https://github.com/webpatser/torque/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/webpatser/torque/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/webpatser/torque/compare/v0.17.0...v0.17.1

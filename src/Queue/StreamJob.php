@@ -121,4 +121,38 @@ class StreamJob extends Job implements JobContract
     {
         return $this->messageId;
     }
+
+    /**
+     * Get the UUID from the payload decoded at construction.
+     *
+     * Same result as Laravel's base implementation, without decoding the
+     * raw body a second time.
+     */
+    #[\Override]
+    public function uuid(): ?string
+    {
+        $uuid = $this->decoded['uuid'] ?? null;
+
+        return is_string($uuid) ? $uuid : null;
+    }
+
+    /**
+     * Get the maximum number of exceptions allowed, from the cached payload.
+     */
+    #[\Override]
+    public function maxExceptions(): ?int
+    {
+        $max = $this->decoded['maxExceptions'] ?? null;
+
+        return $max === null ? null : (int) $max;
+    }
+
+    /**
+     * Whether the job opted into counting worker crashes as exceptions
+     * (`#[CountCrashesAsExceptions]`, laravel/framework 13.34.0).
+     */
+    public function countsCrashesAsExceptions(): bool
+    {
+        return (bool) ($this->decoded['countCrashesAsExceptions'] ?? false);
+    }
 }

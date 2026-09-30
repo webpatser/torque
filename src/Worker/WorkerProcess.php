@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Worker;
 
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Interruptible;
@@ -19,6 +20,7 @@ use Illuminate\Queue\Events\Looping;
 use Illuminate\Queue\Events\WorkerInterrupted;
 use Illuminate\Queue\Events\WorkerPausing;
 use Illuminate\Queue\Events\WorkerResuming;
+use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\Worker;
 use Revolt\EventLoop;
@@ -100,6 +102,16 @@ LUA;
      */
     private array $prefetched = [];
 
+    /**
+     * Messages a slot of this worker is processing right now, keyed
+     * `{stream}|{id}`. Every slot shares one consumer name, so this
+     * consumer's PEL lists them as pending; the pending read must skip them
+     * or a second slot would run the same message concurrently.
+     *
+     * @var array<string, true>
+     */
+    private array $inFlight = [];
+
     /** Limits — set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
@@ -109,6 +121,12 @@ LUA;
 
     /** @var array<string, mixed> */
     private readonly array $config;
+
+    /**
+     * Cache store holding the crash-counting markers, resolved on first use.
+     * False once resolution failed, so a missing store is not retried per job.
+     */
+    private CacheRepository|false|null $crashCache = null;
 
     /** This worker's XREADGROUP consumer name (`{host}-{pid}-{hex}`). */
     public private(set) string $consumerId;
@@ -446,6 +464,9 @@ LUA;
                         continue;
                     }
 
+                    $inFlightKey = $message['stream'].'|'.$message['id'];
+                    $this->inFlight[$inFlightKey] = true;
+
                     $metrics->recordJobStarted();
                     $jobStartTime = hrtime(true);
                     $slotStarts[$fiberIndex] = time();
@@ -462,7 +483,7 @@ LUA;
                             (hrtime(true) - $jobStartTime) / 1_000_000,
                             $queueName,
                         );
-                        unset($slotStarts[$fiberIndex]);
+                        unset($slotStarts[$fiberIndex], $this->inFlight[$inFlightKey]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
 
@@ -496,8 +517,11 @@ LUA;
                         $metrics->recordJobFailed($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
                         $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler, $circuitBreaker);
                     } finally {
+                        // The attempt ran to an end (completed, released or
+                        // failed), so it is not a crash: drop its marker.
+                        $this->forgetProcessingMarker($streamJob);
                         $this->streamActive[$queueName] = max(0, ($this->streamActive[$queueName] ?? 1) - 1);
-                        unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex]);
+                        unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex], $this->inFlight[$inFlightKey]);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
                     }
@@ -547,7 +571,7 @@ LUA;
         // never rotate.
         $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
         $drainStartedAt = null;
-        EventLoop::repeat(1.0, function () use (&$drainStartedAt, &$slotStarts, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey) {
+        EventLoop::repeat(1.0, function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey) {
             if (! $this->hasReachedLimits()) {
                 return;
             }
@@ -572,6 +596,13 @@ LUA;
                 $metricsPublisher->removeWorkerMetrics($this->consumerId);
             } catch (\Throwable) {
                 // Best-effort cleanup; do not block the hard exit.
+            }
+
+            // A forced exit abandons the in-flight jobs on purpose, the way the
+            // stock worker's timeout kill does. Their redelivery is not a crash,
+            // so drop their processing markers before going down.
+            foreach ($slotJobs as $abandoned) {
+                $this->forgetProcessingMarker($abandoned);
             }
 
             $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
@@ -735,7 +766,12 @@ LUA;
         string $consumerGroup,
         \Closure $buildStreamKey,
     ): ?array {
-        $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
+        // The PEL also holds the messages other slots are running and the
+        // prefetched ones waiting for a slot. Read enough entries to get past
+        // all of them, then take the first one nobody here owns.
+        $count = count($this->inFlight) + count($this->prefetched) + 1;
+
+        $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', (string) $count, 'STREAMS'];
 
         foreach ($queues as $queue) {
             $args[] = $buildStreamKey($queue);
@@ -747,7 +783,36 @@ LUA;
 
         $result = $readerRedis->execute('XREADGROUP', ...$args);
 
-        return $this->parseXreadgroupResponse($result);
+        // Built after the await: another fiber may have claimed a message
+        // while this one was waiting on Redis. The caller marks the returned
+        // message in flight before its next suspension point.
+        $taken = $this->inFlight;
+
+        foreach ($this->prefetched as $queued) {
+            $taken[$queued['stream'].'|'.$queued['id']] = true;
+        }
+
+        return self::firstUnclaimed($this->parseXreadgroupMessages($result), $taken);
+    }
+
+    /**
+     * The first pending message that no slot of this worker owns yet.
+     *
+     * Static and pure for unit testing.
+     *
+     * @param  list<array{stream: string, id: string, payload: string}>  $messages
+     * @param  array<string, true>  $taken  Keys `{stream}|{id}`.
+     * @return array{stream: string, id: string, payload: string}|null
+     */
+    public static function firstUnclaimed(array $messages, array $taken): ?array
+    {
+        foreach ($messages as $message) {
+            if (! isset($taken[$message['stream'].'|'.$message['id']])) {
+                return $message;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -933,16 +998,11 @@ LUA;
     /**
      * Announce a job that has just been told about a shutdown signal.
      *
-     * The event class only exists from laravel/framework 13.31.0 (PR #61412),
-     * and the `illuminate/queue` constraint stays at `^13.25` so installs on
-     * 13.25 through 13.30 keep working; on those the dispatch is a no-op.
+     * The event class exists from laravel/framework 13.31.0 (PR #61412);
+     * the `illuminate/*` floor is `^13.34`, so it is always available.
      */
     private function dispatchJobInterrupted(Dispatcher $events, StreamJob $job, int $signal): void
     {
-        if (! class_exists(JobInterrupted::class)) {
-            return;
-        }
-
         try {
             $events->dispatch(new JobInterrupted($job->getConnectionName(), $job, $signal));
         } catch (\Throwable $e) {
@@ -1116,7 +1176,16 @@ LUA;
     ): void {
         $events->dispatch(new JobProcessing($connectionName, $job));
 
+        $this->guardAgainstRepeatedCrashes($job);
+
+        // JobProcessed carries the handler's run time in milliseconds, as the
+        // stock worker reports it since laravel/framework 13.34.0: only fire()
+        // is timed, not the event dispatch or the stream acknowledgement.
+        $startedAt = hrtime(true);
+
         $job->fire();
+
+        $duration = round((hrtime(true) - $startedAt) / 1_000_000, 2);
 
         // If the job handler did not explicitly delete, release, or fail the job,
         // treat it as successfully completed.
@@ -1124,7 +1193,119 @@ LUA;
             $job->delete();
         }
 
-        $events->dispatch(new JobProcessed($connectionName, $job));
+        $events->dispatch(new JobProcessed($connectionName, $job, $duration));
+    }
+
+    /**
+     * Count an unfinished earlier attempt as an exception for jobs marked
+     * `#[CountCrashesAsExceptions]` (laravel/framework 13.34.0).
+     *
+     * Before the handler runs, a processing marker is stored under the job's
+     * UUID; every attempt that ends in this process removes it again. Finding
+     * the marker already there on pickup therefore means the previous worker
+     * died mid-job (OOM, SIGKILL, host loss) and the message came back through
+     * the PEL. That counts as one exception against `maxExceptions`, and once
+     * the limit is reached the job fails with MaxAttemptsExceededException
+     * instead of crashing the next worker too.
+     *
+     * The marker holds the attempt number. Fibers poll constantly, so a job
+     * released with no delay can be picked up by another slot before the
+     * releasing slot's cleanup has run; the new attempt sees a marker from a
+     * different attempt, takes it over and is not counted as a crash. A crash
+     * redelivers the same message, so the attempt number matches.
+     *
+     * Public so the behaviour can be exercised without the event loop.
+     *
+     * @throws MaxAttemptsExceededException
+     */
+    public function guardAgainstRepeatedCrashes(StreamJob $job): void
+    {
+        if (! $job->countsCrashesAsExceptions()
+            || ($uuid = $job->uuid()) === null
+            || ($maxExceptions = $job->maxExceptions()) === null
+            || ($cache = $this->crashCache()) === null) {
+            return;
+        }
+
+        $attempt = $job->attempts();
+
+        try {
+            $marker = 'job-processing:'.$uuid;
+            $expires = now()->addDay();
+
+            if ($cache->add($marker, $attempt, $expires)) {
+                return;
+            }
+
+            if ((int) $cache->get($marker) !== $attempt) {
+                $cache->put($marker, $attempt, $expires);
+
+                return;
+            }
+
+            $counter = 'job-exceptions:'.$uuid;
+
+            if (! $cache->has($counter)) {
+                $cache->put($counter, 0, $expires);
+            }
+
+            $exceeded = (int) $cache->increment($counter) >= $maxExceptions;
+
+            if ($exceeded) {
+                $cache->forget($counter);
+            }
+        } catch (\Throwable $e) {
+            // Crash counting is a safety net; a cache outage must not stop
+            // the job from running.
+            fwrite(STDERR, "[torque:worker] Crash marker check failed for {$uuid}: {$e->getMessage()}\n");
+
+            return;
+        }
+
+        if ($exceeded) {
+            throw MaxAttemptsExceededException::forJob($job);
+        }
+    }
+
+    /**
+     * Remove the job's processing marker, but only the one this attempt set,
+     * so a slower slot finishing an earlier attempt never clears the marker
+     * of a newer attempt that is already running elsewhere.
+     */
+    public function forgetProcessingMarker(StreamJob $job): void
+    {
+        if (! $job->countsCrashesAsExceptions()
+            || ($uuid = $job->uuid()) === null
+            || ($cache = $this->crashCache()) === null) {
+            return;
+        }
+
+        try {
+            $marker = 'job-processing:'.$uuid;
+
+            if ((int) $cache->get($marker) === $job->attempts()) {
+                $cache->forget($marker);
+            }
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] Crash marker cleanup failed for {$uuid}: {$e->getMessage()}\n");
+        }
+    }
+
+    /**
+     * The application's default cache store, as the stock worker uses for its
+     * crash markers, or null when none can be resolved.
+     */
+    private function crashCache(): ?CacheRepository
+    {
+        if ($this->crashCache === null) {
+            try {
+                $this->crashCache = app(CacheRepository::class);
+            } catch (\Throwable) {
+                $this->crashCache = false;
+            }
+        }
+
+        return $this->crashCache ?: null;
     }
 
     /**
@@ -1156,7 +1337,11 @@ LUA;
         // A dontRetry()/dontRetryWhen() verdict from the application's exception
         // handler (Laravel v13.17.0+) forces immediate failure, no matter how
         // many attempts remain — matching Illuminate\Queue\Worker.
-        if (! $this->shouldStopRetries($exception) && $job->attempts() < $maxRetries) {
+        // So does a job whose crashes already used up its maxExceptions.
+        $forceFail = $exception instanceof MaxAttemptsExceededException
+            || $this->shouldStopRetries($exception);
+
+        if (! $forceFail && $job->attempts() < $maxRetries) {
             // Exponential backoff: 2^attempts seconds (2, 4, 8, 16, ...).
             $backoffSeconds = (int) (2 ** $job->attempts());
             $job->release($backoffSeconds);
