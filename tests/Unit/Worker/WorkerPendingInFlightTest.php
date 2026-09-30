@@ -39,3 +39,40 @@ it('keys ownership by stream and id together', function () {
     expect(WorkerProcess::firstUnclaimed($messages, ['torque:default|1-0' => true]))
         ->toBe($messages[0]);
 });
+
+/**
+ * Slot B can finish message M (XACK, then drop it from inFlight) while fiber
+ * A's pending-read reply, built before the XACK, still lists M. A must not
+ * hand the acked job to another slot.
+ */
+it('skips a message that finished while the pending read was awaiting Redis', function () {
+    $messages = [
+        ['stream' => 'torque:default', 'id' => '1-0', 'payload' => 'a'],
+        ['stream' => 'torque:default', 'id' => '2-0', 'payload' => 'b'],
+    ];
+
+    // Before the await M (1-0) is in flight; after it, slot B has released it.
+    $inFlightBefore = ['torque:default|1-0' => true];
+    $inFlightAfter = [];
+    $finishedDuringRead = ['torque:default|1-0' => true];
+
+    expect($inFlightBefore)->toHaveKey('torque:default|1-0')
+        ->and(WorkerProcess::firstUnclaimed($messages, WorkerProcess::takenKeys($inFlightAfter, [], [])))
+        ->toBe($messages[0])
+        ->and(WorkerProcess::firstUnclaimed($messages, WorkerProcess::takenKeys($inFlightAfter, $finishedDuringRead, [])))
+        ->toBe($messages[1]);
+});
+
+it('treats in-flight, finished-during-read and prefetched messages as taken', function () {
+    $taken = WorkerProcess::takenKeys(
+        ['torque:default|1-0' => true],
+        ['torque:default|2-0' => true],
+        [['stream' => 'torque:emails', 'id' => '3-0', 'payload' => 'c']],
+    );
+
+    expect($taken)->toBe([
+        'torque:default|1-0' => true,
+        'torque:default|2-0' => true,
+        'torque:emails|3-0' => true,
+    ]);
+});

@@ -519,7 +519,7 @@ Redis Streams (not LISTs like Horizon) provide:
 | Queue inspection (`all*`) | `allPendingJobs` / `allReservedJobs` / `allDelayedJobs` (13.8) | Same API on `StreamQueue` |
 | Job interrupt event | `JobInterrupted` per `Interruptible` job on SIGTERM/SIGINT (13.31) | Same event per in-flight slot, carrying the `StreamJob` and signal |
 | Job run time | `JobProcessed::$duration` in milliseconds (13.34) | Same, timed around `fire()` per slot |
-| Crash counting | `#[CountCrashesAsExceptions]` counts a worker death mid-job against `maxExceptions` (13.34) | Crashes are counted per slot against `maxExceptions` (thrown exceptions follow the stream's `max_retries`); a forced drain exit is not counted as a crash |
+| Crash counting | `#[CountCrashesAsExceptions]` counts a worker death mid-job against `maxExceptions` (13.34) | Crashes are counted per slot against `maxExceptions` (thrown exceptions follow the stream's `max_retries`); a forced drain exit is not counted as a crash. Known limitation: a job still running past `retry_after` that another worker steals (XAUTOCLAIM) reuses its attempt number and is counted as a crash, so set `retry_after` longer than the longest job |
 
 ## Production deployment
 

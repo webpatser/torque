@@ -112,6 +112,22 @@ LUA;
      */
     private array $inFlight = [];
 
+    /**
+     * Pending re-reads currently awaiting their XREADGROUP reply.
+     */
+    private int $pendingReads = 0;
+
+    /**
+     * Messages whose slot finished while a pending re-read was awaiting
+     * Redis, keyed `{stream}|{id}`. The reply may have been built before the
+     * XACK landed, so it can still list a message that is done; without this
+     * set the read would hand the acked job to a second slot. Cleared once no
+     * pending read is outstanding.
+     *
+     * @var array<string, true>
+     */
+    private array $finishedDuringRead = [];
+
     /** Limits — set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
@@ -483,7 +499,8 @@ LUA;
                             (hrtime(true) - $jobStartTime) / 1_000_000,
                             $queueName,
                         );
-                        unset($slotStarts[$fiberIndex], $this->inFlight[$inFlightKey]);
+                        unset($slotStarts[$fiberIndex]);
+                        $this->releaseInFlight($inFlightKey);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
 
@@ -521,7 +538,8 @@ LUA;
                         // failed), so it is not a crash: drop its marker.
                         $this->forgetProcessingMarker($streamJob);
                         $this->streamActive[$queueName] = max(0, ($this->streamActive[$queueName] ?? 1) - 1);
-                        unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex], $this->inFlight[$inFlightKey]);
+                        unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex]);
+                        $this->releaseInFlight($inFlightKey);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
                     }
@@ -769,7 +787,7 @@ LUA;
         // The PEL also holds the messages other slots are running and the
         // prefetched ones waiting for a slot. Read enough entries to get past
         // all of them, then take the first one nobody here owns.
-        $count = count($this->inFlight) + count($this->prefetched) + 1;
+        $count = count($this->inFlight) + count($this->finishedDuringRead) + count($this->prefetched) + 1;
 
         $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', (string) $count, 'STREAMS'];
 
@@ -781,18 +799,60 @@ LUA;
             $args[] = '0-0';
         }
 
-        $result = $readerRedis->execute('XREADGROUP', ...$args);
+        $this->pendingReads++;
 
-        // Built after the await: another fiber may have claimed a message
-        // while this one was waiting on Redis. The caller marks the returned
-        // message in flight before its next suspension point.
-        $taken = $this->inFlight;
+        try {
+            $result = $readerRedis->execute('XREADGROUP', ...$args);
 
-        foreach ($this->prefetched as $queued) {
-            $taken[$queued['stream'].'|'.$queued['id']] = true;
+            // Built after the await: another fiber may have claimed a message
+            // while this one was waiting on Redis, or finished one the reply
+            // still lists. The caller marks the returned message in flight
+            // before its next suspension point.
+            $taken = self::takenKeys($this->inFlight, $this->finishedDuringRead, $this->prefetched);
+        } finally {
+            if (--$this->pendingReads === 0) {
+                $this->finishedDuringRead = [];
+            }
         }
 
         return self::firstUnclaimed($this->parseXreadgroupMessages($result), $taken);
+    }
+
+    /**
+     * Drop a message from the in-flight set once its slot is done with it.
+     * While a pending re-read is awaiting Redis, remember the message so that
+     * read cannot hand it out again from a reply built before the XACK.
+     */
+    private function releaseInFlight(string $key): void
+    {
+        unset($this->inFlight[$key]);
+
+        if ($this->pendingReads > 0) {
+            $this->finishedDuringRead[$key] = true;
+        }
+    }
+
+    /**
+     * Every `{stream}|{id}` the pending read must skip: messages in flight
+     * now, messages finished while the read was awaiting Redis, and the
+     * prefetched ones waiting for a slot.
+     *
+     * Static and pure for unit testing.
+     *
+     * @param  array<string, true>  $inFlight
+     * @param  array<string, true>  $finishedDuringRead
+     * @param  list<array{stream: string, id: string, payload: string}>  $prefetched
+     * @return array<string, true>
+     */
+    public static function takenKeys(array $inFlight, array $finishedDuringRead, array $prefetched): array
+    {
+        $taken = $inFlight + $finishedDuringRead;
+
+        foreach ($prefetched as $queued) {
+            $taken[$queued['stream'].'|'.$queued['id']] = true;
+        }
+
+        return $taken;
     }
 
     /**
