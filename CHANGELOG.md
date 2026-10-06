@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Parity
+- Reviewed the unreleased Horizon 5.x branch through 2026-10-01: the moment and axios dashboard-asset bumps only, nothing to port.
+
 ## [0.18.0] - 2026-09-30
 
 ### Added
