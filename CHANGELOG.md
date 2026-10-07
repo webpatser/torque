@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Parity
 - Reviewed laravel/framework v13.34.0 against `WorkerProcess`: `JobProcessed::$duration` and `#[CountCrashesAsExceptions]` are carried (see Added). The SIGALRM handler now also notifies the job of the signal before failing it on timeout; Torque has no per-job alarm (fibers share one process), so there is nothing to mirror.
-- Reviewed Horizon v5.50.0 and the unreleased 5.x branch through 2026-09-30: changelog commit only, nothing to port. Earlier review through 2026-09-22: the logarithmic auto-scaling strategy (#1818) has no counterpart because Torque scales the fleet on coroutine-slot utilisation rather than per-queue process pools; the Vue "Delayed Until" fix (#1819) touches dashboard columns Torque does not have.
+- Reviewed Horizon v5.50.0 and the unreleased 5.x branch through 2026-10-01: changelog commit only, plus the 2026-10-01 moment 2.31.0 and axios 1.20.0 dashboard asset bumps, nothing to port. Earlier review through 2026-09-22: the logarithmic auto-scaling strategy (#1818) has no counterpart because Torque scales the fleet on coroutine-slot utilisation rather than per-queue process pools; the Vue "Delayed Until" fix (#1819) touches dashboard columns Torque does not have.
+- Reviewed Laravel v13.35.0 framework drift: `Worker::memoryExceeded` (and `WorkerOptions` / `WorkCommand --memory`) now accepts a percentage (`int|string`); Torque's `WorkerProcess` has no memory-limit logic, so nothing carried.
 - Framework v13.33.0 adds `Worker::$killOnTimeout` and `Worker::killUsing()` around the SIGALRM job timeout; `WorkerProcess` has no per-job alarm or kill path, so nothing to port.
 
 ## [0.17.3] - 2026-09-10
