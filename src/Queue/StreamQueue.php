@@ -163,7 +163,6 @@ class StreamQueue extends Queue implements QueueContract
      * @param  \UnitEnum|string|null  $queue
      * @return string The stream message ID.
      */
-    #[\NoDiscard]
     #[\Override]
     public function push($job, $data = '', $queue = null): string
     {
@@ -183,7 +182,6 @@ class StreamQueue extends Queue implements QueueContract
      * @param  \UnitEnum|string|null  $queue
      * @return string The stream message ID.
      */
-    #[\NoDiscard]
     #[\Override]
     public function pushRaw($payload, $queue = null, array $options = []): string
     {
@@ -227,7 +225,6 @@ class StreamQueue extends Queue implements QueueContract
      * @param  \UnitEnum|string|null  $queue
      * @return string The payload UUID.
      */
-    #[\NoDiscard]
     #[\Override]
     public function later($delay, $job, $data = '', $queue = null): string
     {

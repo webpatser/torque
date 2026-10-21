@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`queue:retry` and job batches no longer crash on PHP 8.5.** `StreamQueue::push()`, `pushRaw()` and `later()` implement the framework's `Queue` contract, whose callers routinely ignore the returned id (`RetryCommand::retryJob()`, the inherited `Queue::bulk()` behind `Bus::batch()`, packages and app code calling `Queue::connection('torque')->push(...)`). The `#[\NoDiscard]` attribute on them turned each such call into a warning that Laravel's error handler raises as an `ErrorException`, so `php artisan queue:retry all` failed on a Torque connection. The attribute is removed from the three contract methods; the returned message id and payload UUID are unchanged.
+
 ### Parity
 - Reviewed the unreleased Horizon 5.x branch through 2026-10-01: the moment and axios dashboard-asset bumps only, nothing to port.
 - Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-10-13: dashboard asset and CI bumps, a chokidar 5 file-watcher fix (Torque has no watcher), and changelog commits; nothing to port.

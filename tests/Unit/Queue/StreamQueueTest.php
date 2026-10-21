@@ -131,3 +131,15 @@ it('falls back to the default queue for null and empty names', function () {
         ->and($queue->getQueue(''))->toBe('emails')
         ->and($queue->getStreamKey(''))->toBe('app:emails');
 });
+
+// -------------------------------------------------------------------------
+//  Queue contract compatibility
+// -------------------------------------------------------------------------
+
+it('does not mark queue contract push methods as NoDiscard', function (string $method) {
+    // Framework code (queue:retry, Queue::bulk) and third-party packages call
+    // these through the Queue contract and ignore the returned id.
+    $attributes = (new ReflectionMethod(StreamQueue::class, $method))->getAttributes(NoDiscard::class);
+
+    expect($attributes)->toBeEmpty();
+})->with(['push', 'pushRaw', 'later']);
