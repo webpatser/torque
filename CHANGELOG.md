@@ -5,7 +5,7 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.1] - 2026-10-21
 
 ### Fixed
 - **`queue:retry` and job batches no longer crash on PHP 8.5.** `StreamQueue::push()`, `pushRaw()` and `later()` implement the framework's `Queue` contract, whose callers routinely ignore the returned id (`RetryCommand::retryJob()`, the inherited `Queue::bulk()` behind `Bus::batch()`, packages and app code calling `Queue::connection('torque')->push(...)`). The `#[\NoDiscard]` attribute on them turned each such call into a warning that Laravel's error handler raises as an `ErrorException`, so `php artisan queue:retry all` failed on a Torque connection. The attribute is removed from the three contract methods; the returned message id and payload UUID are unchanged.
