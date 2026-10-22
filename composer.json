@@ -11,7 +11,7 @@
         "illuminate/support": "^13.34",
         "livewire/livewire": "^4.0",
         "revolt/event-loop": "^1.0",
-        "webpatser/fledge-fiber": "^13.4"
+        "webpatser/fledge-fiber": "^13.38"
     },
     "suggest": {
         "ext-igbinary": "Enables ~2x faster job payload encoding when TORQUE_SERIALIZER=igbinary is set, and globally speeds up PHP serialize() (sessions, cache) when igbinary.compact_strings is on."
