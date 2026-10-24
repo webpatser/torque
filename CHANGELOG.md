@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.3] - 2026-10-24
+
+### Fixed
+- **`afterCommit` jobs dispatched inside a database transaction no longer throw a `TypeError`.** `StreamQueue::push()` and `later()` returned `enqueueUsing()`'s result under a `string` return type, but the framework's `Queue::enqueueUsing()` returns null when a job that dispatches after commit (`->afterCommit()`, `$afterCommit = true` or the connection's `after_commit` option) is deferred to the open transaction. Any such dispatch inside `DB::transaction()` failed with `Return value must be of type string, null returned`. Both methods are now typed `?string`: they return the message id or payload UUID as before for a regular job, and null for an after-commit job, whose id the framework's transactions manager discards; such a job is enqueued on commit (or at once when no transaction is open) and dropped on rollback, as with Laravel's own drivers.
+
 ### Parity
 - Reviewed the unreleased Horizon 5.x branch through 2026-10-20: nothing to port.
 

@@ -161,10 +161,14 @@ class StreamQueue extends Queue implements QueueContract
      * @param  object|string  $job
      * @param  mixed  $data
      * @param  \UnitEnum|string|null  $queue
-     * @return string The stream message ID.
+     * @return string|null The stream message ID, or null when the job dispatches
+     *                     after commit: the framework then hands it to the
+     *                     transactions manager, which enqueues it once the open
+     *                     transaction commits (dropped on rollback), or at once
+     *                     when none is open, and discards the id either way.
      */
     #[\Override]
-    public function push($job, $data = '', $queue = null): string
+    public function push($job, $data = '', $queue = null): ?string
     {
         return $this->enqueueUsing(
             $job,
@@ -223,10 +227,14 @@ class StreamQueue extends Queue implements QueueContract
      * @param  object|string  $job
      * @param  mixed  $data
      * @param  \UnitEnum|string|null  $queue
-     * @return string The payload UUID.
+     * @return string|null The payload UUID, or null when the job dispatches
+     *                     after commit: the framework then hands it to the
+     *                     transactions manager, which enqueues it once the open
+     *                     transaction commits (dropped on rollback), or at once
+     *                     when none is open, and discards the id either way.
      */
     #[\Override]
-    public function later($delay, $job, $data = '', $queue = null): string
+    public function later($delay, $job, $data = '', $queue = null): ?string
     {
         return $this->enqueueUsing(
             $job,
