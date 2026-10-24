@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Queue\Jobs\InspectedJob;
 use Illuminate\Support\Collection;
@@ -223,6 +224,57 @@ it('excludes auxiliary keys (paused, :delayed) from queue enumeration', function
 
     expect($pending)->toHaveCount(1);
     expect($pending->first()->uuid)->toBe('real-1');
+});
+
+// -------------------------------------------------------------------------
+//  Enumeration uses SCAN, never KEYS
+// -------------------------------------------------------------------------
+
+/**
+ * Call counts for one Redis command, from INFO commandstats.
+ */
+function torqueRedisCommandCalls(RedisClient $redis, string $command): int
+{
+    $stats = (string) $redis->execute('INFO', 'commandstats');
+
+    return preg_match('/^cmdstat_'.$command.':calls=(\d+)/m', $stats, $m) === 1 ? (int) $m[1] : 0;
+}
+
+it('enumerates queues with SCAN and never issues KEYS', function () {
+    (void) $this->streamQueue->pushRaw(
+        json_encode(['uuid' => 'scan-1', 'displayName' => 'JobS', 'attempts' => 0]),
+        'default',
+    );
+
+    $redis = $this->streamQueue->getRedisClient();
+    $keysBefore = torqueRedisCommandCalls($redis, 'keys');
+    $scanBefore = torqueRedisCommandCalls($redis, 'scan');
+
+    $pending = $this->streamQueue->allPendingJobs();
+
+    expect($pending)->toHaveCount(1)
+        ->and(torqueRedisCommandCalls($redis, 'keys'))->toBe($keysBefore)
+        ->and(torqueRedisCommandCalls($redis, 'scan'))->toBeGreaterThan($scanBefore);
+});
+
+it('finds every queue across a keyspace larger than one SCAN page', function () {
+    $redis = $this->streamQueue->getRedisClient();
+
+    // Enough bookkeeping keys that a single SCAN page cannot cover them all.
+    for ($i = 0; $i < 1500; $i++) {
+        $redis->execute('SET', $this->testPrefix.'job:filler-'.$i, '1');
+    }
+
+    foreach (['default', 'priority', 'emails'] as $i => $queue) {
+        (void) $this->streamQueue->pushRaw(
+            json_encode(['uuid' => 'page-'.$i, 'displayName' => 'JobP', 'attempts' => 0]),
+            $queue,
+        );
+    }
+
+    $uuids = $this->streamQueue->allPendingJobs()->map(fn (InspectedJob $job) => $job->uuid)->sort()->values()->all();
+
+    expect($uuids)->toBe(['page-0', 'page-1', 'page-2']);
 });
 
 // -------------------------------------------------------------------------

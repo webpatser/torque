@@ -546,16 +546,48 @@ class StreamQueue extends Queue implements QueueContract
      */
     private function allQueueNames(): Collection
     {
-        /** @var list<string> $keys */
-        $keys = $this->redis->execute('KEYS', $this->prefix.'*') ?: [];
-
-        return (new Collection($keys))
+        return (new Collection($this->scanPrefixedKeys()))
             ->map(fn (string $key) => Str::after($key, $this->prefix))
             ->map(fn (string $name) => str_contains($name, ':') ? Str::before($name, ':') : $name)
             ->reject(fn (string $name) => $name === '' || in_array($name, self::RESERVED_NAMESPACES, true))
             ->map(fn (string $name) => $this->cluster ? trim($name, '{}') : $name)
             ->unique()
             ->values();
+    }
+
+    /**
+     * Every key under the prefix, gathered with incremental SCAN.
+     *
+     * Never KEYS: the dashboard calls this on every load, and KEYS blocks the
+     * whole server for the duration of the sweep on a large keyspace. SCAN may
+     * return a key more than once; callers de-duplicate.
+     *
+     * @return list<string>
+     */
+    private function scanPrefixedKeys(): array
+    {
+        // Glob metacharacters in the prefix must match literally.
+        $pattern = preg_replace('/[\\\\*?\[\]]/', '\\\\$0', $this->prefix).'*';
+
+        $keys = [];
+        $cursor = '0';
+
+        do {
+            /** @var array{0: string|int, 1: list<string>}|null $result */
+            $result = $this->redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '500');
+
+            if (! is_array($result)) {
+                break;
+            }
+
+            $cursor = (string) $result[0];
+
+            foreach ($result[1] ?? [] as $key) {
+                $keys[] = (string) $key;
+            }
+        } while ($cursor !== '0');
+
+        return $keys;
     }
 
     /**
