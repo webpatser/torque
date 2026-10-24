@@ -357,8 +357,6 @@ function cleanupRollups(MetricsPublisher $publisher, string $prefix, array $queu
             $redis->execute('DEL', $prefix.'metrics:rollup:'.$tier.':'.$queue);
         }
     }
-
-    $redis->execute('DEL', $prefix.'metrics:buckets');
 }
 
 it('records outcomes into every tier at once', function () {
@@ -472,35 +470,6 @@ it('prunes each tier on its own schedule', function () {
             ->and($redis->execute('HLEN', $prefix.'metrics:rollup:day'))->toBe(2)
             // The expiry safety net covers the key itself, not just its fields.
             ->and((int) $redis->execute('TTL', $prefix.'metrics:rollup:minute'))->toBeGreaterThan(0);
-
-        cleanupRollups($publisher, $prefix);
-    } catch (RedisException $e) {
-        $this->markTestSkipped('Redis not available: '.$e->getMessage());
-    }
-});
-
-it('migrates the pre-rollup buckets hash into the minute tier', function () {
-    $prefix = 'torque-migrate-test:';
-    $publisher = createPublisher($prefix);
-    $now = time();
-    $minuteIndex = intdiv($now, 60);
-
-    try {
-        cleanupRollups($publisher, $prefix);
-
-        $redis = (new ReflectionClass($publisher))
-            ->getMethod('getRedis')
-            ->invoke($publisher);
-
-        // The old shape: minute index => bare processed count.
-        $redis->execute('HSET', $prefix.'metrics:buckets', (string) ($minuteIndex - 1), '120', (string) $minuteIndex, '8');
-
-        $buckets = $publisher->minuteBuckets(2, $now);
-
-        expect(array_values($buckets))->toBe([120, 8])
-            // Rescaled to bucket epochs and the legacy key is gone.
-            ->and(array_keys($buckets))->toBe([($minuteIndex - 1) * 60, $minuteIndex * 60])
-            ->and((int) $redis->execute('EXISTS', $prefix.'metrics:buckets'))->toBe(0);
 
         cleanupRollups($publisher, $prefix);
     } catch (RedisException $e) {

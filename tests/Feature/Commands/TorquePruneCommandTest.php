@@ -47,7 +47,7 @@ it('deletes idle consumers without pending messages and keeps busy ones', functi
 
 /*
  * --deep adds the upgrade sweep (orphaned job streams, stale index members,
- * legacy metric keys) to the routine trim, and reports every category.
+ * stale worker hashes) to the routine trim, and reports every category.
  */
 
 it('sweeps upgrade leftovers with --deep', function () {
@@ -59,7 +59,7 @@ it('sweeps upgrade leftovers with --deep', function () {
 
     expect($output)->toContain('Orphaned job streams')
         ->and($output)->toContain('Stale index members')
-        ->and($output)->toContain('Legacy metric keys')
+        ->and($output)->toContain('Stale worker hashes')
         ->and((int) $this->redis->execute('EXISTS', 'torque-test:job:abandoned'))->toBe(0)
         ->and($this->redis->execute('ZRANGE', 'torque-test:jobs:recent', '0', '-1'))->toBe([]);
 });

@@ -90,21 +90,6 @@ it('removes an orphaned stream and its index member in one pass', function () {
         ->and($this->redis->execute('ZRANGE', $this->prefix.'jobs:active', '0', '-1'))->toBe([]);
 });
 
-it('removes the legacy bucket hash only once its replacement exists', function () {
-    $this->redis->execute('HSET', $this->prefix.'metrics:buckets', '29000000', '5');
-
-    expect(($this->housekeeper)()->deepClean()['legacy_keys'])->toBe(0)
-        ->and((int) $this->redis->execute('EXISTS', $this->prefix.'metrics:buckets'))->toBe(1);
-
-    // Once the minute rollup exists, the migration has run and the old hash
-    // is safe to drop.
-    $this->redis->execute('HSET', $this->prefix.'metrics:rollup:minute', '1756339200', '5,0');
-
-    expect(($this->housekeeper)()->deepClean()['legacy_keys'])->toBe(1)
-        ->and((int) $this->redis->execute('EXISTS', $this->prefix.'metrics:buckets'))->toBe(0)
-        ->and((int) $this->redis->execute('EXISTS', $this->prefix.'metrics:rollup:minute'))->toBe(1);
-});
-
 it('removes worker hashes without a recent heartbeat', function () {
     $this->redis->execute('HSET', $this->prefix.'worker:live', 'last_heartbeat', (string) time());
     $this->redis->execute('HSET', $this->prefix.'worker:ghost', 'last_heartbeat', (string) (time() - 600));
@@ -112,7 +97,7 @@ it('removes worker hashes without a recent heartbeat', function () {
 
     $counts = ($this->housekeeper)()->deepClean();
 
-    expect($counts['legacy_keys'])->toBe(2)
+    expect($counts['worker_hashes'])->toBe(2)
         ->and((int) $this->redis->execute('EXISTS', $this->prefix.'worker:live'))->toBe(1)
         ->and((int) $this->redis->execute('EXISTS', $this->prefix.'worker:ghost'))->toBe(0)
         ->and((int) $this->redis->execute('EXISTS', $this->prefix.'worker:nameless'))->toBe(0);
@@ -153,10 +138,10 @@ it('reports every category and changes nothing on a dry run', function () {
     $counts = ($this->housekeeper)()->deepClean(dryRun: true);
 
     expect(array_keys($counts))
-        ->toBe(['job_streams', 'index_members', 'dead_letter', 'consumers', 'legacy_keys', 'host_index'])
+        ->toBe(['job_streams', 'index_members', 'dead_letter', 'consumers', 'worker_hashes', 'host_index'])
         ->and($counts['job_streams'])->toBe(1)
         ->and($counts['index_members'])->toBe(1)
-        ->and($counts['legacy_keys'])->toBe(1)
+        ->and($counts['worker_hashes'])->toBe(1)
         ->and((int) $this->redis->execute('EXISTS', $this->prefix.'job:abandoned'))->toBe(1)
         ->and($this->redis->execute('ZRANGE', $this->prefix.'jobs:recent', '0', '-1'))->toBe(['vanished'])
         ->and((int) $this->redis->execute('EXISTS', $this->prefix.'worker:ghost'))->toBe(1)
@@ -169,7 +154,7 @@ it('reports zeroes on a clean install', function () {
         'index_members' => 0,
         'dead_letter' => 0,
         'consumers' => 0,
-        'legacy_keys' => 0,
+        'worker_hashes' => 0,
         'host_index' => 0,
     ]);
 });

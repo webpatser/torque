@@ -271,7 +271,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
 | `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
 | `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
-| `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--deep` also sweeps orphaned job streams, stale index members and legacy keys; `--dry-run` to preview |
+| `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--deep` also sweeps orphaned job streams, stale index members and stale worker hashes; `--dry-run` to preview |
 | `torque:supervisor` | Generate a Supervisor config file |
 
 ## Configuration
@@ -550,7 +550,7 @@ A few settings on the Redis instance and the app side that keep a failure storm 
 
 Version-specific notes live in [UPGRADE.md](UPGRADE.md).
 
-Leftovers from a previous version (per-job event streams that never got their terminal expiry, index members pointing at streams that are gone, legacy metric keys) are cleaned up automatically on the first `torque:start` after the deploy: the master runs the sweep once per version and records it in `{prefix}version`, logging a count per category.
+Leftovers from a previous version (per-job event streams that never got their terminal expiry, index members pointing at streams that are gone, worker hashes of exited processes, the pre-rollup `metrics:buckets` hash) are cleaned up automatically on the first `torque:start` after the deploy: the master runs the sweep once per version and records it in `{prefix}version`, logging a count per category.
 
 To preview it before restarting the fleet, run `php artisan torque:prune --deep --dry-run` and then the same command without `--dry-run`. `torque:status` shows the recorded data version next to the installed one.
 

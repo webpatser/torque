@@ -67,12 +67,6 @@ final class MetricsPublisher
     }
 
     /**
-     * Pre-rollup key that held minute counts as bare integers keyed by minute
-     * index. Migrated into the minute tier on first use, then deleted.
-     */
-    private const string LEGACY_BUCKETS_SUFFIX = 'metrics:buckets';
-
-    /**
      * Add an outcome pair to one bucket of one rollup hash.
      *
      * The value is a compact "processed,failed" string, so it cannot be
@@ -263,9 +257,6 @@ LUA;
      * @var array{0: int, 1: list<string>}|null
      */
     private ?array $lastHostIndexTouch = null;
-
-    /** Whether the one-time legacy key migration has been attempted. */
-    private bool $legacyMigrated = false;
 
     /**
      * @param  array<string, mixed>  $settings  The `torque.metrics` config block (enabled, retention, rollups).
@@ -469,7 +460,6 @@ LUA;
         }
 
         $now ??= time();
-        $this->migrateLegacyBuckets();
         $redis = $this->getRedis();
 
         foreach (self::TIER_SECONDS as $tier => $seconds) {
@@ -1455,45 +1445,6 @@ LUA;
     }
 
     /**
-     * Move the pre-rollup `metrics:buckets` hash into the minute tier.
-     *
-     * Its fields were minute indices holding a bare processed count, so they
-     * are rescaled to bucket epochs and given a zero failure count. Runs once
-     * per process, costing a single EXISTS when there is nothing to do.
-     */
-    private function migrateLegacyBuckets(): void
-    {
-        if ($this->legacyMigrated) {
-            return;
-        }
-
-        $this->legacyMigrated = true;
-
-        $redis = $this->getRedis();
-        $legacyKey = $this->prefix.self::LEGACY_BUCKETS_SUFFIX;
-
-        if ((int) $redis->execute('EXISTS', $legacyKey) !== 1) {
-            return;
-        }
-
-        $raw = $redis->execute('HGETALL', $legacyKey);
-
-        if (is_array($raw) && $raw !== []) {
-            $target = $this->rollupKey(self::TIER_MINUTE, null);
-
-            foreach ($this->flatPairsToAssoc($raw) as $minuteIndex => $processed) {
-                $redis->eval(
-                    self::LUA_ADD_OUTCOME,
-                    [$target],
-                    [(string) ((int) $minuteIndex * self::BUCKET_SECONDS), (int) $processed, 0],
-                );
-            }
-        }
-
-        $redis->execute('DEL', $legacyKey);
-    }
-
-    /**
      * Read a whole rollup hash as field => raw "processed,failed" value.
      *
      * @return array<string, string>
@@ -1503,8 +1454,6 @@ LUA;
         if (! $this->metricsEnabled()) {
             return [];
         }
-
-        $this->migrateLegacyBuckets();
 
         return $this->readHash($this->rollupKey($tier, $queue));
     }

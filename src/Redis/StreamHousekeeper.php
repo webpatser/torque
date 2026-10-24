@@ -26,7 +26,7 @@ use function Fledge\Async\Redis\createRedisClient;
  * On top of that, {@see deepClean()} sweeps everything an upgrade from an
  * older Torque can leave behind: per-job event streams that never got their
  * terminal EXPIRE, index members pointing at streams that are gone, and
- * legacy metric keys. It runs once per version through
+ * worker hashes of processes that are gone. It runs once per version through
  * {@see UpgradeRunner}, and on demand via `torque:prune --deep`.
  *
  * The master runs the light pass on a timer (`dead_letter.prune_interval`);
@@ -194,7 +194,7 @@ final class StreamHousekeeper
     /**
      * Sweep everything an upgrade from an older Torque can leave behind.
      *
-     * Five categories, each counted separately and each honouring `$dryRun`:
+     * Six categories, each counted separately and each honouring `$dryRun`:
      *
      *  - `job_streams`: per-job event streams with no expiry whose last event
      *    is older than `job_streams.ttl` plus {@see ORPHAN_MARGIN_SECONDS}.
@@ -204,9 +204,7 @@ final class StreamHousekeeper
      *    sets whose job stream no longer exists.
      *  - `dead_letter`: entries dropped by the normal TTL and cap policy.
      *  - `consumers`: stale consumer names, per the given idle threshold.
-     *  - `legacy_keys`: the pre-rollup `metrics:buckets` hash (only once its
-     *    replacement exists, so the migration cannot be short-circuited) and
-     *    worker hashes without a recent heartbeat.
+     *  - `worker_hashes`: worker hashes without a recent heartbeat.
      *  - `host_index`: hosts the per-host rollups have not seen inside the day
      *    tier's retention.
      *
@@ -221,7 +219,7 @@ final class StreamHousekeeper
             'index_members' => $this->pruneStaleIndexMembers($dryRun),
             'dead_letter' => 0,
             'consumers' => 0,
-            'legacy_keys' => $this->pruneLegacyKeys($dryRun),
+            'worker_hashes' => $this->pruneStaleWorkerHashes($dryRun),
         ];
 
         $deadLetter = $this->pruneDeadLetter($dryRun);
@@ -355,29 +353,11 @@ final class StreamHousekeeper
     }
 
     /**
-     * Remove metric keys that newer code no longer writes.
+     * Remove worker hashes whose process stopped publishing heartbeats.
      */
-    private function pruneLegacyKeys(bool $dryRun): int
+    private function pruneStaleWorkerHashes(bool $dryRun): int
     {
         $removed = 0;
-        $legacyBuckets = $this->prefix.'metrics:buckets';
-
-        try {
-            // Only once the rollup tier it migrates into exists: deleting it
-            // before MetricsPublisher::migrateLegacyBuckets() has run would
-            // throw the history away instead of moving it.
-            if ((int) $this->redis()->execute('EXISTS', $legacyBuckets) === 1
-                && (int) $this->redis()->execute('EXISTS', $this->prefix.'metrics:rollup:minute') === 1) {
-                if (! $dryRun) {
-                    $this->drop([$legacyBuckets]);
-                }
-
-                $removed++;
-            }
-        } catch (\Throwable) {
-            // Best-effort: a missing or unreadable key is not worth failing on.
-        }
-
         $now = time();
         $batch = [];
 

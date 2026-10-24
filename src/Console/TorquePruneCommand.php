@@ -19,7 +19,7 @@ use Webpatser\Torque\Redis\StreamHousekeeper;
  *    names otherwise accumulate forever; 124k per stream were found)
  *
  * With `--deep` it also runs the upgrade sweep (orphaned per-job event
- * streams, stale index members, legacy metric keys) that the master performs
+ * streams, stale index members, stale worker hashes) that the master performs
  * once per version on start. Combine it with `--dry-run` to preview a deploy.
  *
  * The master runs the same {@see StreamHousekeeper} every
@@ -32,7 +32,7 @@ final class TorquePruneCommand extends Command
     protected $signature = 'torque:prune
         {--dead-letter-max=100000 : Hard cap on dead-letter entries (0 = TTL only)}
         {--consumer-idle= : Delete idle consumers without pending work after this many seconds (default 3600, or 0 with --deep)}
-        {--deep : Also sweep leftovers from older Torque versions (orphaned job streams, stale indexes, legacy keys)}
+        {--deep : Also sweep leftovers from older Torque versions (orphaned job streams, stale indexes, stale worker hashes)}
         {--dry-run : Report what would be removed without touching Redis}';
 
     protected $description = 'Trim the dead-letter stream and remove stale stream consumers';
@@ -107,7 +107,7 @@ final class TorquePruneCommand extends Command
             'index_members' => 'Stale index members',
             'dead_letter' => 'Dead-letter entries',
             'consumers' => 'Stale consumers',
-            'legacy_keys' => 'Legacy metric keys',
+            'worker_hashes' => 'Stale worker hashes',
         ];
 
         foreach ($counts as $category => $count) {
