@@ -33,6 +33,9 @@ final class UpgradeRunner
     /** Suffix of the key holding the last-upgraded version. */
     public const string VERSION_KEY_SUFFIX = 'version';
 
+    /** Pre-rollup hash of minute counts, last written by 0.15.x. */
+    public const string LEGACY_BUCKETS_SUFFIX = 'metrics:buckets';
+
     /** Stored for any install without a comparable release version. */
     public const string DEV_VERSION = 'dev';
 
@@ -62,6 +65,9 @@ final class UpgradeRunner
             // 0.16.0 is the first release with bounded keys, so it is also the
             // release that has to clean up what earlier versions leaked.
             '0.16.0' => fn (): array => $this->housekeeper->deepClean(),
+            // 1.0.0 dropped the on-the-fly migration of the pre-rollup
+            // buckets hash; whatever is still there is dead weight.
+            '1.0.0' => fn (): array => ['legacy_keys' => $this->deleteLegacyBuckets()],
         ];
     }
 
@@ -193,6 +199,15 @@ final class UpgradeRunner
         }
 
         return version_compare($stepVersion, $stored, '>');
+    }
+
+    /**
+     * Delete the pre-rollup `metrics:buckets` hash. Returns the number of
+     * keys removed, so a second run is a harmless zero.
+     */
+    private function deleteLegacyBuckets(): int
+    {
+        return (int) $this->redis()->execute('DEL', $this->prefix.self::LEGACY_BUCKETS_SUFFIX);
     }
 
     private function redis(): RedisClient

@@ -163,3 +163,56 @@ it('renders counts as a readable line', function () {
     expect(UpgradeRunner::describe(['job_streams' => 1200, 'legacy_keys' => 0]))
         ->toBe('job streams: 1,200, legacy keys: 0');
 });
+
+/*
+ * The real 1.0.0 step: the on-the-fly migration of the pre-rollup
+ * `metrics:buckets` hash is gone, so the upgrade deletes the key once.
+ */
+
+it('deletes the legacy buckets hash once on the upgrade to 1.0.0', function () {
+    $legacyKey = $this->prefix.UpgradeRunner::LEGACY_BUCKETS_SUFFIX;
+    $foreignKey = 'torque-test-other-'.bin2hex(random_bytes(4)).':metrics:buckets';
+    $this->redis->execute('SET', $this->versionKey, '0.18.4');
+    $this->redis->execute('HSET', $legacyKey, '29000000', '5');
+    $this->redis->execute('HSET', $foreignKey, '29000000', '5');
+
+    $runner = fn (): UpgradeRunner => UpgradeRunner::fromConfig(
+        ['redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix]],
+        function (string $message) {
+            $this->logged[] = $message;
+        },
+        '1.0.0',
+    );
+
+    try {
+        $result = $runner()->run();
+
+        expect($result['ran'])->toBeTrue()
+            ->and($result['counts'])->toBe(['legacy_keys' => 1])
+            ->and((int) $this->redis->execute('EXISTS', $legacyKey))->toBe(0)
+            // Only the configured prefix is touched.
+            ->and((int) $this->redis->execute('EXISTS', $foreignKey))->toBe(1)
+            ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.0.0');
+
+        // A second start at the same version does not run the step again.
+        $this->redis->execute('HSET', $legacyKey, '29000000', '5');
+
+        expect($runner()->run()['ran'])->toBeFalse()
+            ->and((int) $this->redis->execute('EXISTS', $legacyKey))->toBe(1);
+    } finally {
+        $this->redis->execute('DEL', $foreignKey);
+    }
+});
+
+it('reports zero when the legacy buckets hash is already gone', function () {
+    $this->redis->execute('SET', $this->versionKey, '0.18.4');
+
+    $result = UpgradeRunner::fromConfig(
+        ['redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix]],
+        fn (string $message) => null,
+        '1.0.0',
+    )->run();
+
+    expect($result['ran'])->toBeTrue()
+        ->and($result['counts'])->toBe(['legacy_keys' => 0]);
+});
