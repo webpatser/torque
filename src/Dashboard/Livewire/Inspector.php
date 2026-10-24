@@ -11,6 +11,7 @@ use Webpatser\Torque\Dashboard\Data\DeadLetterData;
 use Webpatser\Torque\Dashboard\Data\JobsData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
  * Job inspector: a picker when no job is selected, otherwise a per-job detail
@@ -89,7 +90,7 @@ final class Inspector extends Component
         return view('torque::dashboard.inspector-detail', [
             'job' => $job,
             'events' => $events,
-            'payload' => $detail['payload'],
+            'payload' => is_array($detail['payload']) ? PayloadSanitizer::sanitizePayload($detail['payload']) : null,
             'status' => $status,
             'isLive' => $isLive,
             'exception' => $exception,

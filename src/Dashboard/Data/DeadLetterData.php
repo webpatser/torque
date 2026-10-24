@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Dashboard\Data;
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
  * Dead-letter read-model: list permanently failed jobs in the dashboard shape.
@@ -46,8 +47,8 @@ final class DeadLetterData
                 'name' => $name,
                 'queue' => $entry['original_queue'],
                 'exception' => $entry['exception_class'],
-                'message' => $entry['exception_message'],
-                'trace' => $entry['exception_trace'],
+                'message' => PayloadSanitizer::sanitizeMessage($entry['exception_message'], null),
+                'trace' => PayloadSanitizer::sanitizeMessage($entry['exception_trace'], null),
                 'attempts' => null,
                 'failedAt' => self::toMs($entry['failed_at']),
                 'worker' => null,

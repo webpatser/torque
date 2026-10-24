@@ -171,7 +171,9 @@ new class extends Component
     {
         try {
             $stream = app(JobStream::class);
-            $this->events = $stream->events($this->uuid);
+            // $events is a public property and ships in the Livewire snapshot,
+            // so it must be redacted before it is assigned.
+            $this->events = PayloadSanitizer::sanitizeEvents($stream->events($this->uuid));
             $this->finished = $stream->isFinished($this->uuid);
             $this->error = null;
         } catch (Throwable $e) {

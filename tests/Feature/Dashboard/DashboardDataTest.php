@@ -12,6 +12,7 @@ use Webpatser\Torque\Dashboard\Data\QueuesData;
 use Webpatser\Torque\Dashboard\Data\WorkersData;
 use Webpatser\Torque\Dashboard\Livewire\Dead;
 use Webpatser\Torque\Dashboard\Livewire\Feed;
+use Webpatser\Torque\Dashboard\Livewire\Inspector;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
@@ -273,6 +274,42 @@ it('lists dead-letter entries with the documented shape', function () {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     } finally {
         torqueTestRedis()->execute('DEL', 'torque-test:dead-letter');
+    }
+});
+
+it('redacts credentials from dead-letter messages and job events before rendering', function () {
+    $handler = new DeadLetterHandler(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
+    $recorder = new JobStreamRecorder(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
+    $credentials = base64_encode('user:hunter2');
+    $uuid = 'data-redact-'.bin2hex(random_bytes(4));
+
+    try {
+        $handler->handle(
+            queue: 'default',
+            payload: '{"uuid":"'.$uuid.'"}',
+            messageId: '1680000000000-0',
+            exception: new RuntimeException('401 for Authorization: Basic '.$credentials),
+        );
+        $recorder->record($uuid, 'failed', [
+            'exception_class' => 'RuntimeException',
+            'exception_message' => 'upstream rejected Basic '.$credentials,
+        ], terminal: true);
+
+        $dead = app(DeadLetterData::class)->list()['jobs'][0];
+        $events = app(JobsData::class)->show($uuid)['events'];
+
+        expect($dead['message'])->toContain('***')->not->toContain($credentials)
+            ->and($events[0]['data']['exception_message'])->toBe('upstream rejected Basic ***');
+
+        $html = Livewire::test(Inspector::class, ['uuid' => $uuid])->set('tab', 'exception')->html();
+
+        expect($html)->not->toContain($credentials);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        $redis = torqueTestRedis();
+        $redis->execute('DEL', 'torque-test:dead-letter');
+        $redis->execute('DEL', 'torque-test:job:'.$uuid);
     }
 });
 

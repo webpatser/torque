@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Dashboard\Data;
 
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
 use Webpatser\Torque\Stream\JobStream;
+use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
  * Job list (live feed) and single-job event stream (inspector) read-model.
@@ -51,7 +52,9 @@ final class JobsData
      */
     public function show(string $uuid): array
     {
-        $events = $this->jobStream->events($uuid);
+        // Event data carries exception messages and traces, which can hold
+        // credentials; redact before anything reaches a view.
+        $events = array_values(PayloadSanitizer::sanitizeEvents($this->jobStream->events($uuid)));
 
         if ($events === []) {
             return ['job' => null, 'events' => [], 'payload' => null];
