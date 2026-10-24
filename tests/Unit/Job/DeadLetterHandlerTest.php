@@ -307,3 +307,27 @@ it('trims by ttl and by cap', function () {
 
     $redis->execute('DEL', $key);
 });
+
+it('quarantines an igbinary entry byte for byte with a serializer_mismatch reason', function () {
+    try {
+        $handler = new DeadLetterHandler(
+            redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
+            prefix: 'torque-test-dl-quarantine-'.bin2hex(random_bytes(4)).':',
+        );
+
+        // Array header followed by a body that a decoder would choke on.
+        $blob = "\x00\x00\x00\x02\x14\x01\x06\x04uuid\x11\x02q1";
+
+        $handler->quarantine('default', $blob, '1680000000000-2', 'serializer_mismatch');
+
+        $entries = $handler->list(count: 10);
+        expect($entries)->toHaveCount(1);
+        expect($entries[0]['payload'])->toBe($blob);
+        expect($entries[0]['original_queue'])->toBe('default');
+        expect($entries[0]['exception_message'])->toBe('serializer_mismatch');
+
+        $handler->purge($entries[0]['id']);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});

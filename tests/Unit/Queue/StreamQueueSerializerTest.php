@@ -27,9 +27,29 @@ it('decodes a JSON array payload', function () {
 it('decodes an igbinary payload', function () {
     $raw = igbinary_serialize(['uuid' => 'xyz-789', 'attempts' => 1]);
 
-    $decoded = StreamQueue::decodePayload($raw);
+    $decoded = StreamQueue::decodePayload($raw, 'igbinary');
 
     expect($decoded)->toBe(['uuid' => 'xyz-789', 'attempts' => 1]);
+})->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
+
+it('refuses to decode an igbinary payload when the serializer is json', function () {
+    $raw = igbinary_serialize(['uuid' => 'xyz-789', 'attempts' => 1]);
+
+    StreamQueue::decodePayload($raw, 'json');
+})->throws(InvalidArgumentException::class, 'Unrecognized payload format')
+    ->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
+
+it('refuses to decode an igbinary payload when no serializer is configured', function () {
+    // No container config in a unit test: the default is json.
+    StreamQueue::decodePayload(igbinary_serialize(['a' => 1]));
+})->throws(InvalidArgumentException::class, 'Unrecognized payload format')
+    ->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
+
+it('never unserializes an igbinary object blob', function () {
+    $raw = igbinary_serialize(new ArrayObject(['a' => 1]));
+
+    expect(fn () => StreamQueue::decodePayload($raw, 'igbinary'))
+        ->toThrow(InvalidArgumentException::class, 'Unrecognized payload format');
 })->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
 
 it('throws on an unrecognized payload format', function () {
@@ -59,7 +79,28 @@ it('considers a JSON array valid', function () {
 it('considers a real igbinary blob valid', function () {
     $blob = igbinary_serialize(['x' => 'y']);
 
-    expect(StreamQueue::isValidPayload($blob))->toBeTrue();
+    expect(StreamQueue::isValidPayload($blob, 'igbinary'))->toBeTrue();
+})->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
+
+it('considers an igbinary blob invalid when the serializer is json', function () {
+    $blob = igbinary_serialize(['x' => 'y']);
+
+    expect(StreamQueue::isValidPayload($blob, 'json'))->toBeFalse()
+        ->and(StreamQueue::isValidPayload($blob))->toBeFalse();
+})->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
+
+it('sniffs the igbinary header without decoding the body', function () {
+    // Array header followed by a truncated body: a full decode would fail,
+    // the header sniff must not even try.
+    $headerOnly = "\x00\x00\x00\x02\x14\xff\xff\xff";
+
+    expect(StreamQueue::isValidPayload($headerOnly, 'igbinary'))->toBeTrue();
+});
+
+it('rejects an igbinary object header without decoding', function () {
+    $objectBlob = igbinary_serialize(new ArrayObject(['a' => 1]));
+
+    expect(StreamQueue::isValidPayload($objectBlob, 'igbinary'))->toBeFalse();
 })->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
 
 it('considers garbage with leading nulls invalid', function () {
@@ -76,6 +117,20 @@ it('considers an empty string invalid', function () {
 
 it('considers malformed JSON invalid', function () {
     expect(StreamQueue::isValidPayload('{not real json'))->toBeFalse();
+});
+
+it('flags an igbinary blob on a json install as a serializer mismatch without decoding it', function () {
+    $headerOnly = "\x00\x00\x00\x02\x14\xff\xff\xff";
+
+    expect(StreamQueue::isSerializerMismatch($headerOnly, 'json'))->toBeTrue()
+        ->and(StreamQueue::isSerializerMismatch($headerOnly))->toBeTrue()
+        ->and(StreamQueue::isValidPayload($headerOnly, 'json'))->toBeFalse();
+});
+
+it('does not flag json, garbage or a matching igbinary install as a mismatch', function () {
+    expect(StreamQueue::isSerializerMismatch('{"a":1}', 'json'))->toBeFalse()
+        ->and(StreamQueue::isSerializerMismatch("\x00\x00garbage", 'json'))->toBeFalse()
+        ->and(StreamQueue::isSerializerMismatch('', 'json'))->toBeFalse();
 });
 
 // -------------------------------------------------------------------------
@@ -109,7 +164,7 @@ it('roundtrips a payload through igbinary mode', function () {
     $encoded = invokePrivateEncode($queue, $original);
 
     expect(str_starts_with($encoded, "\x00\x00\x00\x02"))->toBeTrue();
-    expect(StreamQueue::decodePayload($encoded))->toBe($original);
+    expect(StreamQueue::decodePayload($encoded, 'igbinary'))->toBe($original);
 })->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
 
 /**

@@ -215,12 +215,13 @@ LUA;
         // in Laravel, not of Job::fail() itself, so without this listener every
         // failure lands in the dead-letter stream but queue:failed and queue:retry
         // stay empty. Guarded so a broken failer write is loud but never fatal.
-        $events->listen(JobFailed::class, static function (JobFailed $event): void {
+        $failerSerializer = (string) ($this->config['serializer'] ?? 'json');
+        $events->listen(JobFailed::class, static function (JobFailed $event) use ($failerSerializer): void {
             try {
                 app('queue.failer')->log(
                     $event->connectionName,
                     $event->job->getQueue(),
-                    self::failerPayload($event->job->getRawBody()),
+                    self::failerPayload($event->job->getRawBody(), $failerSerializer),
                     $event->exception,
                 );
             } catch (\Throwable $e) {
@@ -489,7 +490,18 @@ LUA;
 
                     $queueName = $this->resolveQueueName($message['stream'], $prefix);
 
-                    if (! StreamQueue::isValidPayload($message['payload'])) {
+                    $wireSerializer = (string) ($this->config['serializer'] ?? 'json');
+
+                    if (! StreamQueue::isValidPayload($message['payload'], $wireSerializer)) {
+                        // An igbinary entry the configured serializer refuses to
+                        // decode (leftover from an earlier run) is parked in the
+                        // dead-letter stream undecoded, so it can be recovered
+                        // after switching TORQUE_SERIALIZER back. Park first: if
+                        // the write throws, the entry stays pending for reclaim.
+                        if (StreamQueue::isSerializerMismatch($message['payload'], $wireSerializer)) {
+                            $deadLetterHandler->quarantine($queueName, $message['payload'], $message['id'], 'serializer_mismatch');
+                        }
+
                         // Corrupt payload, unrecognized format: acknowledge and discard.
                         // recordJobFailed() balances the recordJobStarted() above;
                         // without it every corrupt payload leaks one activeSlot for
@@ -1440,7 +1452,7 @@ LUA;
 
             // Fire a domain event so users can hook in custom notification logic.
             try {
-                $decoded = StreamQueue::decodePayload($message['payload']);
+                $decoded = StreamQueue::decodePayload($message['payload'], (string) ($this->config['serializer'] ?? 'json'));
             } catch (\Throwable) {
                 $decoded = [];
             }
@@ -1563,12 +1575,12 @@ LUA;
      * push runs through {@see StreamQueue::transcodeIncomingPayload()}, which
      * turns it back into igbinary on the wire. JSON bodies pass untouched.
      */
-    public static function failerPayload(string $rawBody): string
+    public static function failerPayload(string $rawBody, ?string $serializer = null): string
     {
         if ($rawBody === '' || $rawBody[0] === '{') {
             return $rawBody;
         }
 
-        return json_encode(StreamQueue::decodePayload($rawBody), JSON_THROW_ON_ERROR);
+        return json_encode(StreamQueue::decodePayload($rawBody, $serializer), JSON_THROW_ON_ERROR);
     }
 }

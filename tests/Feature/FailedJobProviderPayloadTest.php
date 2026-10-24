@@ -37,7 +37,7 @@ beforeEach(function () {
 it('stores an igbinary job in failed_jobs once the payload is re-encoded', function () {
     $raw = igbinary_serialize(['uuid' => 'job-uuid-1', 'displayName' => 'App\\Jobs\\Scrape', 'attempts' => 3]);
 
-    $this->failer->log('torque', 'scrpr', WorkerProcess::failerPayload($raw), new RuntimeException('KvK down'));
+    $this->failer->log('torque', 'scrpr', WorkerProcess::failerPayload($raw, 'igbinary'), new RuntimeException('KvK down'));
 
     $row = DB::table('failed_jobs')->first();
 

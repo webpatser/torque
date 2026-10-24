@@ -8,6 +8,7 @@ use DateInterval;
 use DateTimeInterface;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
+use Illuminate\Container\Container;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Jobs\InspectedJob;
 use Illuminate\Queue\Queue;
@@ -100,12 +101,17 @@ class StreamQueue extends Queue implements QueueContract
      * Static so that {@see WorkerProcess} can call it
      * without holding a StreamQueue instance.
      *
+     * igbinary is only decoded when the configured serializer is `igbinary`:
+     * a stream entry that merely carries the igbinary header must not reach
+     * `igbinary_unserialize()` on a JSON-only install. `$serializer` defaults
+     * to `torque.serializer`.
+     *
      * @return array<string, mixed>
      *
      * @throws \InvalidArgumentException When the format cannot be recognized.
      * @throws \JsonException When JSON decoding fails.
      */
-    public static function decodePayload(string $raw): array
+    public static function decodePayload(string $raw, ?string $serializer = null): array
     {
         if ($raw === '') {
             throw new \InvalidArgumentException('Unrecognized payload format');
@@ -117,7 +123,7 @@ class StreamQueue extends Queue implements QueueContract
             return json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
         }
 
-        if (str_starts_with($raw, "\x00\x00\x00\x02")) {
+        if (self::hasIgbinaryArrayHeader($raw) && self::igbinaryEnabled($serializer)) {
             $decoded = igbinary_unserialize($raw);
 
             if (! is_array($decoded)) {
@@ -135,20 +141,73 @@ class StreamQueue extends Queue implements QueueContract
      *
      * Used by {@see WorkerProcess} as a replacement for
      * the old json_validate() gate, so igbinary blobs are not dropped as corrupt.
+     *
+     * JSON is validated without building the structure; igbinary is accepted
+     * by header alone (never unserialized here) and only when the configured
+     * serializer is `igbinary`.
      */
-    public static function isValidPayload(string $raw): bool
+    public static function isValidPayload(string $raw, ?string $serializer = null): bool
     {
         if ($raw === '') {
             return false;
         }
 
-        try {
-            self::decodePayload($raw);
+        if ($raw[0] === '{' || $raw[0] === '[') {
+            return json_validate($raw, 512);
+        }
 
-            return true;
-        } catch (\Throwable) {
+        return self::hasIgbinaryArrayHeader($raw) && self::igbinaryEnabled($serializer);
+    }
+
+    /**
+     * Is this an igbinary blob that the configured serializer refuses to decode?
+     *
+     * True for leftover entries from a previous `igbinary` run on a JSON
+     * install. Header sniff only, the body is never unserialized.
+     */
+    public static function isSerializerMismatch(string $raw, ?string $serializer = null): bool
+    {
+        return self::hasIgbinaryArrayHeader($raw) && ! self::igbinaryEnabled($serializer);
+    }
+
+    /**
+     * Does the blob start with the igbinary v2 header followed by an array type tag?
+     *
+     * Job payloads are always arrays (igbinary_type_array8/16/32 = 0x14..0x16).
+     */
+    private static function hasIgbinaryArrayHeader(string $raw): bool
+    {
+        if (! str_starts_with($raw, "\x00\x00\x00\x02") || strlen($raw) < 6) {
             return false;
         }
+
+        $type = ord($raw[4]);
+
+        return $type >= 0x14 && $type <= 0x16;
+    }
+
+    /**
+     * Is igbinary decoding allowed for this call?
+     */
+    private static function igbinaryEnabled(?string $serializer): bool
+    {
+        $serializer ??= self::configuredSerializer();
+
+        return $serializer === 'igbinary' && function_exists('igbinary_unserialize');
+    }
+
+    /**
+     * The wire serializer from `torque.serializer`, `json` when unavailable.
+     */
+    private static function configuredSerializer(): string
+    {
+        $container = Container::getInstance();
+
+        if (! $container->bound('config')) {
+            return 'json';
+        }
+
+        return (string) $container->make('config')->get('torque.serializer', 'json');
     }
 
     // -------------------------------------------------------------------------
@@ -204,7 +263,7 @@ class StreamQueue extends Queue implements QueueContract
 
         // Record "queued" event to per-job stream.
         try {
-            $decoded = self::decodePayload($payload);
+            $decoded = self::decodePayload($payload, $this->serializer);
 
             if (isset($decoded['uuid'])) {
                 app(JobStreamRecorder::class)->onQueued(
@@ -263,7 +322,7 @@ class StreamQueue extends Queue implements QueueContract
         );
 
         try {
-            $decoded = self::decodePayload($payload);
+            $decoded = self::decodePayload($payload, $this->serializer);
         } catch (\Throwable) {
             return '';
         }
@@ -667,7 +726,7 @@ class StreamQueue extends Queue implements QueueContract
         $this->redis->execute('XDEL', $streamKey, $job->messageId);
 
         // Rebuild payload with incremented attempts.
-        $payload = self::decodePayload($job->getRawBody());
+        $payload = self::decodePayload($job->getRawBody(), $this->serializer);
         $payload['attempts'] = ($payload['attempts'] ?? 0) + 1;
         $newPayload = $this->encodePayload($payload);
 

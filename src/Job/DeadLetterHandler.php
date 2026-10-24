@@ -46,6 +46,43 @@ final class DeadLetterHandler
      */
     public function handle(string $queue, string $payload, string $messageId, \Throwable $exception): void
     {
+        $this->write($queue, $payload, [
+            'exception_class', $exception::class,
+            'exception_message', substr($exception->getMessage(), 0, 1000),
+            'exception_trace', substr($exception->getTraceAsString(), 0, 5000),
+        ]);
+    }
+
+    /**
+     * Park an entry that could not be processed (not a job failure) in the
+     * dead-letter stream, byte for byte and never decoded.
+     *
+     * Used for payloads the worker refuses to unserialize, such as leftover
+     * igbinary entries on a JSON-configured install (`serializer_mismatch`).
+     * The reason is stored as `reason` and as the exception message, so the
+     * dashboard and `retry()` treat it like any other dead-letter entry.
+     *
+     * @param  string  $queue  The queue the entry was consumed from.
+     * @param  string  $payload  The raw, undecoded payload.
+     * @param  string  $messageId  The original stream message ID.
+     * @param  string  $reason  Short machine-readable reason, e.g. `serializer_mismatch`.
+     */
+    public function quarantine(string $queue, string $payload, string $messageId, string $reason): void
+    {
+        $this->write($queue, $payload, [
+            'exception_class', 'quarantined',
+            'exception_message', substr($reason, 0, 1000),
+            'exception_trace', '',
+            'reason', substr($reason, 0, 200),
+            'original_message_id', $messageId,
+        ]);
+    }
+
+    /**
+     * @param  list<string>  $fields  Flat field/value pairs appended to the entry.
+     */
+    private function write(string $queue, string $payload, array $fields): void
+    {
         // Cap the stream at write time. Approximate trimming (MAXLEN ~) keeps
         // XADD O(1) by only evicting whole macro nodes, so the real length
         // hovers just above the cap instead of being exact. Without this a
@@ -57,15 +94,11 @@ final class DeadLetterHandler
             array_push($args, 'MAXLEN', '~', (string) $this->maxEntries);
         }
 
-        array_push(
+        $args = array_merge(
             $args,
-            '*',
-            'payload', $payload,
-            'original_queue', $queue,
-            'exception_class', $exception::class,
-            'exception_message', substr($exception->getMessage(), 0, 1000),
-            'exception_trace', substr($exception->getTraceAsString(), 0, 5000),
-            'failed_at', (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c'),
+            ['*', 'payload', $payload, 'original_queue', $queue],
+            $fields,
+            ['failed_at', (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c')],
         );
 
         $this->redis->execute('XADD', ...$args);

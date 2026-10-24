@@ -14,7 +14,7 @@ it('re-encodes an igbinary body as JSON so database-uuids can read the uuid', fu
     $payload = ['uuid' => 'abc-123', 'displayName' => 'App\\Jobs\\Scrape', 'attempts' => 3];
     $raw = igbinary_serialize($payload);
 
-    $stored = WorkerProcess::failerPayload($raw);
+    $stored = WorkerProcess::failerPayload($raw, 'igbinary');
 
     expect(json_validate($stored))->toBeTrue()
         ->and(json_decode($stored, true))->toBe($payload)
