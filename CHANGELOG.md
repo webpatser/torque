@@ -214,6 +214,30 @@ The dead-letter cap bounds Redis only. The framework's `failed_jobs` table grew 
 ### Fixed
 - `Torque::registerDevCommands()` now excludes the framework's default `queue` dev command (`DevCommands::except('queue')`), so `composer dev` runs only `torque:start` instead of two competing consumers. Mirrors Horizon v5.48.1.
 
+## [0.14.4] - 2026-07-25
+
+### Added
+- **Per-stream `max_concurrency` caps.** A stream can declare `max_concurrency` in `config/torque.php`: a worker skips polling that stream while it already has that many of its jobs in flight, so bulk work (API backfills, scrapes) cannot monopolize the fiber fleet or hammer an external service, while other streams keep full throughput. The cap is per worker process (fleet-wide = workers x cap) and approximate under bursts, overshooting by at most the number of concurrently polling fibers.
+
+## [0.14.3] - 2026-07-25
+
+### Fixed
+- **The master survives a deploy-time chown of its runtime files.** Deploy tooling that chowns `storage/` to the web user (Deployer with `writable_mode=chown` and an `http_user` differing from the worker user) left the supervised master unable to reopen its own lock file: `fopen` failed with `EACCES`, which was reported as "another Torque master holds the lock" while the program went FATAL. The lock, reload-lock and PID files are now created group-writable (0664), and a lock file that cannot be opened is reported as exactly that, permissions included.
+
+## [0.14.2] - 2026-07-25
+
+### Fixed
+- **Jobs enqueued by another driver are no longer shown as `(unknown)`.** The display name is now recorded on the `started` event too, so a job whose per-job stream begins at `started` (a classic `queue:work` draining a legacy redis list during a migration to Torque) is named in the dashboard.
+
+## [0.14.1] - 2026-07-25
+
+### Added
+- `torque:start --replace` absorbs a live master through the takeover handshake without detaching, so the process stays the supervisor's child and a supervisor respawn converges on exactly one supervised master instead of failing to FATAL. Stale PID files fall through to a normal start. `torque:supervisor` now generates the program command with `--replace` and `startretries=10`.
+- `torque:reload --if-running` exits 0 when no live master is found (missing or stale PID file), so deploy scripts can drop their own PID-file guards.
+
+### Changed
+- `torque:reload` in default mode refuses a supervised master (parent PID other than 1) instead of only warning, pointing at `--drain`; `--force` keeps the deliberate escape hatch. A manual default-mode reload against a supervised master used to spawn a detached master that escaped supervision.
+
 ## [0.14.0] - 2026-07-25
 
 ### Added
@@ -253,6 +277,11 @@ The dead-letter cap bounds Redis only. The framework's `failed_jobs` table grew 
 
 ### Changed
 - **Dashboard rewritten from a React SPA to Livewire 4 + Blade.** The dashboard at `/torque` is now a set of full-page Livewire components (overview, workers, queues, feed, inspector, dead-letter) sharing one Blade layout, with `wire:poll` driving live refresh and a Tailwind 4 stylesheet compiled to a self-contained `dist/torque.css`. This drops React, Vite-for-JS, and the `/torque/api/*` JSON layer; Livewire (a new hard dependency, `livewire/livewire ^4`) provides the runtime and bundled Alpine, so applications still need no `npm` step. No Flux or any paid UI library is used. The per-controller JSON shaping moved into reusable `Dashboard\Data\*` read-models that the components consume.
+
+## [0.11.1] - 2026-07-15
+
+### Fixed
+- **A `torque:reload --drain` can no longer leave the queue paused.** The drain wrote `{prefix}paused` without a TTL and nothing deleted it after the master handover, so every drained reload left all workers refusing pickup until a manual `torque:pause continue`. The drain now sets the key with a `drain_grace_seconds + 60` expiry; a deliberate `torque:pause` keeps its no-TTL semantics. The master also warns at boot when it starts into a paused queue.
 
 ## [0.11.0] - 2026-06-24
 
@@ -376,6 +405,23 @@ The dead-letter cap bounds Redis only. The framework's `failed_jobs` table grew 
 ### Removed
 - Dead `WorkerProcess::processPendingMessages()` method. Crash-recovery drain has lived inline in the Fiber main loop since 0.4.0
 
+## [0.6.2] - 2026-04-16
+
+### Fixed
+- **Duplicate jobs from concurrent delayed job migration.** `migrateDelayedJobs()` used non-atomic `ZRANGEBYSCORE` / `ZREM` / `XADD`, so several workers could migrate the same matured jobs at once, producing duplicates that snowballed to 60K+ after restarts. The migration is now a single atomic Lua script.
+
+### Test infrastructure
+- The remaining `Amp\*` references in the test suite moved to their `Fledge\Async` equivalents, and stale assertions for `TorqueStopCommand`, `StreamConnector` config precedence, the `DeadLetterHandler` constructor and `MetricsCollector` peak tracking were fixed.
+
+## [0.6.1] - 2026-04-16
+
+### Added
+- `torque:flush` clears queued and delayed jobs with `XTRIM` (in-flight jobs are unaffected) and removes their payload keys. Requires `--force` in production.
+- `torque:start` shows the package version in its startup banner.
+
+### Fixed
+- `torque:monitor` uses the alternate screen buffer, so the terminal is clean after Ctrl+C.
+
 ## [0.6.0] - 2026-04-16
 
 ### Fixed
@@ -435,6 +481,26 @@ The dead-letter cap bounds Redis only. The framework's `failed_jobs` table grew 
 
 ### Changed
 - Replaced `pcntl_fork` with `pcntl_exec` for worker spawning: fixes Fiber conflicts in forked processes
+
+## [0.2.4] - 2026-04-06
+
+### Fixed
+- Errors in a forked worker child are caught and logged to stderr instead of disappearing.
+
+## [0.2.3] - 2026-04-06
+
+### Fixed
+- `bootstrap/app.php` is resolved before `pcntl_fork()`, since the child may have a different working directory. Forked workers crashed with "file not found" and respawned in a loop.
+
+## [0.2.2] - 2026-04-06
+
+### Fixed
+- Laravel 13 `Queue` contract compatibility: removed the `?string` type hints that clashed with the contract's signatures.
+
+## [0.2.1] - 2026-04-06
+
+### Added
+- Laravel 13 support (`illuminate/*` `^12.0|^13.0`).
 
 ## [0.2.0] - 2026-04-06
 
@@ -520,6 +586,9 @@ Initial release.
 
 [Unreleased]: https://github.com/webpatser/torque/compare/v0.18.4...HEAD
 [0.18.4]: https://github.com/webpatser/torque/compare/v0.18.3...v0.18.4
+[0.18.3]: https://github.com/webpatser/torque/compare/v0.18.2...v0.18.3
+[0.18.2]: https://github.com/webpatser/torque/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/webpatser/torque/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/webpatser/torque/compare/v0.17.3...v0.18.0
 [0.17.3]: https://github.com/webpatser/torque/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/webpatser/torque/compare/v0.17.1...v0.17.2
@@ -534,10 +603,15 @@ Initial release.
 [0.16.1]: https://github.com/webpatser/torque/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/webpatser/torque/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/webpatser/torque/compare/v0.14.5...v0.15.0
-[0.14.5]: https://github.com/webpatser/torque/compare/v0.14.0...v0.14.5
+[0.14.5]: https://github.com/webpatser/torque/compare/v0.14.4...v0.14.5
+[0.14.4]: https://github.com/webpatser/torque/compare/v0.14.3...v0.14.4
+[0.14.3]: https://github.com/webpatser/torque/compare/v0.14.2...v0.14.3
+[0.14.2]: https://github.com/webpatser/torque/compare/v0.14.1...v0.14.2
+[0.14.1]: https://github.com/webpatser/torque/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/webpatser/torque/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/webpatser/torque/compare/v0.12.0...v0.13.0
-[0.12.0]: https://github.com/webpatser/torque/compare/v0.11.0...v0.12.0
+[0.12.0]: https://github.com/webpatser/torque/compare/v0.11.1...v0.12.0
+[0.11.1]: https://github.com/webpatser/torque/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/webpatser/torque/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/webpatser/torque/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/webpatser/torque/compare/v0.10.0...v0.10.1
@@ -546,12 +620,18 @@ Initial release.
 [0.8.0]: https://github.com/webpatser/torque/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/webpatser/torque/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/webpatser/torque/compare/v0.7.0...v0.7.1
-[0.7.0]: https://github.com/webpatser/torque/compare/v0.6.0...v0.7.0
+[0.7.0]: https://github.com/webpatser/torque/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/webpatser/torque/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/webpatser/torque/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/webpatser/torque/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/webpatser/torque/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/webpatser/torque/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/webpatser/torque/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/webpatser/torque/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/webpatser/torque/compare/v0.2.0...v0.3.0
+[0.3.0]: https://github.com/webpatser/torque/compare/v0.2.4...v0.3.0
+[0.2.4]: https://github.com/webpatser/torque/compare/v0.2.3...v0.2.4
+[0.2.3]: https://github.com/webpatser/torque/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/webpatser/torque/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/webpatser/torque/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/webpatser/torque/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/webpatser/torque/releases/tag/v0.1.0
