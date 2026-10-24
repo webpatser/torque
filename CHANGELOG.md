@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.4] - 2026-10-24
+
 ### Security
 - **Dashboard payloads no longer show secrets stored on the serialized job.** `PayloadSanitizer` only matched `key=value` / `key: value` text, so properties inside the PHP-serialized `data.command` (`s:8:"password";s:7:"hunter2";`) were rendered verbatim to every dashboard user. Serialized commands (including nested `chained` jobs) are now walked property by property: public, protected and private properties with a secret-sounding name show `***`, string leaves get the usual pattern redaction, and every `s:N` length is recomputed so the result is still valid serialized data. Unparseable serialized data is hidden entirely. `Authorization: Basic <base64>` credentials are redacted too (previously only the word `Basic` was), as is a standalone `Basic <base64>` that decodes to `user:pass`.
 - **Exception messages, traces and job events are redacted in the dashboard.** The dead-letter screen, the inspector (exception tab and timeline) and the legacy job inspector's Livewire snapshot rendered exception messages and traces without passing them through `PayloadSanitizer`.
@@ -516,7 +518,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v0.18.4...HEAD
+[0.18.4]: https://github.com/webpatser/torque/compare/v0.18.3...v0.18.4
 [0.18.0]: https://github.com/webpatser/torque/compare/v0.17.3...v0.18.0
 [0.17.3]: https://github.com/webpatser/torque/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/webpatser/torque/compare/v0.17.1...v0.17.2
