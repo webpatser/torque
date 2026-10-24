@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **igbinary payloads are only decoded when `torque.serializer` is `igbinary`.** `StreamQueue::decodePayload()` used to hand any stream entry that began with the igbinary header to `igbinary_unserialize()`, whatever the configured serializer. It now requires `serializer === 'igbinary'` and an array type tag after the header, and `isValidPayload()` sniffs the header (and validates JSON with `json_validate()`) instead of fully decoding. Both take an optional `$serializer` argument that defaults to `torque.serializer`. Behaviour change: on a JSON-configured install, leftover igbinary entries from a previous `TORQUE_SERIALIZER=igbinary` run are never unserialized; the worker moves them, undecoded, to the dead-letter stream with reason `serializer_mismatch` instead of running them.
+- **The master PID temp file can no longer be redirected through a symlink.** `writePidFile()` wrote `storage/torque.pid.<pid>.tmp` with `file_put_contents()`, which follows symlinks, so a local user who could write to `storage/` could plant a link there and have the master truncate another file (`.env`, say). The temp file is now created with `fopen('x')` (`O_CREAT|O_EXCL`, group-writable via umask instead of a `chmod()`), a stale or planted temp path is unlinked first, and the master lock file path is refused when it is a symlink.
 
 ## [0.18.3] - 2026-10-24
 

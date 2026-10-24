@@ -119,6 +119,100 @@ it('writePidFile writes the current pid atomically', function () {
     unlink($path);
 });
 
+it('writePidFile never writes through a symlink planted at the temp path', function () {
+    $path = MasterProcess::pidFilePath();
+    $tmpPath = $path.'.'.getmypid().'.tmp';
+    $victim = $path.'.victim';
+
+    foreach ([$path, $tmpPath, $victim] as $p) {
+        if (is_link($p) || file_exists($p)) {
+            unlink($p);
+        }
+    }
+
+    file_put_contents($victim, 'precious');
+    symlink($victim, $tmpPath);
+
+    try {
+        $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+
+        $reflection = new ReflectionMethod($master, 'writePidFile');
+        $reflection->invoke($master);
+
+        expect(file_get_contents($victim))->toBe('precious')
+            ->and(is_link($path))->toBeFalse()
+            ->and((int) file_get_contents($path))->toBe(getmypid())
+            ->and(file_exists($tmpPath) || is_link($tmpPath))->toBeFalse();
+    } finally {
+        foreach ([$path, $tmpPath, $victim] as $p) {
+            if (is_link($p) || file_exists($p)) {
+                unlink($p);
+            }
+        }
+    }
+});
+
+it('writePidFile replaces a stale temp file and keeps the PID file group-writable', function () {
+    $path = MasterProcess::pidFilePath();
+    $tmpPath = $path.'.'.getmypid().'.tmp';
+
+    foreach ([$path, $tmpPath] as $p) {
+        if (is_link($p) || file_exists($p)) {
+            unlink($p);
+        }
+    }
+
+    file_put_contents($tmpPath, 'stale');
+
+    try {
+        $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+
+        $reflection = new ReflectionMethod($master, 'writePidFile');
+        $reflection->invoke($master);
+
+        expect((int) file_get_contents($path))->toBe(getmypid())
+            ->and(fileperms($path) & 0777)->toBe(0664);
+    } finally {
+        foreach ([$path, $tmpPath] as $p) {
+            if (is_link($p) || file_exists($p)) {
+                unlink($p);
+            }
+        }
+    }
+});
+
+it('refuses to use a master lock file that is a symlink', function () {
+    $path = MasterProcess::lockFilePath();
+    $target = $path.'.dangling-target';
+    $logged = [];
+
+    foreach ([$path, $target] as $p) {
+        if (is_link($p) || file_exists($p)) {
+            unlink($p);
+        }
+    }
+
+    symlink($target, $path);
+
+    try {
+        $master = new MasterProcess(config: ['workers' => 1], logger: function (string $m) use (&$logged) {
+            $logged[] = $m;
+        });
+
+        $reflection = new ReflectionMethod($master, 'tryAcquireMasterLock');
+
+        expect($reflection->invoke($master))->toBeFalse()
+            ->and(file_exists($target))->toBeFalse()
+            ->and(implode("\n", $logged))->toContain('symlink');
+    } finally {
+        foreach ([$path, $target] as $p) {
+            if (is_link($p) || file_exists($p)) {
+                unlink($p);
+            }
+        }
+    }
+});
+
 it('constructor accepts config and logger', function () {
     $logMessages = [];
     $logger = function (string $message) use (&$logMessages) {

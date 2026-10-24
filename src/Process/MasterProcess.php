@@ -879,6 +879,13 @@ LUA;
     private function tryAcquireMasterLock(): bool
     {
         $path = self::lockFilePath();
+
+        if (is_link($path)) {
+            ($this->logger)("Refusing to use master lock file {$path}: it is a symlink.");
+
+            return false;
+        }
+
         $existed = file_exists($path);
         $handle = @fopen($path, 'c');
 
@@ -1356,14 +1363,40 @@ LUA;
 
         $tmpPath = $path.'.'.getmypid().'.tmp';
 
-        if (file_put_contents($tmpPath, (string) getmypid(), LOCK_EX) === false) {
-            throw new \RuntimeException("Failed to write temporary PID file at {$tmpPath}.");
+        // The temp path is predictable, so a local user with write access to
+        // storage/ could pre-plant a symlink there and have the write truncate
+        // an arbitrary file. A stale leftover (or planted link) is removed
+        // (unlink never follows a symlink), then the file is created with
+        // fopen 'x' (O_CREAT|O_EXCL), which fails instead of following a link
+        // that appears in the meantime.
+        if (is_link($tmpPath) || file_exists($tmpPath)) {
+            @unlink($tmpPath);
         }
 
-        // Group-writable: deploy tooling that chowns storage to the web user
-        // (Deployer writable_mode=chown with a different http_user) must not
-        // lock the supervised master's own runtime files away from it.
-        @chmod($tmpPath, 0664);
+        // Group-writable from birth: deploy tooling that chowns storage to the
+        // web user (Deployer writable_mode=chown with a different http_user)
+        // must not lock the supervised master's own runtime files away from
+        // it. A umask-created mode avoids a follow-up chmod(), which would
+        // follow a symlink swapped in after creation.
+        $previousUmask = umask(0002);
+
+        try {
+            $handle = @fopen($tmpPath, 'x');
+        } finally {
+            umask($previousUmask);
+        }
+
+        if ($handle === false) {
+            throw new \RuntimeException("Failed to create temporary PID file at {$tmpPath} exclusively.");
+        }
+
+        $written = flock($handle, LOCK_EX) && fwrite($handle, (string) getmypid()) !== false;
+        fclose($handle);
+
+        if (! $written) {
+            @unlink($tmpPath);
+            throw new \RuntimeException("Failed to write temporary PID file at {$tmpPath}.");
+        }
 
         if (! rename($tmpPath, $path)) {
             @unlink($tmpPath);
