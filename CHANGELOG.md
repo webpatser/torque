@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-24
+
+First stable release. From here on Torque follows semantic versioning strictly: breaking changes wait for 2.0. See UPGRADE.md for the 0.18 to 1.0 notes.
+
+### Added
+- **`1.0.0` data upgrade step.** On the first `torque:start` after the deploy, `UpgradeRunner` deletes the pre-rollup `{prefix}metrics:buckets` hash once (only under the configured prefix) and logs it as `legacy keys`. A second start at the same version does not run it again, and an already missing key reports 0.
+
+### Removed
+- **The on-the-fly `metrics:buckets` migration.** `MetricsPublisher` no longer checks for the 0.15.x hash on its first write or read to move it into the minute tier, and `StreamHousekeeper::deepClean()` no longer deletes it. Installs coming from 0.15.x or older should start any 0.16 to 0.18 release once first to keep the last day of minute history.
+
+### Changed
+- `StreamHousekeeper::deepClean()` reports the stale worker hash sweep as `worker_hashes` instead of `legacy_keys`, and `torque:prune --deep` labels it `Stale worker hashes`. The sweep itself is unchanged.
+
 ## [0.18.4] - 2026-10-24
 
 ### Security
@@ -584,7 +597,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v0.18.4...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/webpatser/torque/compare/v0.18.4...v1.0.0
 [0.18.4]: https://github.com/webpatser/torque/compare/v0.18.3...v0.18.4
 [0.18.3]: https://github.com/webpatser/torque/compare/v0.18.2...v0.18.3
 [0.18.2]: https://github.com/webpatser/torque/compare/v0.18.1...v0.18.2
