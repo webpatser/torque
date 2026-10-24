@@ -2,6 +2,57 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so. `torque:status` shows the recorded data version next to the installed one.
 
+## 0.18.x to 1.0.0
+
+1.0.0 is the first stable release: from here on, breaking changes wait for a major version. It removes the remaining migration code for data written by 0.15.x and earlier.
+
+### Before you upgrade
+
+- **Coming from 0.15.x or older?** Upgrade to any 0.16, 0.17 or 0.18 release first and start the master once. Those releases migrate the pre-rollup `metrics:buckets` hash into the minute tier; 1.0.0 only deletes it. Skipping straight to 1.0.0 loses at most the last day of minute history (the minute tier's retention), and every other upgrade step still runs.
+
+### Automatic
+
+- A `1.0.0` data step deletes `{prefix}metrics:buckets` on the first `torque:start` after the deploy and logs it as `legacy keys: 1` (or `0` when it was already gone). It runs once, like every other step.
+
+### Behaviour changes
+
+- `MetricsPublisher` no longer looks for `metrics:buckets` on its first write or read, so a process costs one `EXISTS` less at startup.
+- `torque:prune --deep` no longer deletes `metrics:buckets`. Its stale worker hash sweep is unchanged, and is now reported as `Stale worker hashes` instead of `Legacy metric keys`.
+
+### API changes
+
+- `StreamHousekeeper::deepClean()` returns a `worker_hashes` count in place of `legacy_keys`. Code reading that key from the array must switch to the new name.
+- New `UpgradeRunner::LEGACY_BUCKETS_SUFFIX` constant (`metrics:buckets`).
+
+Nothing else changes: config keys, env vars, the queue connection, Redis key layout and the `WorkerId` parser (which still reads the older `{host}-{pid}` ids) are the same as in 0.18.4.
+
+## 0.17.x to 0.18.0
+
+### Requirements
+
+- `illuminate/*` `^13.34` (0.18.0). `JobProcessed::$duration` and the `#[CountCrashesAsExceptions]` payload flag need it.
+- `webpatser/fledge-fiber` `^13.38` (0.18.2).
+
+### Automatic
+
+- No data step. The `#[CountCrashesAsExceptions]` processing marker (`job-processing:<uuid>`) lives in your default cache store, not in Torque's Redis prefix, and is removed when the attempt ends.
+
+### Behaviour changes
+
+- **`#[CountCrashesAsExceptions]` is honoured.** For a job with the flag and a `maxExceptions` limit, a worker that dies mid-job counts as one exception; once the limit is reached the job fails permanently instead of crashing the next worker. Set each stream's `retry_after` longer than its longest job, or a job stolen through `XAUTOCLAIM` while still running is counted as a crash.
+- **A pending re-read no longer hands a running job to a second slot** (0.18.0). Jobs that ran twice concurrently after a slot's PEL re-read now run once.
+- **`push()` and `later()` return `?string`** (0.18.3): null for an `afterCommit` job dispatched inside a transaction, which is enqueued on commit and dropped on rollback. Code that type-hints the result as `string` must accept null.
+- **`#[\NoDiscard]` is gone from `push()`, `pushRaw()` and `later()`** (0.18.1), so `queue:retry` and `Bus::batch()` work on PHP 8.5.
+- **igbinary payloads are only decoded when `torque.serializer` is `igbinary`** (0.18.4). If you switched from `TORQUE_SERIALIZER=igbinary` back to JSON with igbinary entries still queued, those entries now go to the dead-letter stream with reason `serializer_mismatch` instead of running. Drain the queues before switching serializers.
+- **The dashboard redacts more** (0.18.4): secret-named properties inside the serialized `data.command`, `Authorization: Basic` credentials, and exception messages, traces and job events on the dead-letter screen and inspector. Unparseable serialized data is hidden entirely.
+- **The master refuses a symlinked lock file** and creates its PID temp file exclusively (0.18.4). If `storage/torque.lock` is a symlink in your deploy layout, replace it with a regular file or let the master create it.
+- **Queue enumeration uses `SCAN` instead of `KEYS`** (0.18.4), so dashboard loads no longer block Redis on a large keyspace.
+
+### API changes
+
+- `StreamQueue::push()` and `later()`: `?string` return type.
+- `StreamQueue::decodePayload()` and `isValidPayload()` take an optional `$serializer` argument (defaults to `torque.serializer`).
+
 ## 0.16.x to 0.17.0
 
 ### Automatic
