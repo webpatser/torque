@@ -216,3 +216,20 @@ it('reports zero when the legacy buckets hash is already gone', function () {
     expect($result['ran'])->toBeTrue()
         ->and($result['counts'])->toBe(['legacy_keys' => 0]);
 });
+
+it('runs every real step without error on a fresh 1.0.0 install', function () {
+    $this->redis->execute('HSET', $this->prefix.UpgradeRunner::LEGACY_BUCKETS_SUFFIX, '29000000', '5');
+
+    $result = UpgradeRunner::fromConfig(
+        ['redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix]],
+        fn (string $message) => null,
+        '1.0.0',
+    )->run();
+
+    expect($result['ran'])->toBeTrue()
+        ->and($result['from'])->toBeNull()
+        ->and($result['counts'])->toHaveKeys(['job_streams', 'worker_hashes', 'legacy_keys'])
+        ->and($result['counts']['legacy_keys'])->toBe(1)
+        ->and((int) $this->redis->execute('EXISTS', $this->prefix.UpgradeRunner::LEGACY_BUCKETS_SUFFIX))->toBe(0)
+        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.0.0');
+});
