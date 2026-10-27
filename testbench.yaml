@@ -3,5 +3,14 @@
 # that stock laravel/framework (pulled in by testbench) does not expose, so
 # they are excluded from package discovery. The test suite registers the
 # providers it needs explicitly in tests/TestCase.php.
+#
+# The package's own provider is listed explicitly: Testbench only adds the
+# root package to its discovery manifest when run through the testbench CLI,
+# so without this a fresh checkout boots Larastan without Torque's console
+# commands (typed option/argument inference) and the torque:: view namespace
+# (view-string checks), while a stale manifest in vendor/ hides the gap.
+providers:
+  - Webpatser\Torque\TorqueServiceProvider
+
 dont-discover:
   - webpatser/fledge-fiber
