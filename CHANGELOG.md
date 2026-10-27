@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Parity
+- Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-10-20: the security policy removal in favor of the org-wide default and a follow-redirects dashboard dependency bump; nothing to port.
+
 ## [1.0.0] - 2026-10-24
 
 First stable release. From here on Torque follows semantic versioning strictly: breaking changes wait for 2.0. See UPGRADE.md for the 0.18 to 1.0 notes.
