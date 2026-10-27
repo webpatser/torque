@@ -66,6 +66,19 @@ final class ProcessInspector
     }
 
     /**
+     * Whether a process with the given PID exists (signal 0 probe).
+     *
+     * Marked impure so static analysis re-evaluates it on every call: a
+     * polling loop asks the same question until the answer changes.
+     *
+     * @phpstan-impure
+     */
+    public static function isAlive(int $pid): bool
+    {
+        return @posix_kill($pid, 0);
+    }
+
+    /**
      * Whether the process at the given PID looks like a live Torque master.
      */
     public static function isTorqueMaster(int $pid): bool

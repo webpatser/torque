@@ -498,7 +498,7 @@ final class StreamHousekeeper
      * XINFO replies arrive as a RESP3 map (assoc) or a RESP2 flat key/value list.
      *
      * @param  array<int|string, mixed>  $entry
-     * @return array<string, mixed>
+     * @return array<int|string, mixed>
      */
     private static function normalise(array $entry): array
     {

@@ -62,11 +62,14 @@ class StreamQueue extends Queue implements QueueContract
      *
      * 'json'     : JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR.
      * 'igbinary' : igbinary_serialize (requires ext-igbinary).
+     *
+     * @param  array<string, mixed>  $payload
      */
     private function encodePayload(array $payload): string
     {
         if ($this->serializer === 'igbinary') {
-            return igbinary_serialize($payload);
+            return igbinary_serialize($payload)
+                ?? throw new \RuntimeException('igbinary_serialize() failed to encode the job payload.');
         }
 
         return json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
@@ -92,7 +95,8 @@ class StreamQueue extends Queue implements QueueContract
 
         $decoded = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
 
-        return igbinary_serialize($decoded);
+        return igbinary_serialize($decoded)
+            ?? throw new \RuntimeException('igbinary_serialize() failed to transcode the job payload.');
     }
 
     /**
@@ -232,7 +236,9 @@ class StreamQueue extends Queue implements QueueContract
         return $this->enqueueUsing(
             $job,
             $this->createPayload($job, $this->getQueue($queue), $data),
-            $queue,
+            // Laravel's own RedisQueue passes the raw (possibly enum) queue
+            // here too; only enqueueUsing()'s PHPDoc still says string|null.
+            $queue, // @phpstan-ignore argument.type
             null,
             fn (string $payload, \UnitEnum|string|null $queue) => $this->pushRaw($payload, $queue),
         );
@@ -243,6 +249,7 @@ class StreamQueue extends Queue implements QueueContract
      *
      * @param  string  $payload  JSON-encoded job payload.
      * @param  \UnitEnum|string|null  $queue
+     * @param  array<string, mixed>  $options
      * @return string The stream message ID.
      */
     #[\Override]
@@ -298,7 +305,9 @@ class StreamQueue extends Queue implements QueueContract
         return $this->enqueueUsing(
             $job,
             $this->createPayload($job, $this->getQueue($queue), $data, $delay),
-            $queue,
+            // Raw (possibly enum) queue, as Laravel's RedisQueue passes it;
+            // see push().
+            $queue, // @phpstan-ignore argument.type
             $delay,
             fn (string $payload, \UnitEnum|string|null $queue, $delay) => $this->laterRaw($delay, $payload, $queue),
         );
@@ -573,7 +582,7 @@ class StreamQueue extends Queue implements QueueContract
         $cursor = '0';
 
         do {
-            /** @var array{0: string|int, 1: list<string>}|null $result */
+            /** @var array{0: string|int, 1?: list<string>}|null $result */
             $result = $this->redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '500');
 
             if (! is_array($result)) {
@@ -763,9 +772,9 @@ class StreamQueue extends Queue implements QueueContract
         $newPayload = $this->encodePayload($payload);
 
         if ($delay > 0) {
-            (void) $this->laterRaw($delay, $newPayload, $queue);
+            $this->laterRaw($delay, $newPayload, $queue);
         } else {
-            (void) $this->pushRaw($newPayload, $queue);
+            $this->pushRaw($newPayload, $queue);
         }
     }
 

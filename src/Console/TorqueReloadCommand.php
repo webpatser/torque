@@ -218,7 +218,7 @@ final class TorqueReloadCommand extends Command
         $deadline = microtime(true) + $window;
 
         while (microtime(true) < $deadline) {
-            if (! @posix_kill($pid, 0)) {
+            if (! ProcessInspector::isAlive($pid)) {
                 $this->components->info("Old master (PID: {$pid}) exited cleanly.");
 
                 return self::SUCCESS;
@@ -284,7 +284,7 @@ final class TorqueReloadCommand extends Command
 
         $status = proc_get_status($process);
 
-        return $status['pid'] ?? null;
+        return $status['pid'];
     }
 
     /**

@@ -30,7 +30,11 @@ final class TorqueMonitorCommand extends Command
 
     private int $lastLineCount = 0;
 
-    /** Circular buffer of [timestamp, totalJobs] samples for rolling throughput. */
+    /**
+     * Circular buffer of [timestamp, totalJobs] samples for rolling throughput.
+     *
+     * @var array<int, array{0: float, 1: int}>
+     */
     private array $throughputSamples = [];
 
     private int $throughputCursor = 0;
@@ -71,6 +75,9 @@ final class TorqueMonitorCommand extends Command
     /** @var string[] */
     private array $lines = [];
 
+    /**
+     * @param  array<string, mixed>  $config
+     */
     private function render(MetricsPublisher $publisher, array $config, string $prefix, string $redisUri): void
     {
         $this->lines = [];
@@ -120,6 +127,9 @@ final class TorqueMonitorCommand extends Command
         $this->lines[] = $content;
     }
 
+    /**
+     * @param  array<string, mixed>  $metrics
+     */
     private function renderHeader(array $metrics, ?int $masterPid, bool $paused): void
     {
         $workerCount = (int) ($metrics['workers'] ?? 0);
@@ -139,6 +149,9 @@ final class TorqueMonitorCommand extends Command
         $this->bufferLine(' '.str_repeat('─', 78));
     }
 
+    /**
+     * @param  array<string, mixed>  $m
+     */
     private function renderMetrics(array $m): void
     {
         $throughput = round((float) ($m['throughput'] ?? 0), 1);
@@ -184,6 +197,9 @@ final class TorqueMonitorCommand extends Command
         ));
     }
 
+    /**
+     * @param  array<string, array<string, string>>  $workers
+     */
     private function renderWorkers(array $workers): void
     {
         $this->bufferLine();
@@ -244,6 +260,9 @@ final class TorqueMonitorCommand extends Command
         $this->bufferLine('  └'.str_repeat('─', 24).'┴'.str_repeat('─', 8).'┴'.str_repeat('─', $barWidth + 10).'┴'.str_repeat('─', 10).'┴'.str_repeat('─', 8).'┘');
     }
 
+    /**
+     * @param  array<string, mixed>  $config
+     */
     private function renderQueues(array $config, string $redisUri, string $prefix): void
     {
         $streams = $config['streams'] ?? [];
@@ -293,6 +312,9 @@ final class TorqueMonitorCommand extends Command
         $this->bufferLine('  └'.str_repeat('─', 20).'┴'.str_repeat('─', 8).'┴'.str_repeat('─', 9).'┴'.str_repeat('─', 9).'┘');
     }
 
+    /**
+     * @param  array<string, mixed>  $metrics
+     */
     private function renderFooter(array $metrics, bool $paused, int $refreshMs): void
     {
         $this->bufferLine();

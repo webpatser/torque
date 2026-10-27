@@ -89,7 +89,9 @@ final class TorqueServiceProvider extends ServiceProvider
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
                 ttl: $config['dead_letter']['ttl'] ?? 604800,
                 prefix: $config['redis']['prefix'] ?? 'torque:',
-                allowedQueues: array_keys($config['streams'] ?? []),
+                // Numeric stream names come back from array_keys() as ints;
+                // the retry whitelist compares strictly against strings.
+                allowedQueues: array_map(strval(...), array_keys($config['streams'] ?? [])),
                 maxEntries: (int) ($config['dead_letter']['max_entries'] ?? 100000),
             );
         });
@@ -113,7 +115,7 @@ final class TorqueServiceProvider extends ServiceProvider
         ], 'torque-config');
 
         /** @var QueueManager $manager */
-        $manager = $this->app['queue'];
+        $manager = $this->app->make('queue');
         $manager->addConnector('torque', fn (): StreamConnector => new StreamConnector);
 
         $this->loadViewsFrom(__DIR__.'/Dashboard/resources/views', 'torque');

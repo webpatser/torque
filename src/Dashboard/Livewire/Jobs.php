@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire;
 
+use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\JobMetricsData;
@@ -47,7 +48,7 @@ final class Jobs extends Component
         $this->direction = $sort === 'name' ? 'asc' : 'desc';
     }
 
-    public function render()
+    public function render(): View
     {
         $window = $this->range();
 

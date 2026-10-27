@@ -56,7 +56,11 @@ final class MetricsCollector
      */
     private array $perJob = [];
 
-    /** Circular buffer holding the most recent latency samples (ms). */
+    /**
+     * Circular buffer holding the most recent latency samples (ms).
+     *
+     * @var SplFixedArray<float|null>
+     */
     private SplFixedArray $latencyBuffer;
 
     /** Write cursor into the circular buffer. */

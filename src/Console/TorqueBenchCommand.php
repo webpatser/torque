@@ -232,7 +232,7 @@ final class TorqueBenchCommand extends Command
         $this->components->twoColumnDetail('unserialize', '<fg=gray>v1.1 follow-up</>');
         $this->components->twoColumnDetail(
             'handle (median)',
-            isset($results['handle_ns_median']) && $results['handle_ns_median'] !== null
+            isset($results['handle_ns_median'])
                 ? number_format((int) $results['handle_ns_median']).' ns'
                 : '<fg=gray>--</>',
         );

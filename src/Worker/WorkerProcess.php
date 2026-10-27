@@ -147,6 +147,9 @@ LUA;
     /** This worker's XREADGROUP consumer name (`{host}-{pid}-{hex}`). */
     public private(set) string $consumerId;
 
+    /**
+     * @param  array<string, mixed>  $config
+     */
     public function __construct(array $config)
     {
         $this->config = $config;
@@ -179,7 +182,7 @@ LUA;
             (float) ($this->config['max_worker_lifetime_jitter'] ?? 0.1),
         );
         $poolSize = (int) ($this->config['pools']['redis']['size'] ?? 30);
-        /** @var string[] $queues */
+        /** @var list<string> $queues */
         $queues = (array) ($this->config['queues'] ?? ['default']);
         $connectionName = Torque::CONNECTION;
         $streams = $this->config['streams'] ?? [];
@@ -276,16 +279,8 @@ LUA;
         $this->startTime = time();
         $startTime = $this->startTime;
 
-        // Shared pause flag updated by a timer instead of per-Fiber EXISTS calls.
-        $pauseState = new \stdClass;
-        $pauseState->paused = false;
-        // Framework-paused queue names (queue:pause / queue:pause --all), kept
-        // fresh by the same 2s timer that polls Torque's own pause key.
-        $pauseState->frameworkPausedQueues = [];
-        // The effective per-queue pause set the reader fibers consume: the
-        // framework's paused queues plus any stream whose circuit breaker is
-        // open. One representation, one code path, whatever the source.
-        $pauseState->pausedQueues = [];
+        // Shared pause state, mutated by the 2s timer and read by every reader Fiber.
+        $pauseState = self::newPauseState();
 
         // Per-slot job-start tracker for the stalled-job watchdog. Indexed by
         // Fiber index; the value is the unix timestamp when the slot picked up
@@ -780,14 +775,11 @@ LUA;
      * Read a pending message (already delivered but not ACKed) from any stream.
      *
      * Uses '0-0' as the ID to fetch messages in this consumer's PEL.
-     * Non-blocking — returns null immediately when no pending messages remain.
+     * Non-blocking: returns null immediately when no pending messages remain.
      *
      * @param  string[]  $queues
-     * @return array{stream: string, id: string, payload: string}|null
-     */
-    /**
-     * @param  string[]  $queues
      * @param  \Closure(string): string  $buildStreamKey
+     * @return array{stream: string, id: string, payload: string}|null
      */
     private function readPendingMessage(
         RedisClient $readerRedis,
@@ -895,12 +887,8 @@ LUA;
      *
      * @param  string[]  $queues
      * @param  array<string, array<string, mixed>>  $streams
-     * @return array{stream: string, id: string, payload: string}|null
-     */
-    /**
-     * @param  string[]  $queues
-     * @param  array<string, array<string, mixed>>  $streams
      * @param  \Closure(string): string  $buildStreamKey
+     * @return array{stream: string, id: string, payload: string}|null
      */
     private function stealMessage(
         RedisClient $readerRedis,
@@ -1168,6 +1156,30 @@ LUA;
     public static function mergePausedQueues(array $frameworkPaused, array $circuitOpen): array
     {
         return array_values(array_unique([...$frameworkPaused, ...$circuitOpen]));
+    }
+
+    /**
+     * Fresh shared pause state for one worker run.
+     *
+     * The return shape types the fields as the mutable state they are; built
+     * inline, analysis would pin them to their initial literal values inside
+     * the timer and reader closures.
+     *
+     * @return \stdClass&object{paused: bool, frameworkPausedQueues: list<string>, pausedQueues: list<string>}
+     */
+    private static function newPauseState(): \stdClass
+    {
+        return (object) [
+            // Shared pause flag updated by a timer instead of per-Fiber EXISTS calls.
+            'paused' => false,
+            // Framework-paused queue names (queue:pause / queue:pause --all), kept
+            // fresh by the same 2s timer that polls Torque's own pause key.
+            'frameworkPausedQueues' => [],
+            // The effective per-queue pause set the reader fibers consume: the
+            // framework's paused queues plus any stream whose circuit breaker is
+            // open. One representation, one code path, whatever the source.
+            'pausedQueues' => [],
+        ];
     }
 
     /**

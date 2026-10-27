@@ -1,0 +1,7 @@
+# Testbench configuration used when Larastan boots a Laravel application for
+# static analysis. The Fledge Fiber service providers call Fledge-only APIs
+# that stock laravel/framework (pulled in by testbench) does not expose, so
+# they are excluded from package discovery. The test suite registers the
+# providers it needs explicitly in tests/TestCase.php.
+dont-discover:
+  - webpatser/fledge-fiber

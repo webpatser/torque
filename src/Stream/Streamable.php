@@ -20,6 +20,8 @@ namespace Webpatser\Torque\Stream;
  *       }
  *   }
  */
+// Public API for application jobs; nothing inside src uses it, so PHPStan cannot analyse it in context.
+// @phpstan-ignore trait.unused
 trait Streamable
 {
     /**

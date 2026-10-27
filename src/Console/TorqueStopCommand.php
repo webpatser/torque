@@ -107,7 +107,7 @@ final class TorqueStopCommand extends Command
 
         while ($waited < $maxWait) {
             // posix_kill with signal 0 returns false when the process no longer exists.
-            if (! posix_kill($pid, 0)) {
+            if (! ProcessInspector::isAlive($pid)) {
                 $this->removePidFile($pidFile);
                 $this->components->info('Torque master stopped gracefully.');
 

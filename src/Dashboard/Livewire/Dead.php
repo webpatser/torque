@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire;
 
+use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\DeadLetterData;
@@ -71,7 +72,7 @@ final class Dead extends Component
         $this->selected = [];
     }
 
-    public function render()
+    public function render(): View
     {
         $window = $this->range();
 

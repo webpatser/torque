@@ -17,7 +17,11 @@ namespace Webpatser\Torque\Job;
  */
 final class CoroutineContext
 {
-    /** @var \WeakMap<\Fiber, array<string, mixed>> */
+    /**
+     * Keyed by Fiber instance (WeakMap keys are typed as plain objects).
+     *
+     * @var \WeakMap<object, array<string, mixed>>
+     */
     private static \WeakMap $storage;
 
     public static function init(): void

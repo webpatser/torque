@@ -48,20 +48,34 @@ final class MysqlPool
     ) {
         $config = MysqlConfig::fromString($this->dsn);
 
-        $this->inner = new MysqlConnectionPool($config, $this->maxConnections);
+        // Same guard the inner pool applies, hoisted so the size is a proven
+        // positive int by the time it is handed over.
+        $maxConnections = $this->maxConnections;
+
+        if ($maxConnections < 1) {
+            throw new \Error('Pool must contain at least one connection');
+        }
+
+        $this->inner = new MysqlConnectionPool($config, $maxConnections);
     }
 
     /**
      * Execute a SQL query with optional parameters.
      *
-     * Parameters are bound positionally — use `?` placeholders.
+     * Parameters are bound positionally: use `?` placeholders. Without
+     * parameters this is a plain query; with them it runs as a one-off
+     * prepared statement, since the inner pool's query() binds nothing.
      *
      *     $result = $pool->query('SELECT * FROM users WHERE id = ?', [42]);
+     *
+     * @param  array<int|string, mixed>  $params
      */
     #[\NoDiscard]
     public function query(string $sql, array $params = []): MysqlResult
     {
-        return $this->inner->query($sql, $params);
+        return $params === []
+            ? $this->inner->query($sql)
+            : $this->inner->execute($sql, $params);
     }
 
     /**
@@ -85,6 +99,8 @@ final class MysqlPool
      * Shorthand for prepare + execute when you only need to run it once.
      *
      *     $result = $pool->execute('UPDATE jobs SET status = ? WHERE id = ?', ['done', $id]);
+     *
+     * @param  array<int|string, mixed>  $params
      */
     #[\NoDiscard]
     public function execute(string $sql, array $params = []): MysqlResult

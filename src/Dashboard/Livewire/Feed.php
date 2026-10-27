@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire;
 
+use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\JobsData;
@@ -26,7 +27,7 @@ final class Feed extends Component
         $this->filter = $filter;
     }
 
-    public function render()
+    public function render(): View
     {
         $window = $this->range();
 

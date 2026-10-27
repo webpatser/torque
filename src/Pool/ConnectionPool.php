@@ -19,6 +19,7 @@ use SplQueue;
  */
 final class ConnectionPool
 {
+    /** @var SplQueue<mixed> */
     private SplQueue $idle;
 
     private int $created = 0;
@@ -43,6 +44,12 @@ final class ConnectionPool
         private readonly \Closure $factory,
         public private(set) int $maxSize = 10,
     ) {
+        // Same guard LocalSemaphore applies, hoisted so the size is a proven
+        // positive int by the time it is handed over.
+        if ($maxSize < 1) {
+            throw new \ValueError('The number of locks must be greater than 0, got '.$maxSize);
+        }
+
         $this->idle = new SplQueue;
         $this->semaphore = new LocalSemaphore($maxSize);
     }

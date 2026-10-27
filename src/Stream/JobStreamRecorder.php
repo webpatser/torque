@@ -57,7 +57,7 @@ final class JobStreamRecorder
         }
 
         $this->record($uuid, 'started', [
-            'queue' => $event->job->getQueue() ?? 'default',
+            'queue' => $event->job->getQueue() ?: 'default',
             // The torque driver records the name on the queued event, but jobs
             // can enter through other drivers (a classic queue:work draining a
             // legacy redis list during a migration): their per-job stream then
@@ -121,6 +121,8 @@ final class JobStreamRecorder
 
     /**
      * Record a custom event emitted by the job via the Streamable trait.
+     *
+     * @param  array<array-key, mixed>  $data
      */
     public function emitCustom(string $uuid, string $message, ?float $progress = null, array $data = []): void
     {
@@ -148,6 +150,8 @@ final class JobStreamRecorder
      *
      * Both sets are trimmed opportunistically to drop entries older than the
      * per-job stream TTL.
+     *
+     * @param  array<string, mixed>  $data  Extra stream fields; values must be Redis-encodable scalars.
      */
     public function record(string $uuid, string $type, array $data, bool $terminal = false): void
     {
@@ -206,6 +210,10 @@ final class JobStreamRecorder
      */
     private function extractUuid(mixed $job): ?string
     {
+        if (! is_object($job)) {
+            return null;
+        }
+
         if (method_exists($job, 'uuid') && $job->uuid() !== '') {
             return $job->uuid();
         }

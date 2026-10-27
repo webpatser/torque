@@ -42,5 +42,8 @@ jobs:
       - name: Audit dependencies for known vulnerabilities
         run: composer audit --no-dev
 
+      - name: Static analysis
+        run: composer analyse -- --no-progress --error-format=github
+
       - name: Run tests
         run: ./vendor/bin/pest

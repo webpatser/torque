@@ -22,6 +22,8 @@ final class AutoScaler
     }
 
     public function __construct(
+        // Kept for constructor parity with sibling manager classes; not read by the scaler itself.
+        // @phpstan-ignore property.onlyWritten
         private readonly string $redisUri,
         public private(set) int $minWorkers = 2,
         public private(set) int $maxWorkers = 8,

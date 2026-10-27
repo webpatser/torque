@@ -120,14 +120,14 @@ final class Range
     #[\NoDiscard]
     public static function options(): array
     {
-        return array_values(array_map(
+        return array_map(
             static fn (string $key): array => [
                 'key' => $key,
                 'short' => self::RANGES[$key]['short'],
                 'label' => self::RANGES[$key]['label'],
             ],
             self::keys(),
-        ));
+        );
     }
 
     /**

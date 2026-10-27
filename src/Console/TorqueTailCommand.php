@@ -58,6 +58,8 @@ final class TorqueTailCommand extends Command
 
     /**
      * Render a single event to the console.
+     *
+     * @param  array{id: string, type: string, data: array<string, string>}  $event
      */
     private function renderEvent(array $event): void
     {

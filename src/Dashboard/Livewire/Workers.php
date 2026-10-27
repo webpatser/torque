@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire;
 
+use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\OverviewData;
@@ -23,7 +24,7 @@ final class Workers extends Component
 {
     use WithDashboardChrome;
 
-    public function render()
+    public function render(): View
     {
         $window = $this->range();
         $hosts = rescue(fn (): array => app(WorkersData::class)->get($window->key)['hosts'], [], false);

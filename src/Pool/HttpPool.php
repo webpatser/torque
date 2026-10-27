@@ -55,7 +55,16 @@ final class HttpPool
         public private(set) int $maxConcurrent = 15,
     ) {
         $this->client = HttpClientBuilder::buildDefault();
-        $this->semaphore = new LocalSemaphore($this->maxConcurrent);
+
+        // Same guard LocalSemaphore applies, hoisted so the limit is a proven
+        // positive int by the time it is handed over.
+        $maxConcurrent = $this->maxConcurrent;
+
+        if ($maxConcurrent < 1) {
+            throw new \ValueError('The number of locks must be greater than 0, got '.$maxConcurrent);
+        }
+
+        $this->semaphore = new LocalSemaphore($maxConcurrent);
     }
 
     /**

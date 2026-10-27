@@ -154,7 +154,7 @@ final class JobStream
      * @param  string|null  $status  Filter: 'active', 'completed', 'failed', or null for all.
      * @param  int  $limit  Maximum number of jobs to return.
      * @param  int|null  $since  Unix timestamp; drop jobs indexed before it.
-     * @return array<int, array{uuid: string, first_event: array, last_event: array}>
+     * @return list<array{uuid: string, first_event: array{id: string, type: string, data: array<string, string>}, last_event: array{id: string, type: string, data: array<string, string>}}>
      */
     public function recentJobs(?string $status = null, int $limit = 100, ?int $since = null): array
     {
@@ -317,7 +317,7 @@ final class JobStream
     /**
      * SCAN fallback for `recentJobs()` when the sorted-set index is empty.
      *
-     * @return array<int, array{uuid: string, first_event: array, last_event: array}>
+     * @return list<array{uuid: string, first_event: array{id: string, type: string, data: array<string, string>}, last_event: array{id: string, type: string, data: array<string, string>}}>
      */
     private function scanRecentJobs(?string $status, int $limit): array
     {
@@ -389,7 +389,8 @@ final class JobStream
     /**
      * Parse raw XRANGE/XREAD entries into structured arrays.
      *
-     * @return array<int, array{id: string, type: string, data: array<string, string>}>
+     * @param  array<mixed>  $rawEntries  Raw `[[id, [field, value, ...]], ...]` reply.
+     * @return list<array{id: string, type: string, data: array<string, string>}>
      */
     private function parseEntries(array $rawEntries): array
     {

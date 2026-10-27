@@ -176,13 +176,6 @@ final class DeadLetterHandler
     }
 
     /**
-     * List entries in the dead-letter stream, newest first.
-     *
-     * @param  int  $count  Maximum number of entries to return.
-     * @param  int|null  $sinceMs  Millisecond epoch; drop entries older than it.
-     * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
-     */
-    /**
      * Number of entries no older than a millisecond epoch.
      *
      * `XLEN` cannot take a range, so this is an `XRANGE` with the ids only.
@@ -211,6 +204,13 @@ final class DeadLetterHandler
         return $sinceMs === null ? '-' : max(0, $sinceMs).'-0';
     }
 
+    /**
+     * List entries in the dead-letter stream, newest first.
+     *
+     * @param  int  $count  Maximum number of entries to return.
+     * @param  int|null  $sinceMs  Millisecond epoch; drop entries older than it.
+     * @return list<array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
+     */
     #[\NoDiscard]
     public function list(int $count = 50, ?int $sinceMs = null): array
     {
@@ -255,7 +255,7 @@ final class DeadLetterHandler
      * @param  string  $beforeId  The exclusive upper bound message ID.
      * @param  int  $count  Maximum number of entries to return.
      * @param  int|null  $sinceMs  Millisecond epoch; drop entries older than it.
-     * @return array<int, array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
+     * @return list<array{id: string, payload: string, original_queue: string, exception_class: string, exception_message: string, exception_trace: string, failed_at: string}>
      */
     #[\NoDiscard]
     public function listBefore(string $beforeId, int $count = 50, ?int $sinceMs = null): array

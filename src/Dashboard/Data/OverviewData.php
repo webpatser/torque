@@ -164,6 +164,20 @@ final class OverviewData
      *
      * @param  array<int, int>  $buckets  Per-minute job counts.
      */
+    #[\NoDiscard]
+    public static function gaugeMax(float $current, array $buckets): int
+    {
+        $configured = config('torque.dashboard.gauge_max');
+
+        if ($configured !== null) {
+            return max(1, (int) $configured);
+        }
+
+        $peak = max($current, $buckets === [] ? 0 : max($buckets));
+
+        return max(100, self::roundUpToNice($peak));
+    }
+
     /**
      * Project a gauge series onto its per-bucket averages.
      *
@@ -182,20 +196,6 @@ final class OverviewData
     public static function isValidRange(string $range): bool
     {
         return Range::isValid($range);
-    }
-
-    #[\NoDiscard]
-    public static function gaugeMax(float $current, array $buckets): int
-    {
-        $configured = config('torque.dashboard.gauge_max');
-
-        if ($configured !== null) {
-            return max(1, (int) $configured);
-        }
-
-        $peak = max($current, $buckets === [] ? 0 : max($buckets));
-
-        return max(100, self::roundUpToNice($peak));
     }
 
     /**

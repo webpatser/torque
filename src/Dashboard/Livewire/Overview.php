@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire;
 
+use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\OverviewData;
@@ -21,7 +22,7 @@ final class Overview extends Component
 {
     use WithDashboardChrome;
 
-    public function render()
+    public function render(): View
     {
         // The range is the dashboard-wide one from the topbar picker; the
         // component owns none of its own.

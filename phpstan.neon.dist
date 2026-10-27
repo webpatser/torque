@@ -1,0 +1,14 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    paths:
+        - src
+
+    # Blade views and Livewire single-file components are compiled by
+    # Livewire at runtime (computed properties, anonymous classes), which
+    # PHPStan cannot model; they are not analysable PHP source.
+    excludePaths:
+        - src/Dashboard/resources
+
+    level: 8

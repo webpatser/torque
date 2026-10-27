@@ -165,7 +165,7 @@ final class TorqueStartCommand extends Command
             return self::FAILURE;
         }
 
-        if ($serializer === 'igbinary' && $hasIgbinary) {
+        if ($serializer === 'igbinary') {
             $this->components->info('Serializer: igbinary');
         } elseif ($serializer === 'json' && ! $hasIgbinary) {
             $this->components->info('Tip: install ext-igbinary for ~2x faster payload encoding (set TORQUE_SERIALIZER=igbinary).');

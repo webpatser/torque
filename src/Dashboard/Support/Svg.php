@@ -39,7 +39,7 @@ final class Svg
     /**
      * Build the line and area paths for a sparkline over the given series.
      *
-     * @param  list<float|int>  $data
+     * @param  non-empty-list<float|int>  $data
      * @return array{line: string, area: string, lastX: float, lastY: float}
      */
     public static function sparkline(array $data, float $w, float $h): array
@@ -50,7 +50,7 @@ final class Svg
         $step = $w / (max(count($data) - 1, 1));
 
         $pts = [];
-        foreach (array_values($data) as $i => $v) {
+        foreach ($data as $i => $v) {
             $pts[] = [$i * $step, $h - 3 - (($v - $min) / $span) * ($h - 6)];
         }
 

@@ -14,6 +14,8 @@ use Illuminate\Support\Facades\Gate;
  * only checked once, leaving Livewire action endpoints open to any user
  * with the `web` session.
  */
+// Used only by the Livewire single-file components under Dashboard/resources, which are excluded from analysis.
+// @phpstan-ignore trait.unused
 trait AuthorizesTorqueAccess
 {
     public function bootAuthorizesTorqueAccess(): void

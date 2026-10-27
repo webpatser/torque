@@ -66,10 +66,6 @@ final class BenchJob implements ShouldQueue
                 // Touch the blob length so the optimizer cannot eliminate it.
                 if ($this->blob !== null) {
                     $touched = strlen($this->blob);
-                    if ($touched < 0) {
-                        // Unreachable, but keeps the read live.
-                        return;
-                    }
                 }
                 break;
         }

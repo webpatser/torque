@@ -446,9 +446,8 @@ LUA;
         }
 
         foreach ($perQueue as $queue => $outcome) {
-            $outcome = array_values((array) $outcome);
-            $queueProcessed = max(0, (int) ($outcome[0] ?? 0));
-            $queueFailed = max(0, (int) ($outcome[1] ?? 0));
+            $queueProcessed = max(0, (int) $outcome[0]);
+            $queueFailed = max(0, (int) $outcome[1]);
 
             if ($queueProcessed > 0 || $queueFailed > 0) {
                 $scopes[] = [(string) $queue, $queueProcessed, $queueFailed];
@@ -534,11 +533,10 @@ LUA;
         $recorded = [];
 
         foreach ($perJob as $class => $outcome) {
-            $outcome = array_values((array) $outcome);
-            $processed = max(0, (int) ($outcome[0] ?? 0));
-            $failed = max(0, (int) ($outcome[1] ?? 0));
-            $runtimeSum = max(0.0, (float) ($outcome[2] ?? 0));
-            $runtimeMax = max(0.0, (float) ($outcome[3] ?? 0));
+            $processed = max(0, (int) $outcome[0]);
+            $failed = max(0, (int) $outcome[1]);
+            $runtimeSum = max(0.0, (float) $outcome[2]);
+            $runtimeMax = max(0.0, (float) $outcome[3]);
 
             if ($processed === 0 && $failed === 0) {
                 continue;
@@ -604,9 +602,8 @@ LUA;
 
         foreach ($perHost as $host => $outcome) {
             $host = self::normaliseHost((string) $host);
-            $outcome = array_values((array) $outcome);
-            $processed = max(0, (int) ($outcome[0] ?? 0));
-            $failed = max(0, (int) ($outcome[1] ?? 0));
+            $processed = max(0, (int) $outcome[0]);
+            $failed = max(0, (int) $outcome[1]);
 
             if ($processed > 0 || $failed > 0) {
                 $scopes[$host] = [$processed, $failed];
@@ -672,7 +669,7 @@ LUA;
             foreach ($samples as $host => $metrics) {
                 $host = self::normaliseHost((string) $host);
 
-                if ($host === '' || ! is_array($metrics) || $metrics === []) {
+                if ($host === '' || $metrics === []) {
                     continue;
                 }
 
@@ -943,7 +940,7 @@ LUA;
         $classes = array_map(strval(...), $members);
         sort($classes);
 
-        return array_values($classes);
+        return $classes;
     }
 
     /**
@@ -1447,7 +1444,9 @@ LUA;
     /**
      * Read a whole rollup hash as field => raw "processed,failed" value.
      *
-     * @return array<string, string>
+     * Bucket fields are numeric, so PHP stores them as integer keys.
+     *
+     * @return array<int|string, string>
      */
     private function readRollup(string $tier, ?string $queue): array
     {
@@ -1461,7 +1460,9 @@ LUA;
     /**
      * HGETALL one hash as an associative array.
      *
-     * @return array<string, string>
+     * Numeric fields (bucket epochs) become integer keys, as PHP always does.
+     *
+     * @return array<int|string, string>
      */
     private function readHash(string $key): array
     {
@@ -1768,7 +1769,7 @@ LUA;
      * Convert a flat [key, value, key, value, ...] array from HGETALL
      * into an associative array.
      *
-     * @param  list<mixed>  $pairs
+     * @param  array<mixed>  $pairs
      * @return array<string, string>
      */
     private function flatPairsToAssoc(array $pairs): array

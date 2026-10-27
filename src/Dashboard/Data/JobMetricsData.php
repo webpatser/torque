@@ -97,7 +97,9 @@ final class JobMetricsData
                 'classes' => count($jobs),
                 'processed' => array_sum(array_column($jobs, 'processed')),
                 'failed' => array_sum(array_column($jobs, 'failed')),
-                'slowest' => $jobs === [] ? 0.0 : max(array_column($jobs, 'maxRuntimeMs')),
+                // Runtimes are never negative, so seeding with 0.0 only covers
+                // the empty table.
+                'slowest' => max(0.0, ...array_column($jobs, 'maxRuntimeMs')),
             ],
         ];
     }
@@ -119,7 +121,7 @@ final class JobMetricsData
             return $ascending ? $comparison : -$comparison;
         });
 
-        return array_values($jobs);
+        return $jobs;
     }
 
     #[\NoDiscard]

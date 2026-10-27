@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire;
 
+use Illuminate\Contracts\View\View;
 use Illuminate\Support\Str;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
@@ -39,14 +40,14 @@ final class Inspector extends Component
     /**
      * Retry a dead-lettered job, then jump to the dead-letter screen.
      */
-    public function retry(string $id)
+    public function retry(string $id): void
     {
         rescue(fn () => app(DeadLetterHandler::class)->retry($id), null, false);
 
-        return $this->redirectRoute('torque.dead', navigate: true);
+        $this->redirectRoute('torque.dead', navigate: true);
     }
 
-    public function render()
+    public function render(): View
     {
         $chrome = $this->chrome();
 

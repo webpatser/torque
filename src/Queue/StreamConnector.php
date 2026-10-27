@@ -19,6 +19,8 @@ final class StreamConnector implements ConnectorInterface
      *  - prefix          (string)  Key prefix for all Redis keys
      *  - consumer_group  (string)  Consumer group name
      *  - serializer      (string)  Wire format: 'json' (default) or 'igbinary'
+     *
+     * @param  array<string, mixed>  $config
      */
     #[\Override]
     public function connect(array $config): StreamQueue

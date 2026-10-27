@@ -138,12 +138,12 @@ LUA;
         get => count($this->workerPids);
     }
 
+    private readonly string $artisanPath;
+
     /**
      * @param  array<string, mixed>  $config  Merged Torque config.
      * @param  Closure(string): void  $logger  Callback for outputting status messages.
      */
-    private readonly string $artisanPath;
-
     public function __construct(
         private readonly array $config,
         private readonly Closure $logger,
@@ -422,6 +422,12 @@ LUA;
             return;
         }
 
+        // Both are built together in run() when autoscale is enabled; the
+        // monitor loop only calls in here once the scaler exists.
+        if ($this->autoScaler === null || $this->metricsPublisher === null) {
+            return;
+        }
+
         $rawMetrics = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
 
         // Build the format AutoScaler expects, keyed by the worker's PID so
@@ -476,7 +482,7 @@ LUA;
     {
         ($this->logger)("Autoscaler: scaling up (workers: {$this->workerCount} -> ".($this->workerCount + 1).')');
         $this->spawnWorker();
-        $this->autoScaler->recordAction();
+        $this->autoScaler?->recordAction();
     }
 
     /**
@@ -485,7 +491,7 @@ LUA;
      * The targeted worker is added to {@see $scalingDownPids} so
      * the monitor loop does not respawn it after it drains and exits.
      *
-     * @param  array<string, array{active: int, total: int}>  $workerMetrics
+     * @param  array<int, array{active: int, total: int}>  $workerMetrics  Keyed by worker PID.
      */
     private function scaleDown(array $workerMetrics): void
     {
@@ -512,7 +518,7 @@ LUA;
 
         $this->scalingDownPids[$targetPid] = true;
         posix_kill($targetPid, SIGTERM);
-        $this->autoScaler->recordAction();
+        $this->autoScaler?->recordAction();
     }
 
     /**
@@ -763,7 +769,9 @@ LUA;
             $value = $redis->execute('GET', $prefix.'paused');
             $value = $value === null ? null : (string) $value;
 
-            if (! DrainPause::isStale($value, getmypid(), $isMasterAlive)) {
+            $selfPid = getmypid();
+
+            if ($selfPid === false || ! DrainPause::isStale($value, $selfPid, $isMasterAlive)) {
                 return false;
             }
 
@@ -1325,7 +1333,7 @@ LUA;
     {
         $pending = 0;
         $delayed = 0;
-        $probe = $this->depthProbe ??= rescue(fn (): ?StreamQueue => StreamQueueResolver::make(), null, false);
+        $probe = $this->depthProbe ??= rescue(fn (): StreamQueue => StreamQueueResolver::make(), null, false);
 
         if ($probe !== null) {
             foreach (array_keys((array) ($this->config['streams'] ?? [])) as $stream) {

@@ -321,7 +321,6 @@ final class TorqueStatusCommand extends Command
     private function getHashAll(RedisClient $redis, string $key): array
     {
         try {
-            /** @var array|null $result */
             $result = $redis->execute('HGETALL', $key);
         } catch (RedisException) {
             return [];
@@ -353,7 +352,7 @@ final class TorqueStatusCommand extends Command
         $cursor = '0';
 
         do {
-            /** @var array $result */
+            /** @var array{0: int|string, 1?: list<string>} $result */
             $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '100');
 
             $cursor = (string) $result[0];
