@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Parity
 - Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-10-20: the security policy removal in favor of the org-wide default and a follow-redirects dashboard dependency bump; nothing to port.
+- Reviewed framework v13.39.0: `JobAttempted` gained a `duration` (ms) property, computed in a `finally` around `fire()`; Torque's `WorkerProcess` does not dispatch `JobAttempted` and already times `fire()` for `JobProcessed`, so nothing carried. The other touched queue files (`Queue.php`, `CallQueuedHandler.php`, `Jobs/Job.php`, `Jobs/FakeJob.php`) were docblock-only.
 
 ## [1.0.0] - 2026-10-24
 
