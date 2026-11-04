@@ -15,7 +15,7 @@ final class StreamConnector implements ConnectorInterface
      *  - redis_uri       (string)  Redis URI, e.g. "redis://127.0.0.1:6379"
      *  - queue           (string)  Default queue/stream name
      *  - retry_after     (int)     Seconds before a job is retried
-     *  - block_for       (int)     Milliseconds XREADGROUP blocks
+     *  - block_for       (int)     Milliseconds slots sleep between empty polls (XREADGROUP itself never blocks)
      *  - prefix          (string)  Key prefix for all Redis keys
      *  - consumer_group  (string)  Consumer group name
      *  - serializer      (string)  Wire format: 'json' (default) or 'igbinary'

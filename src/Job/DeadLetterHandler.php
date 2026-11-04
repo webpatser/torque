@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Job;
 
 use Fledge\Async\Redis\RedisClient;
+use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -24,6 +25,7 @@ final class DeadLetterHandler
     /**
      * @param  array<int, string>  $allowedQueues  Whitelist of queue names permitted as retry targets.
      * @param  int  $maxEntries  Hard cap on stream length, enforced at write time. 0 = uncapped.
+     * @param  bool  $cluster  Hash tag retry targets, matching StreamQueue::getStreamKey().
      */
     public function __construct(
         private readonly string $redisUri,
@@ -31,6 +33,7 @@ final class DeadLetterHandler
         private readonly string $prefix = 'torque:',
         private readonly array $allowedQueues = [],
         private readonly int $maxEntries = 100000,
+        private readonly bool $cluster = false,
     ) {
         $this->deadLetterStream = $this->prefix.'dead-letter';
         $this->redis = createRedisClient($this->redisUri);
@@ -128,6 +131,9 @@ final class DeadLetterHandler
         $queue = $targetQueue ?? $fields['original_queue']
             ?? throw new \RuntimeException("Cannot determine target queue for [{$deadLetterId}].");
 
+        // Entries written before 1.1.2 hold the tagged name in cluster mode.
+        $queue = WorkerProcess::bareQueueName($queue, $this->cluster);
+
         // Structural check: keep Redis key space sane even when no explicit
         // whitelist is configured (e.g. when the handler is instantiated
         // outside the service provider).
@@ -138,11 +144,13 @@ final class DeadLetterHandler
         // Whitelist check: when provided, the target must match a configured
         // Torque stream so retries cannot push jobs into arbitrary streams
         // (including the dead-letter stream itself).
-        if ($this->allowedQueues !== [] && ! in_array($queue, $this->allowedQueues, true)) {
+        if ($this->allowedQueues !== [] && ! in_array($queue, array_map(fn (string $allowed): string => WorkerProcess::bareQueueName($allowed, $this->cluster), $this->allowedQueues), true)) {
             throw new \RuntimeException("Queue [{$queue}] is not a configured Torque stream.");
         }
 
-        $streamKey = $this->prefix.$queue;
+        // The structural check above leaves no braces in the name, so this is
+        // StreamQueue::getStreamKey() for it.
+        $streamKey = $this->prefix.($this->cluster ? '{'.$queue.'}' : $queue);
 
         $this->redis->execute(
             'XADD',

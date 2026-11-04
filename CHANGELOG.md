@@ -5,6 +5,33 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-04
+
+Upgrade if you rely on `Context` for tenancy or anything similar: on any install with more than one slot per worker (`coroutines_per_worker` defaults to 50), jobs could read each other's data. Read the behaviour changes below before deploying.
+
+### Fixed
+- **`Context` is now kept per attempt.** With more than one slot, concurrent jobs shared one `Context`, so a job could overwrite another's values and a child job dispatched from it could carry another job's tenant. A job starting in one slot also flushed `Context` in every other running slot. Each attempt now gets its own `Context`, including for child fibers started through `async()`.
+- **`queue:restart` now stops Torque workers.** It used to have no effect on them.
+- **`queue:clear` works.** It trims the stream with `XTRIM`, so the consumer group survives.
+- **A slot no longer dies for good when a stream read or a listener throws**, and thrown exceptions reach the exception reporter.
+- **`max_concurrency` is no longer exceeded under bursts.** A slot only counted against the cap after claiming a job, so every slot polling at the same time could claim too, and the cap could be passed by a wide margin. Slots now hold their place before reading.
+- **A worker no longer steals its own running job** while claiming idle entries.
+- **A dead consumer's message behind running entries is now reached.** The steal scan moves past the entries this worker is running instead of stopping at them.
+- **Pending entries trimmed from the stream are acknowledged**, so they no longer stay pending forever. One a slot is still running is left for that job to acknowledge.
+- **A half-open Redis connection no longer holds a slot.** A read that never got a reply waited until TCP gave up, and on a stream with `max_concurrency` 1 stopped that stream in the worker. Slot reads now give up after `redis.read_timeout` (`TORQUE_REDIS_READ_TIMEOUT`, default 30 seconds) and reconnect.
+- **Release-then-throw is handled once.** `StreamQueue::release()` is atomic, so a failed re-add no longer loses the job, and the failed attempt is not counted.
+- **Corrupt igbinary entries move to the dead-letter stream** with reason `undecodable` instead of looping.
+- **`interrupted()` and `JobInterrupted` see the job's `Context`.**
+- **Cluster mode:** per-stream settings (`max_concurrency`, `max_retries`, circuit breaker) were ignored for queues named `{q}`; dead-letter entries written under `{q}` can now be retried; `torque:flush` and `torque:monitor` use the tagged key.
+
+### Behaviour changes
+- **More errors reach your error tracker.** Thrown job exceptions, `failed()` callback errors and failer errors are now reported, unless `Worker::$reportJobExceptions` is off. Stream read failures and failing resets are reported even with it off, at most once a minute. Expect higher volume; adjust grouping or alert rules if needed.
+- **`queue:restart` in a deploy script now drains workers.** A job still running after `drain_grace_seconds` (default 10) is abandoned and re-run after `retry_after`, where the stock worker waits for it. Raise `drain_grace_seconds` if you run long jobs. As in stock, `cache:clear` or eviction of the restart key also triggers it.
+- **The stock reset closure runs when a job starts with nothing else in flight**, so scoped instances and boot-time `Log::shareContext()` are dropped at that point. At one slot that is every job; at more than one it depends on load, so behaviour differs between quiet and busy periods. Workers log a boot WARN at more than one slot naming scoped bindings that stay shared across slots. Resolve such state per job instead of at boot.
+- **Fewer re-adds and dead-letters after a throw.** Release-then-throw on the last attempt re-adds the job with no dead-letter entry; fail-then-throw no longer dead-letters at the retry limit; delete-then-throw and a throwing `JobProcessed` listener no longer re-add or dead-letter the job.
+- **`queue:clear` counts in-flight entries in its total.** Those jobs still finish.
+- **Cluster mode reports `q`, not `{q}`.** `$job->getQueue()`, circuit breaker events, metrics, `failed_jobs` and the dashboard's queues screen use the bare name. A queue configured as `{q}` now matches `queue:pause` on `q`, so re-issue any existing pause on `{q}` as `q`.
+
 ## [1.1.1] - 2026-11-04
 
 ### Fixed
@@ -624,7 +651,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v1.1.2...HEAD
+[1.1.2]: https://github.com/webpatser/torque/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/webpatser/torque/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/webpatser/torque/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/webpatser/torque/compare/v0.18.4...v1.0.0

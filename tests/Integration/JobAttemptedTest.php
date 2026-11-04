@@ -316,7 +316,19 @@ it('keeps the slot alive when a JobAttempted listener throws', function () {
 it('reports a throwing JobAttempted listener through the exception handler', function () {
     $reported = array_filter(torque_job_attempted_log(), static fn (array $row): bool => $row['type'] === 'reported');
 
-    expect(array_column($reported, 'message'))->toBe(['JobAttempted listener threw']);
+    expect(array_count_values(array_column($reported, 'message'))['JobAttempted listener threw'] ?? 0)->toBe(1);
+});
+
+it('reports each thrown job exception once, and a job failing itself not at all', function () {
+    $messages = array_column(
+        array_filter(torque_job_attempted_log(), static fn (array $row): bool => $row['type'] === 'reported'),
+        'message',
+    );
+
+    // Two attempts threw, and the refused job threw before its handler ran.
+    expect(array_count_values($messages)['probe threw'] ?? 0)->toBe(2)
+        ->and(array_filter($messages, static fn (string $message): bool => str_contains($message, 'attempted too many times')))->toHaveCount(1)
+        ->and($messages)->not->toContain('probe failed');
 });
 
 // The 1000 ms threshold leaves room for a cold first job (autoloading, a loaded

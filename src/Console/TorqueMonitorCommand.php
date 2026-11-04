@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\StreamQueueResolver;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -97,7 +98,7 @@ final class TorqueMonitorCommand extends Command
         $this->renderHeader($metrics, $masterPid, $paused);
         $this->renderMetrics($metrics);
         $this->renderWorkers($workers);
-        $this->renderQueues($config, $redisUri, $prefix);
+        $this->renderQueues($config, $redisUri);
         $this->renderFooter($metrics, $paused, (int) $this->option('refresh'));
 
         // Build frame: cursor home, each line clears to EOL, then wipe leftover lines.
@@ -263,7 +264,7 @@ final class TorqueMonitorCommand extends Command
     /**
      * @param  array<string, mixed>  $config
      */
-    private function renderQueues(array $config, string $redisUri, string $prefix): void
+    private function renderQueues(array $config, string $redisUri): void
     {
         $streams = $config['streams'] ?? [];
         if ($streams === []) {
@@ -282,9 +283,10 @@ final class TorqueMonitorCommand extends Command
 
         try {
             $redis = createRedisClient($redisUri);
+            $streamQueue = StreamQueueResolver::make();
 
             foreach (array_keys($streams) as $queue) {
-                $streamKey = $prefix.$queue;
+                $streamKey = $streamQueue->getStreamKey((string) $queue);
                 $consumerGroup = $config['consumer_group'] ?? 'torque';
 
                 $size = (int) $redis->execute('XLEN', $streamKey);

@@ -9,6 +9,7 @@ use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Torque;
+use Webpatser\Torque\Worker\WorkerProcess;
 
 /**
  * Per-stream depth read-model for the queues screen.
@@ -36,7 +37,14 @@ final class QueuesData
         $queue = StreamQueueResolver::make();
         $queues = [];
 
-        $names = array_map(strval(...), array_keys((array) config('torque.streams', [])));
+        // Workers write rollups, pauses and breaker state under the bare name, so
+        // a stream configured as `{q}` in cluster mode has to be looked up as `q`.
+        // Its depth still resolves: the queue tags a bare name again.
+        $cluster = (bool) config('torque.redis.cluster', false);
+        $names = array_values(array_unique(array_map(
+            static fn (int|string $name): string => WorkerProcess::bareQueueName((string) $name, $cluster),
+            array_keys((array) config('torque.streams', [])),
+        )));
 
         // Framework pause state (queue:pause / queue:pause --all); one cache
         // round-trip for all names. A broken cache store must not 500 the

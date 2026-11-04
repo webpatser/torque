@@ -9,6 +9,7 @@ use DateTimeInterface;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Queue\ClearableQueue;
 use Illuminate\Contracts\Queue\Queue as QueueContract;
 use Illuminate\Queue\Jobs\InspectedJob;
 use Illuminate\Queue\Queue;
@@ -26,7 +27,7 @@ use function Illuminate\Support\enum_value;
  * Every Redis command goes through {@see RedisClient::execute()} because
  * amphp/redis v2 has no typed stream helpers.
  */
-class StreamQueue extends Queue implements QueueContract
+class StreamQueue extends Queue implements ClearableQueue, QueueContract
 {
     private readonly RedisClient $redis;
 
@@ -38,6 +39,33 @@ class StreamQueue extends Queue implements QueueContract
      * @var list<string>
      */
     private const array RESERVED_NAMESPACES = ['paused', 'version', 'worker', 'metrics', 'job', 'jobs', 'dead-letter', 'cb'];
+
+    /**
+     * Lua script for an atomic release.
+     *
+     * Writes the new copy first, to the delayed set or the stream, and only then
+     * drops the original. A failing redis.call() aborts the script, so the
+     * original then stays in the stream and the PEL for reclaim. The write must
+     * be the first command: under Redis OOM with noeviction XACK and XDEL are
+     * still allowed while XADD and ZADD are refused.
+     *
+     * KEYS[1] = stream key
+     * KEYS[2] = delayed sorted set key
+     * ARGV[1] = consumer group
+     * ARGV[2] = id of the entry being released
+     * ARGV[3] = new payload
+     * ARGV[4] = delayed score, empty to add to the stream at once
+     */
+    private const LUA_RELEASE = <<<'LUA'
+if ARGV[4] ~= '' then
+    redis.call('ZADD', KEYS[2], ARGV[4], ARGV[3])
+else
+    redis.call('XADD', KEYS[1], '*', 'payload', ARGV[3])
+end
+redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
+redis.call('XDEL', KEYS[1], ARGV[2])
+return 1
+LUA;
 
     public function __construct(
         private readonly string $redisUri,
@@ -268,7 +296,16 @@ class StreamQueue extends Queue implements QueueContract
             $payload,
         );
 
-        // Record "queued" event to per-job stream.
+        $this->recordQueued($payload, $queue);
+
+        return (string) $messageId;
+    }
+
+    /**
+     * Record the "queued" event to the per-job stream.
+     */
+    private function recordQueued(string $payload, \UnitEnum|string|null $queue): void
+    {
         try {
             $decoded = self::decodePayload($payload, $this->serializer);
 
@@ -282,8 +319,6 @@ class StreamQueue extends Queue implements QueueContract
         } catch (\Throwable) {
             // Never break job dispatch for stream recording.
         }
-
-        return (string) $messageId;
     }
 
     /**
@@ -422,6 +457,29 @@ class StreamQueue extends Queue implements QueueContract
     public function size($queue = null): int
     {
         return (int) $this->redis->execute('XLEN', $this->getStreamKey($queue));
+    }
+
+    /**
+     * Delete every waiting and delayed job of a queue.
+     *
+     * The stream is emptied with XTRIM MAXLEN 0, never DEL: DEL would destroy
+     * the consumer group and a running worker would then fail on its next read.
+     * Entries a worker holds in the PEL are trimmed from the stream as well
+     * (so they count here) but their PEL records stay until the worker acks.
+     * The delayed set is emptied atomically with ZREMRANGEBYRANK.
+     *
+     * @param  \UnitEnum|string|null  $queue
+     * @return int Stream entries plus delayed jobs removed.
+     */
+    #[\Override]
+    public function clear($queue = null): int
+    {
+        $streamKey = $this->getStreamKey($queue);
+
+        $trimmed = (int) $this->redis->execute('XTRIM', $streamKey, 'MAXLEN', '0');
+        $delayed = (int) $this->redis->execute('ZREMRANGEBYRANK', $streamKey.':delayed', '0', '-1');
+
+        return $trimmed + $delayed;
     }
 
     /**
@@ -746,7 +804,7 @@ class StreamQueue extends Queue implements QueueContract
      */
     public function deleteAndAcknowledge(string $queue, string $messageId): void
     {
-        $streamKey = $this->prefix.$queue;
+        $streamKey = $this->getStreamKey($queue);
 
         $this->redis->execute('XACK', $streamKey, $this->consumerGroup, $messageId);
         $this->redis->execute('XDEL', $streamKey, $messageId);
@@ -755,26 +813,33 @@ class StreamQueue extends Queue implements QueueContract
     /**
      * Release a job back onto the queue, optionally with a delay.
      *
-     * The original message is ACKed and a new one is pushed with an
-     * incremented attempt counter.
+     * A new message with an incremented attempt counter replaces the original
+     * in one script. When that write fails the error reaches the caller and the
+     * original stays in the stream and the PEL, so it is redelivered.
      */
     public function release(string $queue, StreamJob $job, int $delay = 0): void
     {
-        $streamKey = $this->prefix.$queue;
-
-        // Acknowledge the original message so it leaves the PEL.
-        $this->redis->execute('XACK', $streamKey, $this->consumerGroup, $job->messageId);
-        $this->redis->execute('XDEL', $streamKey, $job->messageId);
+        $streamKey = $this->getStreamKey($queue);
 
         // Rebuild payload with incremented attempts.
         $payload = self::decodePayload($job->getRawBody(), $this->serializer);
         $payload['attempts'] = ($payload['attempts'] ?? 0) + 1;
         $newPayload = $this->encodePayload($payload);
 
-        if ($delay > 0) {
-            $this->laterRaw($delay, $newPayload, $queue);
-        } else {
-            $this->pushRaw($newPayload, $queue);
+        $this->redis->execute(
+            'EVAL',
+            self::LUA_RELEASE,
+            '2',
+            $streamKey,
+            $streamKey.':delayed',
+            $this->consumerGroup,
+            $job->messageId,
+            $newPayload,
+            $delay > 0 ? (string) $this->availableAt($delay) : '',
+        );
+
+        if ($delay <= 0) {
+            $this->recordQueued($newPayload, $queue);
         }
     }
 

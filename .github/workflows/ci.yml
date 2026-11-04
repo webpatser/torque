@@ -34,6 +34,7 @@ jobs:
         with:
           php-version: '8.5'
           coverage: none
+          extensions: igbinary
           tools: composer:v2
 
       - name: Install dependencies

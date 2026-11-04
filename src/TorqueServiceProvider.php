@@ -93,6 +93,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 // the retry whitelist compares strictly against strings.
                 allowedQueues: array_map(strval(...), array_keys($config['streams'] ?? [])),
                 maxEntries: (int) ($config['dead_letter']['max_entries'] ?? 100000),
+                cluster: (bool) ($config['redis']['cluster'] ?? false),
             );
         });
 

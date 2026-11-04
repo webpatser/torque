@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\StreamQueueResolver;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -56,6 +57,7 @@ final class TorqueFlushCommand extends Command
 
         try {
             $redis = createRedisClient($redisUri);
+            $streamQueue = StreamQueueResolver::make();
         } catch (\Throwable $e) {
             $this->components->error("Cannot connect to Redis: {$e->getMessage()}");
 
@@ -66,7 +68,7 @@ final class TorqueFlushCommand extends Command
         $totalDelayed = 0;
 
         foreach ($queues as $queue) {
-            $streamKey = $prefix.$queue;
+            $streamKey = $streamQueue->getStreamKey((string) $queue);
             $delayedKey = $streamKey.':delayed';
 
             // Count before flushing.

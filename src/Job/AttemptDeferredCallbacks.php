@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Job;
 
 use Closure;
-use Fledge\Async\FiberContext;
 use Illuminate\Contracts\Container\Container;
 use Illuminate\Support\Defer\DeferredCallbackCollection;
 
@@ -19,22 +18,15 @@ use Illuminate\Support\Defer\DeferredCallbackCollection;
  * that suspends could run twice, since invokeWhen() removes a callback only
  * after it returns.
  *
- * So every attempt gets a stock collection of its own, and this class routes
- * each call to the collection of the attempt the caller belongs to. The
+ * So every {@see AttemptScope} holds a stock collection of its own, and this
+ * class routes each call to the scope of the attempt the caller belongs to. The
  * framework's listener stays as it is: JobAttempted is dispatched from the
  * slot's Fiber, so its invokeWhen() reaches exactly that attempt's callbacks.
  *
- * Ownership lives in {@see CoroutineContext}, which is per Fiber. A job's own
- * child Fibers have no link to the slot's Fiber, so a {@see FiberContext} hook
- * carries the owner across async(), which every concurrency helper goes
- * through (Concurrency's fiber driver, FiberDB, Pipeline, disperse).
- *
- * Callers without an owner share one ambient collection, as code outside a job
+ * Callers without a scope share the ambient collection, as code outside a job
  * always did: a command's CommandFinished listener still finds its callbacks
- * there. That includes code a job starts without async(), such as a raw Fiber
- * or an event loop timer, since nothing links those to the attempt. A worker
- * normally ends in a hard exit, so ambient callbacks there accumulate until the
- * worker rotates and may never run.
+ * there. A worker normally ends in a hard exit, so ambient callbacks there
+ * accumulate until the worker rotates and may never run.
  *
  * A child Fiber outliving its attempt keeps writing to that attempt's
  * collection. JobAttempted has been announced by then, so those late callbacks
@@ -42,19 +34,6 @@ use Illuminate\Support\Defer\DeferredCallbackCollection;
  */
 final class AttemptDeferredCallbacks extends DeferredCallbackCollection
 {
-    private const string CONTEXT_KEY = 'torque.deferred_callbacks';
-
-    private const string HOOK = 'torque.deferred_callbacks';
-
-    private readonly DeferredCallbackCollection $ambient;
-
-    public function __construct()
-    {
-        $this->ambient = new DeferredCallbackCollection;
-
-        CoroutineContext::init();
-    }
-
     /**
      * Bind a routing collection into the container and start carrying the
      * owning attempt across async().
@@ -65,35 +44,22 @@ final class AttemptDeferredCallbacks extends DeferredCallbackCollection
      */
     public static function install(Container $container): self
     {
+        AttemptScope::propagateAcrossAsync();
+        AttemptScope::ambient()->deferredCallbacks = new DeferredCallbackCollection;
+
         $collection = new self;
 
         $container->scoped(DeferredCallbackCollection::class, static fn (): self => $collection);
-
-        FiberContext::register(
-            self::HOOK,
-            static fn (): ?DeferredCallbackCollection => CoroutineContext::get(self::CONTEXT_KEY),
-            static function (mixed $owner): ?Closure {
-                if (! $owner instanceof DeferredCallbackCollection) {
-                    return null;
-                }
-
-                CoroutineContext::set(self::CONTEXT_KEY, $owner);
-
-                // Revolt reuses callback Fibers, so the next closure on this
-                // one must not inherit the owner.
-                return static fn () => CoroutineContext::forget(self::CONTEXT_KEY);
-            },
-        );
 
         return $collection;
     }
 
     /**
-     * Give the current Fiber's attempt its own, empty collection.
+     * Give the current Fiber's attempt its own, empty scope.
      */
     public function beginAttempt(): void
     {
-        CoroutineContext::set(self::CONTEXT_KEY, new DeferredCallbackCollection);
+        AttemptScope::begin();
     }
 
     /**
@@ -101,7 +67,7 @@ final class AttemptDeferredCallbacks extends DeferredCallbackCollection
      */
     public function endAttempt(): void
     {
-        CoroutineContext::forget(self::CONTEXT_KEY);
+        AttemptScope::end();
     }
 
     public function first()
@@ -146,6 +112,6 @@ final class AttemptDeferredCallbacks extends DeferredCallbackCollection
 
     private function current(): DeferredCallbackCollection
     {
-        return CoroutineContext::get(self::CONTEXT_KEY) ?? $this->ambient;
+        return AttemptScope::current()->deferredCallbacks;
     }
 }

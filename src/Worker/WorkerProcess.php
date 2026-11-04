@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Worker;
 
+use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
@@ -26,10 +27,13 @@ use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\Worker;
 use Revolt\EventLoop;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
+use Webpatser\Torque\Job\AttemptContextRepository;
 use Webpatser\Torque\Job\AttemptDeferredCallbacks;
+use Webpatser\Torque\Job\AttemptScope;
 use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Job\CoroutineContext;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Job\QuiescentReset;
 use Webpatser\Torque\Metrics\MetricsCollector;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Pool\RedisPool;
@@ -41,14 +45,15 @@ use Webpatser\Torque\Torque;
 
 use function Fledge\Async\async;
 use function Fledge\Async\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisConnector;
 
 /**
  * The heart of Torque. Runs inside a forked child process with a Revolt event loop.
  *
  * Each worker reads jobs from one or more Redis Streams via XREADGROUP, then
  * dispatches them concurrently using Fibers gated by a semaphore. A dedicated
- * (non-pooled) Redis connection is used for blocking XREADGROUP reads so pool
- * connections are never tied up during BLOCK waits.
+ * (non-pooled) Redis connection is used for the non-blocking XREADGROUP reads
+ * so pool connections are never tied up by polling.
  */
 final class WorkerProcess
 {
@@ -73,11 +78,23 @@ end
 return #entries
 LUA;
 
+    /**
+     * XAUTOCLAIM round trips one poll may spend per stream. Each looks at about
+     * ten PEL entries at COUNT 1; the cursor carries on from there at the next poll.
+     */
+    private const STEAL_SCANS_PER_POLL = 8;
+
+    /** Seconds a slot's read waits for a reply when `redis.read_timeout` is not set. */
+    private const DEFAULT_READ_TIMEOUT = 30.0;
+
     public private(set) bool $isRunning = false;
 
     public private(set) int $jobsProcessed = 0;
 
     private bool $stopRequested = false;
+
+    /** True while a queue:restart cache read is awaiting its reply, so ticks do not overlap. */
+    private bool $restartChecking = false;
 
     /**
      * Set once the process is going down: on the worker's own exit paths and,
@@ -94,9 +111,10 @@ LUA;
     }
 
     /**
-     * Jobs currently being processed per stream, keyed by queue name. Shared
-     * across this worker's Fibers (single-threaded event loop, mutated only
-     * between awaits) to enforce per-stream `max_concurrency`.
+     * Jobs currently being processed per stream plus reads in flight on it,
+     * keyed by queue name. Shared across this worker's Fibers (single-threaded
+     * event loop, mutated only between awaits) to enforce per-stream
+     * `max_concurrency`.
      *
      * @var array<string, int>
      */
@@ -139,6 +157,17 @@ LUA;
      */
     private array $finishedDuringRead = [];
 
+    /**
+     * Where the next XAUTOCLAIM of each stream continues, keyed by stream key.
+     * Starting every scan at 0-0 would look at the same first entries forever:
+     * Redis stops a COUNT 1 scan after about ten entries that are not idle yet,
+     * so a dead message behind those would never be reached. Slots overwriting
+     * each other's cursor can only skip entries until the scan wraps around.
+     *
+     * @var array<string, string>
+     */
+    private array $stealCursors = [];
+
     /** Limits — set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
@@ -159,11 +188,29 @@ LUA;
     public private(set) string $consumerId;
 
     /**
+     * Exceptions already handed to the exception handler, so one object that
+     * surfaces on two paths (a listener rethrowing the job's exception) is
+     * reported once. Entries go away with the exception.
+     *
+     * @var \WeakMap<\Throwable, true>
+     */
+    private \WeakMap $reported;
+
+    /**
+     * When a recurring worker-level failure was last announced, by a fixed key:
+     * an event class or the read path. hrtime in seconds.
+     *
+     * @var array<string, int>
+     */
+    private array $lastAnnounced = [];
+
+    /**
      * @param  array<string, mixed>  $config
      */
     public function __construct(array $config)
     {
         $this->config = $config;
+        $this->reported = new \WeakMap;
         $this->consumerId = gethostname().'-'.getmypid().'-'.bin2hex(random_bytes(4));
     }
 
@@ -205,14 +252,22 @@ LUA;
         // Pool for job operations (delete, release, etc.)
         $redisPool = new RedisPool($redisUri, size: $poolSize);
 
-        // Each Fiber gets its own reader Redis connection since XREADGROUP BLOCK
-        // holds the connection for the duration of the wait.
+        // Each Fiber gets its own reader Redis connection so concurrent reads
+        // never share a socket mid-protocol.
         // We create them lazily inside the Fiber loop instead of sharing one.
 
         $metrics = new MetricsCollector(totalSlots: $concurrency);
         $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix, settings: $this->config['metrics'] ?? []);
 
         $cluster = (bool) ($this->config['redis']['cluster'] ?? false);
+
+        // One name per queue from here on, whichever way the config wrote it:
+        // the hash tag belongs to the Redis key, which $buildStreamKey adds back.
+        $queues = array_values(array_unique(array_map(
+            static fn (string $queue): string => self::bareQueueName($queue, $cluster),
+            $queues,
+        )));
+        $streams = self::bareStreamConfigs($streams, $cluster);
 
         $streamQueue = new StreamQueue(
             redisUri: $redisUri,
@@ -228,9 +283,23 @@ LUA;
         $events = app(Dispatcher::class);
         $queueManager = app('queue');
 
-        // defer() callbacks belong to the attempt that registered them; the
-        // framework's shared collection assumes one job at a time.
-        $deferredCallbacks = AttemptDeferredCallbacks::install(app());
+        // Context and defer() callbacks belong to the attempt that registered
+        // them; the framework's shared instances assume one job at a time.
+        AttemptContextRepository::install(app());
+        AttemptDeferredCallbacks::install(app());
+
+        // Not a job's exception, so like a failed read it is reported whatever
+        // Worker::$reportJobExceptions says, and at most once a minute: it fails
+        // again at every quiet moment until someone fixes it.
+        $quiescentReset = QuiescentReset::for(app(), function (\Throwable $e): void {
+            if ($this->mayAnnounce('quiescent reset', 60)) {
+                $this->reportSafely($e);
+            }
+        });
+
+        if ($concurrency > 1 && ($shared = QuiescentReset::userScopedBindings(app())) !== []) {
+            fwrite(STDERR, "[torque:worker] WARN coroutines_per_worker={$concurrency}: these scoped bindings are shared by concurrent jobs and reset only when no job is in flight, which may never happen under sustained load: ".implode(', ', $shared)."\n");
+        }
 
         // Mirror queue:work's failed-job bookkeeping (WorkCommand::listenForEvents):
         // the failed-jobs provider write is a listener concern of the worker command
@@ -238,7 +307,7 @@ LUA;
         // failure lands in the dead-letter stream but queue:failed and queue:retry
         // stay empty. Guarded so a broken failer write is loud but never fatal.
         $failerSerializer = (string) ($this->config['serializer'] ?? 'json');
-        $events->listen(JobFailed::class, static function (JobFailed $event) use ($failerSerializer): void {
+        $events->listen(JobFailed::class, function (JobFailed $event) use ($failerSerializer): void {
             try {
                 app('queue.failer')->log(
                     $event->connectionName,
@@ -248,6 +317,10 @@ LUA;
                 );
             } catch (\Throwable $e) {
                 fwrite(STDERR, "[torque:worker] failed-jobs log threw: {$e->getMessage()}\n");
+
+                if (Worker::$reportJobExceptions) {
+                    $this->reportSafely($e);
+                }
             }
         });
 
@@ -291,6 +364,22 @@ LUA;
             fwrite(STDERR, $e->getTraceAsString()."\n");
         });
 
+        // Timestamp of the last queue:restart at start-up; a later change means
+        // a deploy asked for fresh code.
+        $restartBaseline = null;
+        $restartBaselineKnown = false;
+        $restartReadFailed = false;
+
+        if (Worker::$restartable && ($restartCache = $this->crashCache()) !== null) {
+            try {
+                $restartBaseline = $restartCache->get('illuminate:queue:restart');
+                $restartBaselineKnown = true;
+            } catch (\Throwable $e) {
+                $restartReadFailed = true;
+                fwrite(STDERR, "[torque:worker] queue:restart key unreadable ({$e->getMessage()}), ignoring\n");
+            }
+        }
+
         fwrite(STDERR, "[torque:worker] Setup complete, entering event loop\n");
 
         $this->maxJobs = $maxJobs;
@@ -313,6 +402,12 @@ LUA;
         /** @var array<int, StreamJob> $slotJobs */
         $slotJobs = [];
 
+        // Per-slot attempt scope, so a signal callback can run a job's interrupted()
+        // in it. A slot's job is in $slotJobs before its scope exists, but it has
+        // no resolved command until after that, so notifyInterrupted() skips it.
+        /** @var array<int, AttemptScope> $slotScopes */
+        $slotScopes = [];
+
         // Install signal handlers for graceful shutdown.
         // On SIGTERM/SIGINT we (1) flag the worker to stop, (2) dispatch
         // Laravel's WorkerInterrupted event once, (3) forward the signal
@@ -322,9 +417,9 @@ LUA;
         // 13.7.0 (PRs #59833, #59848) and extended in 13.31.0 with the
         // JobInterrupted event, adapted for N concurrent fibers.
         $primaryQueue = $queues[0] ?? 'default';
-        $shutdownHandler = function (int $signal) use ($events, $connectionName, $primaryQueue, &$slotJobs) {
+        $shutdownHandler = function (int $signal) use ($events, $connectionName, $primaryQueue, &$slotJobs, &$slotScopes) {
             $this->stopRequested = true;
-            $this->notifyInterrupted($signal, $slotJobs, $events, $connectionName, $primaryQueue);
+            $this->notifyInterrupted($signal, $slotJobs, $events, $connectionName, $primaryQueue, $slotScopes);
         };
 
         EventLoop::onSignal(SIGTERM, fn () => $shutdownHandler(SIGTERM));
@@ -382,10 +477,42 @@ LUA;
         // OOM), we get reparented and would otherwise keep consuming as an orphan
         // forever. Detect the reparenting and drain out through the normal stop path.
         $masterPid = posix_getppid();
-        EventLoop::repeat(2.0, function () use ($masterPid) {
+        EventLoop::repeat(2.0, function () use ($masterPid, &$restartBaseline, &$restartBaselineKnown, &$restartReadFailed) {
             if (! $this->stopRequested && posix_getppid() !== $masterPid) {
                 fwrite(STDERR, "[torque:worker] Master (PID {$masterPid}) is gone, shutting down orphaned worker\n");
                 $this->stopRequested = true;
+            }
+
+            // queue:restart: the same timestamp comparison as the stock worker,
+            // checked here so an idle worker notices too. A change drains out
+            // through the normal stop path (exit 0, which the master respawns).
+            if ($this->stopRequested || ! Worker::$restartable || $this->restartChecking
+                || ($cache = $this->crashCache()) === null) {
+                return;
+            }
+
+            $this->restartChecking = true;
+
+            try {
+                $current = $cache->get('illuminate:queue:restart');
+                $restartReadFailed = false;
+
+                if (! $restartBaselineKnown) {
+                    // The start-up read failed: adopt the first good value, so
+                    // an outage is never mistaken for a restart.
+                    $restartBaseline = $current;
+                    $restartBaselineKnown = true;
+                } elseif ($current != $restartBaseline) {
+                    fwrite(STDERR, "[torque:worker] Received queue:restart signal, draining and exiting.\n");
+                    $this->stopRequested = true;
+                }
+            } catch (\Throwable $e) {
+                if (! $restartReadFailed) {
+                    $restartReadFailed = true;
+                    fwrite(STDERR, "[torque:worker] queue:restart key unreadable ({$e->getMessage()}), ignoring\n");
+                }
+            } finally {
+                $this->restartChecking = false;
             }
         });
 
@@ -414,15 +541,18 @@ LUA;
                 $pauseState,
                 $concurrency,
                 $buildStreamKey,
-                $deferredCallbacks,
+                $quiescentReset,
+                $cluster,
                 &$slotStarts,
                 &$slotJobs,
+                &$slotScopes,
             ) {
                 // Stagger Fiber startup to spread polling across time.
                 \Fledge\Async\delay($fiberIndex * ($pollInterval / $concurrency));
 
-                $fiberRedis = createRedisClient($redisUri);
+                $fiberRedis = $this->createReaderClient($redisUri);
                 $loopCount = 0;
+                $readFailures = 0;
 
                 while (true) {
                     if ($this->hasReachedLimits()) {
@@ -435,13 +565,15 @@ LUA;
                         continue;
                     }
 
-                    $events->dispatch(new Looping($connectionName, $queues[0] ?? 'default'));
+                    // Fires on every poll of every slot, so a broken listener is
+                    // announced once a minute, not once per poll.
+                    $this->dispatchSafely($events, new Looping($connectionName, $queues[0] ?? 'default'), announceEverySeconds: 60);
 
                     // Per-stream concurrency cap: exclude streams that already
-                    // have max_concurrency jobs in flight in this worker. The
-                    // cap is approximate under bursts (fibers that passed this
-                    // filter may still be awaiting their read), overshooting by
-                    // at most the number of concurrently-polling fibers.
+                    // have max_concurrency jobs or reads in flight in this
+                    // worker. Each read below counts until it returns, so slots
+                    // that poll at the same moment cannot pass this check on
+                    // the same free place.
                     $pollQueues = self::eligibleQueues($queues, $streams, $this->streamActive, $pauseState->pausedQueues);
 
                     $loopCount++;
@@ -452,22 +584,54 @@ LUA;
                         continue;
                     }
 
-                    // Non-blocking poll for new messages.
-                    $message = $this->readNextMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
-
-                    // Periodically re-check PEL for any orphaned messages (~every 25s).
-                    if ($message === null && $loopCount % 50 === 0) {
-                        $message = $this->readPendingMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
+                    // Nothing suspends between the check above and this, or
+                    // between the end of the read and the count for its job.
+                    foreach ($pollQueues as $polled) {
+                        $this->streamActive[$polled] = ($this->streamActive[$polled] ?? 0) + 1;
                     }
 
-                    // Drain pending on first iteration (crash recovery).
-                    if ($message === null && $loopCount === 1) {
-                        $message = $this->readPendingMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
-                    }
+                    try {
+                        try {
+                            // Non-blocking poll for new messages.
+                            $message = $this->readNextMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
 
-                    // Still nothing: steal from dead consumers.
-                    if ($message === null) {
-                        $message = $this->stealMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $streams, $buildStreamKey);
+                            // Periodically re-check PEL for any orphaned messages (~every 25s).
+                            if ($message === null && $loopCount % 50 === 0) {
+                                $message = $this->readPendingMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
+                            }
+
+                            // Drain pending on first iteration (crash recovery).
+                            if ($message === null && $loopCount === 1) {
+                                $message = $this->readPendingMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
+                            }
+
+                            // Still nothing: steal from dead consumers.
+                            if ($message === null) {
+                                $message = $this->stealMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $streams, $buildStreamKey);
+                            }
+                        } finally {
+                            // Before the back-off below: a slot with a broken
+                            // connection must not hold other slots off the stream.
+                            foreach ($pollQueues as $polled) {
+                                $this->streamActive[$polled]--;
+                            }
+                        }
+
+                        $readFailures = 0;
+                    } catch (\Throwable $e) {
+                        // A throw here would end this Fiber, and the slot with
+                        // it, until the worker rotates. Redis errors can last
+                        // (outage, NOGROUP after a flush), hence the back-off.
+                        // The next limit check still stops the worker on time.
+                        $this->backOffSlot($fiberIndex, 'failed to read', $e, ++$readFailures);
+
+                        try {
+                            $fiberRedis = $this->createReaderClient($redisUri);
+                        } catch (\Throwable $reconnect) {
+                            fwrite(STDERR, "[torque:worker] Fiber {$fiberIndex} reconnect failed: {$reconnect->getMessage()}\n");
+                        }
+
+                        continue;
                     }
 
                     if ($message === null) {
@@ -477,16 +641,17 @@ LUA;
                         // Liveness check: PING the per-Fiber reader connection every
                         // ~30 idle iterations (~60s at default pollInterval). On a
                         // half-open socket (common after NAT timeout, redis client
-                        // output buffer kill, or a server restart), XREADGROUP can
-                        // block forever waiting for a reply that never comes. PING
-                        // surfaces the dead client so we can recreate it.
+                        // output buffer kill, or a server restart), a reply never
+                        // comes. The reads above then end through the read timeout
+                        // and the catch; this replaces a client whose PING fails,
+                        // and is subject to the same timeout.
                         if ($loopCount % 30 === 0) {
                             try {
                                 $fiberRedis->execute('PING');
                             } catch (\Throwable $e) {
                                 fwrite(STDERR, "[torque:worker] Fiber {$fiberIndex} reader Redis dead ({$e->getMessage()}); reconnecting.\n");
                                 try {
-                                    $fiberRedis = createRedisClient($redisUri);
+                                    $fiberRedis = $this->createReaderClient($redisUri);
                                 } catch (\Throwable $reconnect) {
                                     fwrite(STDERR, "[torque:worker] Fiber {$fiberIndex} reconnect failed: {$reconnect->getMessage()}\n");
                                 }
@@ -503,45 +668,74 @@ LUA;
                     $jobStartTime = hrtime(true);
                     $slotStarts[$fiberIndex] = time();
 
-                    $queueName = $this->resolveQueueName($message['stream'], $prefix);
+                    $queueName = self::queueNameFromStreamKey($message['stream'], $prefix, $cluster);
 
                     $wireSerializer = (string) ($this->config['serializer'] ?? 'json');
 
-                    if (! StreamQueue::isValidPayload($message['payload'], $wireSerializer)) {
-                        // An igbinary entry the configured serializer refuses to
-                        // decode (leftover from an earlier run) is parked in the
-                        // dead-letter stream undecoded, so it can be recovered
-                        // after switching TORQUE_SERIALIZER back. Park first: if
-                        // the write throws, the entry stays pending for reclaim.
-                        if (StreamQueue::isSerializerMismatch($message['payload'], $wireSerializer)) {
-                            $deadLetterHandler->quarantine($queueName, $message['payload'], $message['id'], 'serializer_mismatch');
+                    try {
+                        $streamJob = null;
+                        $quarantineReason = null;
+
+                        if (StreamQueue::isValidPayload($message['payload'], $wireSerializer)) {
+                            try {
+                                $streamJob = new StreamJob(
+                                    container: app(),
+                                    streamQueue: $streamQueue,
+                                    rawBody: $message['payload'],
+                                    messageId: $message['id'],
+                                    connectionName: $connectionName,
+                                    queue: $queueName,
+                                );
+                            } catch (\Throwable $undecodable) {
+                                // The pre-flight check reads the header only, so a
+                                // corrupt igbinary body gets here. Left alone it
+                                // would come back at every pending read, forever.
+                                fwrite(STDERR, "[torque:worker] Quarantining undecodable message {$message['id']}: {$undecodable->getMessage()}\n");
+                                $quarantineReason = 'undecodable';
+                            }
+                        } elseif (StreamQueue::isSerializerMismatch($message['payload'], $wireSerializer)) {
+                            // An igbinary entry the configured serializer refuses to
+                            // decode (leftover from an earlier run) can be recovered
+                            // after switching TORQUE_SERIALIZER back.
+                            $quarantineReason = 'serializer_mismatch';
                         }
 
-                        // Corrupt payload, unrecognized format: acknowledge and discard.
-                        // recordJobFailed() balances the recordJobStarted() above;
-                        // without it every corrupt payload leaks one activeSlot for
-                        // the life of the process, so the gauge never returns to 0.
-                        $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
-                        $metrics->recordJobFailed(
-                            (hrtime(true) - $jobStartTime) / 1_000_000,
-                            $queueName,
-                        );
+                        if ($streamJob === null) {
+                            // Park first: if the write throws, the entry stays
+                            // pending for reclaim, and so it does on a crash between
+                            // the two calls.
+                            if ($quarantineReason !== null) {
+                                $deadLetterHandler->quarantine($queueName, $message['payload'], $message['id'], $quarantineReason);
+                            }
+
+                            // Corrupt payload, unrecognized format: acknowledge and discard.
+                            // recordJobFailed() balances the recordJobStarted() above;
+                            // without it every corrupt payload leaks one activeSlot for
+                            // the life of the process, so the gauge never returns to 0.
+                            $streamQueue->deleteAndAcknowledge($queueName, $message['id']);
+                            $metrics->recordJobFailed(
+                                (hrtime(true) - $jobStartTime) / 1_000_000,
+                                $queueName,
+                            );
+                            unset($slotStarts[$fiberIndex]);
+                            $this->releaseInFlight($inFlightKey);
+                            CoroutineContext::flush();
+                            $this->jobsProcessed++;
+
+                            continue;
+                        }
+                    } catch (\Throwable $e) {
+                        // No attempt started, and the message stays in the PEL for
+                        // the pending read. Undo the claim so that read can take it
+                        // and a drain does not wait for a job nobody is running.
+                        $metrics->recordJobFailed((hrtime(true) - $jobStartTime) / 1_000_000, $queueName);
                         unset($slotStarts[$fiberIndex]);
                         $this->releaseInFlight($inFlightKey);
-                        CoroutineContext::flush();
-                        $this->jobsProcessed++;
+                        $this->backOffSlot($fiberIndex, 'failed to start a job', $e, 1);
 
                         continue;
                     }
 
-                    $streamJob = new StreamJob(
-                        container: app(),
-                        streamQueue: $streamQueue,
-                        rawBody: $message['payload'],
-                        messageId: $message['id'],
-                        connectionName: $connectionName,
-                        queue: $queueName,
-                    );
                     $slotJobs[$fiberIndex] = $streamJob;
                     $this->streamActive[$queueName] = ($this->streamActive[$queueName] ?? 0) + 1;
 
@@ -550,7 +744,13 @@ LUA;
                     $attemptException = null;
                     $attemptEnded = false;
 
-                    $deferredCallbacks->beginAttempt();
+                    // After the claim above, so a second slot sees this one in
+                    // flight, and with $slotStarts set, so a drain waits for it.
+                    $quiescentReset->beforeAttempt(count($this->inFlight));
+
+                    // Before JobProcessing: its Context hydrate flushes, and that
+                    // must reach this attempt only. Ends after JobAttempted.
+                    $slotScopes[$fiberIndex] = AttemptScope::begin();
 
                     try {
                         $this->processMessage($streamJob, $events, $connectionName, $attemptDuration);
@@ -569,12 +769,21 @@ LUA;
                         $attemptException = $e;
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
                         $metrics->recordJobFailed($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
-                        $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler, $circuitBreaker);
+
+                        try {
+                            $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler, $circuitBreaker);
+                        } catch (\Throwable $handlingFailure) {
+                            // Redis gone during the release or dead-letter write.
+                            // An unacknowledged message stays in the PEL for
+                            // reclaim; the slot must outlive this either way.
+                            fwrite(STDERR, "[torque:worker] Handling a job failure threw: {$handlingFailure->getMessage()}\n");
+                            $this->reportSafely($handlingFailure);
+                        }
                     } finally {
                         // The command is done: a signal arriving while a
                         // listener below suspends must not interrupt it.
                         // $slotStarts stays set so a drain still waits.
-                        unset($slotJobs[$fiberIndex]);
+                        unset($slotJobs[$fiberIndex], $slotScopes[$fiberIndex]);
 
                         // PHP also runs this block when it destroys the Fiber at
                         // shutdown, whatever the attempt was doing. That job was
@@ -587,9 +796,16 @@ LUA;
                             // failed), so it is not a crash: drop its marker.
                             $this->forgetProcessingMarker($streamJob);
                             $this->dispatchJobAttempted($events, $connectionName, $streamJob, $attemptException, $attemptDuration);
+
+                            // Last, as in the stock worker's runJob(), and before
+                            // the scope ends so the reporter sees this job's Context.
+                            if ($attemptException !== null && Worker::$reportJobExceptions) {
+                                $this->reportSafely($attemptException);
+                            }
                         }
 
-                        $deferredCallbacks->endAttempt();
+                        AttemptScope::end();
+                        $quiescentReset->attemptFinished();
                         $this->streamActive[$queueName] = max(0, ($this->streamActive[$queueName] ?? 1) - 1);
                         unset($slotStarts[$fiberIndex]);
                         $this->releaseInFlight($inFlightKey);
@@ -799,15 +1015,10 @@ LUA;
 
             foreach ($streamData[1] ?? [] as $message) {
                 $messageId = (string) $message[0];
-                $fields = $message[1];
 
-                $payload = null;
-                for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-                    if ((string) $fields[$i] === 'payload') {
-                        $payload = (string) $fields[$i + 1];
-                        break;
-                    }
-                }
+                // Reading a PEL lists an entry trimmed from the stream with nil
+                // fields; trimmedPendingEntries() reports those.
+                $payload = is_array($message[1] ?? null) ? self::payloadField($message[1]) : null;
 
                 if ($payload === null) {
                     continue;
@@ -822,6 +1033,49 @@ LUA;
         }
 
         return $parsed;
+    }
+
+    /**
+     * The entries of an XREADGROUP reply on a PEL that no longer exist in the
+     * stream, such as after StreamQueue::clear(): an id with no fields.
+     *
+     * Static and pure for unit testing.
+     *
+     * @return list<array{stream: string, id: string}>
+     */
+    public static function trimmedPendingEntries(mixed $result): array
+    {
+        if (! is_array($result)) {
+            return [];
+        }
+
+        $trimmed = [];
+
+        foreach ($result as $streamData) {
+            foreach ($streamData[1] ?? [] as $message) {
+                if (isset($message[0]) && ($message[1] ?? []) === []) {
+                    $trimmed[] = ['stream' => (string) $streamData[0], 'id' => (string) $message[0]];
+                }
+            }
+        }
+
+        return $trimmed;
+    }
+
+    /**
+     * The `payload` value in a flat [field, value, ...] stream entry.
+     *
+     * @param  array<int, mixed>  $fields
+     */
+    private static function payloadField(array $fields): ?string
+    {
+        for ($i = 0, $count = count($fields); $i + 1 < $count; $i += 2) {
+            if ((string) $fields[$i] === 'payload') {
+                return (string) $fields[$i + 1];
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -872,7 +1126,23 @@ LUA;
             }
         }
 
-        return self::firstUnclaimed($this->parseXreadgroupMessages($result), $taken);
+        // Return before suspending: the caller must mark this message in flight
+        // while $taken is still true.
+        $message = self::firstUnclaimed($this->parseXreadgroupMessages($result), $taken);
+
+        if ($message !== null) {
+            return $message;
+        }
+
+        // Nobody can ever run a trimmed entry, so nothing but an ack ends it. One
+        // a slot is still running is left alone: that job acknowledges it itself.
+        foreach (self::trimmedPendingEntries($result) as $trimmed) {
+            if (! isset($taken[$trimmed['stream'].'|'.$trimmed['id']])) {
+                $readerRedis->execute('XACK', $trimmed['stream'], $consumerGroup, $trimmed['id']);
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -938,6 +1208,12 @@ LUA;
      * Only claims messages that have been idle longer than the stream's
      * retry_after setting. Returns the claimed message or null.
      *
+     * XAUTOCLAIM cannot exclude a consumer, so this worker's own long-running
+     * jobs come back too, already claimed and with their idle time reset. Those
+     * are skipped, not run: they stay with this consumer, which is running them
+     * and acknowledges them when done. The scan then carries on past them, so
+     * they cannot hide a dead consumer's message further along the PEL.
+     *
      * @param  string[]  $queues
      * @param  array<string, array<string, mixed>>  $streams
      * @param  \Closure(string): string  $buildStreamKey
@@ -960,51 +1236,112 @@ LUA;
             $minIdleMs = ((int) ($streamConfig['retry_after'] ?? 60)) * 1000;
 
             try {
-                $result = $readerRedis->execute(
-                    'XAUTOCLAIM',
-                    $streamKey,
-                    $consumerGroup,
-                    $this->consumerId,
-                    (string) $minIdleMs,
-                    '0-0',
-                    'COUNT',
-                    '1',
-                );
+                for ($scan = 0; $scan < self::STEAL_SCANS_PER_POLL; $scan++) {
+                    // A drain only waits for slots running a job, not for this
+                    // scan, so releaseConsumer() may be under way. A claim landing
+                    // between its XPENDING and DELCONSUMER drops the entry from
+                    // every PEL for good. A read already on the wire can still do
+                    // that; only making the release atomic would rule it out.
+                    if ($this->hasReachedLimits()) {
+                        return null;
+                    }
 
-                // XAUTOCLAIM returns [nextCursor, [[id, [fields...]], ...], [deletedIds...]]
-                $messages = is_array($result) && is_array($result[1] ?? null) ? $result[1] : [];
+                    // Counts as a pending read: this reply can also list a message
+                    // a slot finishes while it is on its way.
+                    $this->pendingReads++;
 
-                if ($messages === []) {
-                    continue;
-                }
+                    try {
+                        $result = $readerRedis->execute(
+                            'XAUTOCLAIM',
+                            $streamKey,
+                            $consumerGroup,
+                            $this->consumerId,
+                            (string) $minIdleMs,
+                            $this->stealCursors[$streamKey] ?? '0-0',
+                            'COUNT',
+                            '1',
+                        );
 
-                $message = $messages[0];
-                $messageId = (string) $message[0];
-                $fields = $message[1];
+                        $taken = self::takenKeys($this->inFlight, $this->finishedDuringRead, $this->prefetched);
+                    } finally {
+                        if (--$this->pendingReads === 0) {
+                            $this->finishedDuringRead = [];
+                        }
+                    }
 
-                $payload = null;
-                for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-                    if ((string) $fields[$i] === 'payload') {
-                        $payload = (string) $fields[$i + 1];
+                    $claim = self::parseClaimReply($result, $streamKey);
+                    $this->stealCursors[$streamKey] = $claim['cursor'];
+
+                    // Return before suspending: the caller must mark this message
+                    // in flight while $taken is still true.
+                    $message = self::firstUnclaimed($claim['messages'], $taken);
+
+                    if ($message !== null) {
+                        return $message;
+                    }
+
+                    // Claimed by the call above, and nobody can ever run it.
+                    foreach ($claim['trimmed'] as $trimmedId) {
+                        $readerRedis->execute('XACK', $streamKey, $consumerGroup, $trimmedId);
+                    }
+
+                    if ($claim['cursor'] === '0-0') {
                         break;
                     }
                 }
-
-                if ($payload === null) {
-                    continue;
-                }
-
-                return [
-                    'stream' => $streamKey,
-                    'id' => $messageId,
-                    'payload' => $payload,
-                ];
             } catch (RedisException) {
                 continue;
             }
         }
 
         return null;
+    }
+
+    /**
+     * Parse an XAUTOCLAIM reply: [nextCursor, [[id, [fields...]], ...], [deletedIds...]].
+     *
+     * Redis 7 removes an entry that left the stream from the PEL itself and lists
+     * its id under deletedIds, so there is nothing to do for those. Below 7 it
+     * stays in the PEL and comes back here as nil, without so much as an id if
+     * the whole entry is nil. That one still moved to this consumer, so the next
+     * pending read lists it and acknowledges it.
+     *
+     * Static and pure for unit testing.
+     *
+     * @return array{cursor: string, messages: list<array{stream: string, id: string, payload: string}>, trimmed: list<string>}
+     */
+    public static function parseClaimReply(mixed $result, string $streamKey): array
+    {
+        $claim = ['cursor' => '0-0', 'messages' => [], 'trimmed' => []];
+
+        if (! is_array($result)) {
+            return $claim;
+        }
+
+        $claim['cursor'] = (string) ($result[0] ?? '0-0');
+
+        foreach (is_array($result[1] ?? null) ? $result[1] : [] as $entry) {
+            if (! isset($entry[0])) {
+                continue;
+            }
+
+            $id = (string) $entry[0];
+            $fields = $entry[1] ?? [];
+
+            if ($fields === []) {
+                $claim['trimmed'][] = $id;
+
+                continue;
+            }
+
+            $payload = self::payloadField($fields);
+
+            if ($payload !== null) {
+                $claim['messages'][] = ['stream' => $streamKey, 'id' => $id, 'payload' => $payload];
+            }
+        }
+
+        return $claim;
     }
 
     /**
@@ -1068,7 +1405,12 @@ LUA;
      * exception skips the dispatch. Public so the behaviour can be exercised
      * in tests without spinning up the event loop.
      *
+     * The signal callback belongs to no attempt, so both run in the job's own
+     * scope: a checkpoint job dispatched from interrupted() carries that job's
+     * Context, not the ambient one.
+     *
      * @param  array<int, StreamJob>  $slotJobs
+     * @param  array<int, AttemptScope>  $slotScopes  Keyed like $slotJobs. A slot without one runs in the caller's scope.
      */
     public function notifyInterrupted(
         int $signal,
@@ -1076,6 +1418,7 @@ LUA;
         Dispatcher $events,
         string $connectionName,
         ?string $queue,
+        array $slotScopes = [],
     ): void {
         try {
             $events->dispatch(new WorkerInterrupted($signal, $connectionName, $queue));
@@ -1083,7 +1426,7 @@ LUA;
             fwrite(STDERR, "[torque:worker] WorkerInterrupted dispatch failed: {$e->getMessage()}\n");
         }
 
-        foreach ($slotJobs as $job) {
+        foreach ($slotJobs as $slot => $job) {
             $resolved = $job->getResolvedJob();
 
             if (! $resolved instanceof CallQueuedHandler) {
@@ -1096,15 +1439,17 @@ LUA;
                 continue;
             }
 
-            try {
-                $command->interrupted($signal);
-            } catch (\Throwable $e) {
-                fwrite(STDERR, "[torque:worker] Job interrupted({$signal}) threw: {$e->getMessage()}\n");
+            AttemptScope::within($slotScopes[$slot] ?? AttemptScope::current(), function () use ($command, $signal, $events, $job): void {
+                try {
+                    $command->interrupted($signal);
+                } catch (\Throwable $e) {
+                    fwrite(STDERR, "[torque:worker] Job interrupted({$signal}) threw: {$e->getMessage()}\n");
 
-                continue;
-            }
+                    return;
+                }
 
-            $this->dispatchJobInterrupted($events, $job, $signal);
+                $this->dispatchJobInterrupted($events, $job, $signal);
+            });
         }
     }
 
@@ -1369,19 +1714,122 @@ LUA;
         ?\Throwable $exception,
         ?float $duration,
     ): void {
+        $this->dispatchSafely($events, new JobAttempted($connectionName, $job, $exception, $duration));
+    }
+
+    /**
+     * Dispatch a worker-lifecycle event whose listeners have no say in the job's
+     * outcome, so a throw from one cannot end the slot or skip an acknowledgement.
+     * Not for JobProcessing or JobProcessed: a throw from those fails the attempt,
+     * as it does in the stock worker.
+     *
+     * @param  int  $announceEverySeconds  Limit for events that fire without a job,
+     *                                     where a broken listener would otherwise
+     *                                     flood the log and the error tracker.
+     */
+    private function dispatchSafely(Dispatcher $events, object $event, int $announceEverySeconds = 0): void
+    {
         try {
-            $events->dispatch(new JobAttempted($connectionName, $job, $exception, $duration));
+            $events->dispatch($event);
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[torque:worker] JobAttempted dispatch failed: {$e->getMessage()}\n");
+            if ($announceEverySeconds > 0 && ! $this->mayAnnounce($event::class, $announceEverySeconds)) {
+                return;
+            }
+
+            $name = class_basename($event);
+
+            fwrite(STDERR, "[torque:worker] {$name} dispatch failed: {$e->getMessage()}\n");
 
             if (Worker::$reportJobExceptions) {
-                try {
-                    app(ExceptionHandler::class)->report($e);
-                } catch (\Throwable $reportFailure) {
-                    fwrite(STDERR, "[torque:worker] Reporting that failure threw: {$reportFailure->getMessage()}\n");
-                }
+                $this->reportSafely($e);
             }
         }
+    }
+
+    /**
+     * Send an exception to the application's handler, once per exception object.
+     * A broken handler is logged, never thrown into the slot.
+     */
+    private function reportSafely(\Throwable $exception): void
+    {
+        if (isset($this->reported[$exception])) {
+            return;
+        }
+
+        $this->reported[$exception] = true;
+
+        try {
+            app(ExceptionHandler::class)->report($exception);
+        } catch (\Throwable $reportFailure) {
+            fwrite(STDERR, "[torque:worker] Reporting an exception threw: {$reportFailure->getMessage()}\n");
+        }
+    }
+
+    /**
+     * Whether a recurring failure under this key is due to be announced again.
+     */
+    private function mayAnnounce(string $key, int $everySeconds): bool
+    {
+        $now = (int) (hrtime(true) / 1_000_000_000);
+
+        if (isset($this->lastAnnounced[$key]) && $now - $this->lastAnnounced[$key] < $everySeconds) {
+            return false;
+        }
+
+        $this->lastAnnounced[$key] = $now;
+
+        return true;
+    }
+
+    /**
+     * Log why a slot is stepping back, report it like the stock worker reports a
+     * failed pop (at most once a minute here: every slot hits the same outage),
+     * and wait without blocking the other slots.
+     */
+    private function backOffSlot(int $fiberIndex, string $what, \Throwable $exception, int $failures): void
+    {
+        $seconds = self::slotBackoffSeconds($failures);
+
+        fwrite(STDERR, "[torque:worker] Fiber {$fiberIndex} {$what}: {$exception->getMessage()}; retrying in {$seconds}s.\n");
+
+        if ($this->mayAnnounce($what, 60)) {
+            $this->reportSafely($exception);
+        }
+
+        \Fledge\Async\delay($seconds);
+    }
+
+    /**
+     * The Redis client a slot reads with, which gives up on a reply after
+     * `redis.read_timeout` seconds (zero or less waits forever).
+     *
+     * A read holds its place under `max_concurrency` until it returns, so without
+     * a limit one reply lost to a half-open socket stops a stream with a cap of 1
+     * in this worker until TCP gives up. `createRedisClient()` cannot set the
+     * limit, and it does not read `?read_timeout=` from a URI.
+     *
+     * Slots never send BLOCK, so a healthy Redis answers at once and a timeout
+     * means a dead socket or a server stalled for that long. Both end in the
+     * slot's back-off and a new client, which also keeps a long stall from
+     * turning into a reconnect loop.
+     */
+    public function createReaderClient(string $redisUri): RedisClient
+    {
+        $readTimeout = (float) ($this->config['redis']['read_timeout'] ?? self::DEFAULT_READ_TIMEOUT);
+
+        return new RedisClient(new ReconnectingRedisLink(
+            createRedisConnector($redisUri),
+            readTimeout: $readTimeout > 0 ? $readTimeout : null,
+        ));
+    }
+
+    /**
+     * Wait before a slot retries after its nth consecutive failure: 0.5s, 1s, 2s,
+     * doubling up to 30s. Static and pure for unit testing.
+     */
+    public static function slotBackoffSeconds(int $failures): float
+    {
+        return min(30.0, 0.5 * 2 ** min(max($failures, 1) - 1, 10));
     }
 
     /**
@@ -1500,7 +1948,11 @@ LUA;
      * Handle a job that threw an exception during processing.
      *
      * Releases the job with exponential backoff if attempts remain, otherwise
-     * marks it as permanently failed.
+     * marks it as permanently failed. A job that already released, deleted or
+     * failed itself before throwing keeps that outcome, as in the stock worker's
+     * handleJobException(), and is neither added again nor dead-lettered. That
+     * includes a release on the last attempt: its copy runs once more and is the
+     * one that can still reach the dead-letter stream.
      *
      * @param  array{stream: string, id: string, payload: string}  $message
      * @param  array<string, array<string, mixed>>  $streams
@@ -1517,7 +1969,20 @@ LUA;
     ): void {
         $queueName = $job->getQueue();
 
-        $events->dispatch(new JobExceptionOccurred($connectionName, $job, $exception));
+        $this->dispatchSafely($events, new JobExceptionOccurred($connectionName, $job, $exception));
+
+        if ($job->isDeleted() || $job->isReleased() || $job->hasFailed()) {
+            // delete() and fail() have acknowledged the message by now, and so has
+            // a release() that succeeded; after one that threw, the entry stays in
+            // the stream and PEL for reclaim. markAsFailed() alone has not, and
+            // nothing else would: drop it from the PEL, or it would run again once
+            // retry_after has passed.
+            if (! $job->isDeleted() && ! $job->isReleased()) {
+                $job->delete();
+            }
+
+            return;
+        }
 
         $streamConfig = $streams[$queueName] ?? [];
         $maxRetries = (int) ($streamConfig['max_retries'] ?? 3);
@@ -1560,6 +2025,10 @@ LUA;
                 // never silently: a broken failed_jobs write would otherwise
                 // hide every failure from queue:failed and retry tooling.
                 fwrite(STDERR, "[torque:worker] job->fail() threw: {$failError->getMessage()} in {$failError->getFile()}:{$failError->getLine()}\n");
+
+                if (Worker::$reportJobExceptions) {
+                    $this->reportSafely($failError);
+                }
             }
 
             // No manual JobFailed dispatch here: Job::fail() already dispatches it
@@ -1574,7 +2043,7 @@ LUA;
             }
             $failedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c');
 
-            $events->dispatch(new JobPermanentlyFailed(
+            $this->dispatchSafely($events, new JobPermanentlyFailed(
                 jobName: $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
                 queue: $queueName,
                 payload: $message['payload'],
@@ -1639,9 +2108,6 @@ LUA;
     }
 
     /**
-     * Resolve the queue name by stripping the prefix from a stream key.
-     */
-    /**
      * Filter the poll list down to streams below their max_concurrency cap.
      *
      * A stream with `max_concurrency` in its config is skipped while this
@@ -1672,13 +2138,50 @@ LUA;
         }));
     }
 
-    private function resolveQueueName(string $streamKey, string $prefix): string
+    /**
+     * The queue name for a stream key: the prefix and cluster hash tag removed,
+     * so it matches the config keys and the worker's own queue list.
+     *
+     * Static and pure for unit testing.
+     */
+    public static function queueNameFromStreamKey(string $streamKey, string $prefix, bool $cluster): string
     {
-        if (str_starts_with($streamKey, $prefix)) {
-            return substr($streamKey, strlen($prefix));
+        $queue = str_starts_with($streamKey, $prefix) ? substr($streamKey, strlen($prefix)) : $streamKey;
+
+        return self::bareQueueName($queue, $cluster);
+    }
+
+    /**
+     * A queue name without the cluster hash tag wrapping it. A tag around only
+     * part of the name stays: it is what getStreamKey() would keep as well, so
+     * removing it would point at a different key.
+     *
+     * Static and pure for unit testing.
+     */
+    public static function bareQueueName(string $queue, bool $cluster): string
+    {
+        return $cluster && preg_match('/^\{([^{}]+)\}$/', $queue, $matches) === 1 ? $matches[1] : $queue;
+    }
+
+    /**
+     * Stream settings keyed by bare queue name. An entry already under the bare
+     * name wins over one under its tagged form.
+     *
+     * Static and pure for unit testing.
+     *
+     * @param  array<string, array<string, mixed>>  $streams
+     * @return array<string, array<string, mixed>>
+     */
+    public static function bareStreamConfigs(array $streams, bool $cluster): array
+    {
+        $bare = [];
+
+        foreach ($streams as $queue => $settings) {
+            $name = self::bareQueueName((string) $queue, $cluster);
+            $bare[$name] = $streams[$name] ?? $settings;
         }
 
-        return $streamKey;
+        return $bare;
     }
 
     /**

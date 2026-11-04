@@ -412,6 +412,46 @@ it('marks every queue paused when the global pause flag is set', function () {
     }
 });
 
+it('reads a stream configured under a cluster hash tag by its bare name', function () {
+    $name = 'tagged'.bin2hex(random_bytes(4));
+
+    config()->set('torque.redis.cluster', true);
+    config()->set('torque.streams', ['{'.$name.'}' => []]);
+    cache()->forever('illuminate:queue:paused:torque:'.$name, true);
+
+    try {
+        torqueTestSeedStreams(['{'.$name.'}']);
+        torqueTestRedis()->execute('XADD', 'torque-test:{'.$name.'}', '*', 'payload', '{}');
+        torqueTestRedis()->execute('XREADGROUP', 'GROUP', 'torque-test', 'consumer', 'STREAMS', 'torque-test:{'.$name.'}', '>');
+
+        // What a worker writes: the rollup under the bare name.
+        app(MetricsPublisher::class)->recordOutcomes(3, 1, [$name => [3, 1]]);
+
+        $queues = app(QueuesData::class)->get()['queues'];
+
+        expect($queues)->toHaveCount(1)
+            ->and($queues[0]['name'])->toBe($name)
+            ->and($queues[0]['processed'])->toBe(3)
+            ->and($queues[0]['failed'])->toBe(1)
+            ->and(array_sum($queues[0]['history']))->toBe(3)
+            ->and($queues[0]['paused'])->toBeTrue()
+            ->and($queues[0]['pending'])->toBe(1);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cache()->forget('illuminate:queue:paused:torque:'.$name);
+        try {
+            $keys = torqueTestRedis()->execute('KEYS', 'torque-test:*'.$name.'*') ?: [];
+
+            if ($keys !== []) {
+                torqueTestRedis()->execute('DEL', ...$keys);
+            }
+        } catch (RedisException) {
+            // Cleanup only; the try block's outcome is what matters.
+        }
+    }
+});
+
 it('marks only an individually paused queue as paused', function () {
     config()->set('torque.streams', ['default' => [], 'backfill' => []]);
     cache()->forever('illuminate:queue:paused:torque:backfill', true);

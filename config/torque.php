@@ -118,6 +118,9 @@ return [
         'uri' => env('TORQUE_REDIS_URI', 'redis://127.0.0.1:6379'),
         'prefix' => env('TORQUE_PREFIX', 'torque:'.Str::slug(env('APP_NAME', 'laravel'), '_').':'),
         'cluster' => (bool) env('TORQUE_CLUSTER', false),
+        // Seconds a worker slot's read waits for a reply before it reconnects, so
+        // a half-open socket cannot hold the slot. Zero or less waits forever.
+        'read_timeout' => (float) env('TORQUE_REDIS_READ_TIMEOUT', 30),
     ],
 
     /*
