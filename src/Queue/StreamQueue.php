@@ -15,6 +15,7 @@ use Illuminate\Queue\Jobs\InspectedJob;
 use Illuminate\Queue\Queue;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
+use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 use Webpatser\Torque\Worker\WorkerProcess;
 
@@ -49,8 +50,12 @@ class StreamQueue extends Queue implements ClearableQueue, QueueContract
      * be the first command: under Redis OOM with noeviction XACK and XDEL are
      * still allowed while XADD and ZADD are refused.
      *
+     * The copy gets a new id, so its redelivery count starts at 0. Dropping the
+     * old id's count costs no round trip, so it happens whatever strict_attempts says.
+     *
      * KEYS[1] = stream key
      * KEYS[2] = delayed sorted set key
+     * KEYS[3] = redelivery counter hash key
      * ARGV[1] = consumer group
      * ARGV[2] = id of the entry being released
      * ARGV[3] = new payload
@@ -64,8 +69,99 @@ else
 end
 redis.call('XACK', KEYS[1], ARGV[1], ARGV[2])
 redis.call('XDEL', KEYS[1], ARGV[2])
+redis.call('HDEL', KEYS[3], ARGV[2])
 return 1
 LUA;
+
+    /**
+     * Lua script counting one redelivery, so the hash cannot exist without a TTL.
+     *
+     * KEYS[1] = redelivery counter hash key
+     * ARGV[1] = entry id
+     * ARGV[2] = TTL in seconds
+     */
+    private const LUA_COUNT_REDELIVERY = <<<'LUA'
+local count = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return count
+LUA;
+
+    /**
+     * Lua script handing back entries a stopping worker read and never started.
+     *
+     * Each becomes a new entry with the same fields, so attempts stay as they are
+     * and the next read is a first delivery. A count from an earlier delivery moves
+     * with it. An entry that left this consumer's PEL was stolen and is being run
+     * elsewhere, so it is left alone. The write comes first, as in LUA_RELEASE.
+     *
+     * KEYS[1] = stream key
+     * KEYS[2] = redelivery counter hash key
+     * ARGV[1] = consumer group
+     * ARGV[2] = consumer name
+     * ARGV[3...] = entry ids
+     */
+    private const LUA_RETURN_UNSTARTED = <<<'LUA'
+local returned = 0
+for i = 3, #ARGV do
+    local id = ARGV[i]
+    if #redis.call('XPENDING', KEYS[1], ARGV[1], id, id, 1, ARGV[2]) > 0 then
+        local entry = redis.call('XRANGE', KEYS[1], id, id)[1]
+        if entry then
+            local new = redis.call('XADD', KEYS[1], '*', unpack(entry[2]))
+            local count = redis.call('HGET', KEYS[2], id)
+            if count then
+                redis.call('HSET', KEYS[2], new, count)
+                redis.call('HDEL', KEYS[2], id)
+            end
+            returned = returned + 1
+        end
+        redis.call('XACK', KEYS[1], ARGV[1], id)
+        redis.call('XDEL', KEYS[1], id)
+    end
+end
+return returned
+LUA;
+
+    /**
+     * Lua script deleting a consumer only when it has no pending entries, as one
+     * step: DELCONSUMER discards the consumer's PEL, so a delivery landing between
+     * a separate check and the delete would be lost for good. Returns 1 if deleted.
+     * A delivery after this recreates the consumer, and the entry stays claimable.
+     *
+     * KEYS[1] = stream key
+     * ARGV[1] = consumer group
+     * ARGV[2] = consumer name
+     */
+    public const string LUA_DELETE_IDLE_CONSUMER = <<<'LUA'
+if #redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2]) > 0 then
+    return 0
+end
+redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+return 1
+LUA;
+
+    /** Entries one LUA_RETURN_UNSTARTED call moves, so a long list cannot stall Redis. */
+    private const int RETURN_UNSTARTED_BATCH = 500;
+
+    /** Appended to a stream key: the hash of redelivery counts, by entry id. */
+    public const string REDELIVERIES_SUFFIX = ':redeliveries';
+
+    /**
+     * Seconds the hash outlives the last redelivery counted on the queue. Far above
+     * any retry_after, so it cannot run out between the deliveries of a crash loop.
+     * Whatever a crash or a worker without strict_attempts left behind goes with it.
+     */
+    private const int REDELIVERIES_TTL = 604800;
+
+    /**
+     * Entries this process counted a redelivery for and has not let go of yet,
+     * keyed `{stream key}|{id}`. Only these can have a field: an entry delivered
+     * for the first time never has one, so acknowledging it needs no HDEL, and
+     * without strict_attempts this stays empty.
+     *
+     * @var array<string, true>
+     */
+    private array $countedRedeliveries = [];
 
     /**
      * Lua script reading the depths of one queue in a single round trip.
@@ -582,7 +678,8 @@ LUA;
      * the consumer group and a running worker would then fail on its next read.
      * Entries a worker holds in the PEL are trimmed from the stream as well
      * (so they count here) but their PEL records stay until the worker acks.
-     * The delayed set is emptied atomically with ZREMRANGEBYRANK.
+     * The delayed set is emptied atomically with ZREMRANGEBYRANK. The redelivery
+     * counts go too: their entries are gone.
      *
      * @param  \UnitEnum|string|null  $queue
      * @return int Stream entries plus delayed jobs removed.
@@ -594,6 +691,7 @@ LUA;
 
         $trimmed = (int) $this->redis->execute('XTRIM', $streamKey, 'MAXLEN', '0');
         $delayed = (int) $this->redis->execute('ZREMRANGEBYRANK', $streamKey.':delayed', '0', '-1');
+        $this->redis->execute('DEL', $streamKey.self::REDELIVERIES_SUFFIX);
 
         return $trimmed + $delayed;
     }
@@ -901,6 +999,10 @@ LUA;
 
     /**
      * Acknowledge and delete a message from the stream.
+     *
+     * An entry this process counted a redelivery for also loses its field. Failing
+     * that, or crashing first, leaves a field nothing can read: stream ids are never
+     * reused, and {@see StreamHousekeeper} and the hash's TTL remove it.
      */
     public function deleteAndAcknowledge(string $queue, string $messageId): void
     {
@@ -908,6 +1010,66 @@ LUA;
 
         $this->redis->execute('XACK', $streamKey, $this->consumerGroup, $messageId);
         $this->redis->execute('XDEL', $streamKey, $messageId);
+
+        $counted = $streamKey.'|'.$messageId;
+
+        if (isset($this->countedRedeliveries[$counted])) {
+            unset($this->countedRedeliveries[$counted]);
+
+            try {
+                $this->redis->execute('HDEL', $streamKey.self::REDELIVERIES_SUFFIX, $messageId);
+            } catch (\Throwable) {
+                // The job is done; this must not turn it into a failed one.
+            }
+        }
+    }
+
+    /**
+     * Count one more delivery of an entry after its first, returning the total.
+     * Only for workers under strict_attempts.
+     */
+    public function countRedelivery(string $queue, string $messageId): int
+    {
+        $streamKey = $this->getStreamKey($queue);
+
+        $count = (int) $this->redis->execute(
+            'EVAL',
+            self::LUA_COUNT_REDELIVERY,
+            '1',
+            $streamKey.self::REDELIVERIES_SUFFIX,
+            $messageId,
+            (string) self::REDELIVERIES_TTL,
+        );
+
+        $this->countedRedeliveries[$streamKey.'|'.$messageId] = true;
+
+        return $count;
+    }
+
+    /**
+     * Hand back entries a stopping worker read and never started, returning how
+     * many went back. Not a release: no attempt happened, so attempts stay as they are.
+     *
+     * @param  list<string>  $ids
+     */
+    public function returnUnstarted(string $streamKey, string $consumer, array $ids): int
+    {
+        $returned = 0;
+
+        foreach (array_chunk($ids, self::RETURN_UNSTARTED_BATCH) as $batch) {
+            $returned += (int) $this->redis->execute(
+                'EVAL',
+                self::LUA_RETURN_UNSTARTED,
+                '2',
+                $streamKey,
+                $streamKey.self::REDELIVERIES_SUFFIX,
+                $this->consumerGroup,
+                $consumer,
+                ...$batch,
+            );
+        }
+
+        return $returned;
     }
 
     /**
@@ -929,14 +1091,17 @@ LUA;
         $this->redis->execute(
             'EVAL',
             self::LUA_RELEASE,
-            '2',
+            '3',
             $streamKey,
             $streamKey.':delayed',
+            $streamKey.self::REDELIVERIES_SUFFIX,
             $this->consumerGroup,
             $job->messageId,
             $newPayload,
             $delay > 0 ? (string) $this->availableAt($delay) : '',
         );
+
+        unset($this->countedRedeliveries[$streamKey.'|'.$job->messageId]);
 
         if ($delay <= 0) {
             $this->recordQueued($newPayload, $queue);

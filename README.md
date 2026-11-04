@@ -221,6 +221,61 @@ If your jobs rely on any of the shared items, lower `coroutines_per_worker` for 
 > [!NOTE]
 > Laravel Cloud's queue listeners hold the current job in process-wide state. Torque dispatches the events anyway, but at more than one slot exception attribution on Cloud (which job an exception is reported against) is unreliable.
 
+### Shared transactions
+
+A database transaction belongs to a connection, and every job on the worker uses the same one. If job A hangs inside a transaction while job B is in flight, B nests in A's transaction. B's commit never reaches the database, B acks as a success, and when the worker exits the transaction rolls back, taking B's writes with it, silently. A's `failed_jobs` row and batch counts live in that same transaction (the dead-letter entry survives). On a timeout with other jobs in flight, Torque skips stock's rollback of the failed-jobs and batch connections, so it cannot destroy the other slots' work; a timeout on the only job in flight keeps the stock rollback. Only separate connections per job (a pool) or `coroutines_per_worker = 1` avoid the risk.
+On such a timeout the worker logs a WARN when the failed-jobs connection has a transaction open, since the `failed_jobs` row may then be lost.
+
+### Timeouts
+
+Timeouts are opt-in: set `TORQUE_TIMEOUTS=true` (`timeouts.enabled`). Off, `$timeout` means nothing and a job runs as long as it runs.
+
+- **Limit.** `$job->timeout() ?? the stream's timeout`, in seconds; `0` or neither set means no limit. Set the stream default with `timeout` in `streams.<name>`. Keep it below `retry_after`; the worker logs a WARN at boot otherwise, because another worker can steal a job that is still running.
+- **At expiry.** The job is told through `interrupted()`, then fails if `$failOnTimeout` is set or its attempts are up, and is otherwise released with a delay of at least `drain_grace_seconds`. `JobTimedOut` and `JobExceptionOccurred` are dispatched.
+- **The worker rotates.** A timeout stops the whole worker (exit 1) and the master starts a replacement. The other slots get `drain_grace_seconds` to finish; whatever is still running after that is redelivered. At-least-once means duplicates can happen, so keep `coroutines_per_worker` low on streams with jobs that tend to hang.
+- **Budget.** `interrupted()` and the `JobInterrupted`, `JobTimedOut` and `JobExceptionOccurred` listeners share a bounded budget of `min(drain_grace_seconds / 2, 5)` seconds. The job is failed or released after that, also when one of them has not returned.
+- **What is timed.** The timer spans `handle()` only. The stock worker's alarm also covers the `JobProcessing` and `JobProcessed` listeners; here those are not timed.
+- **What can time out.** Only a job suspended on the event loop (a Redis, HTTP or async DB call). Code that blocks the process never lets the timer run; use the watchdog below.
+- **After abandonment.** The job's fiber is not stopped, because throwing into it could return a connection to the pool mid-reply. Its code may run briefly until the worker exits.
+- **Retry delay.** The release delay is at least the grace, so it can overshoot a `retryUntil`.
+
+### Strict attempts and redelivery counting
+
+With `strict_attempts` (`TORQUE_STRICT_ATTEMPTS`, off by default) a job is checked against its attempts and `retryUntil` before it runs, and a delivery after the first counts against `$tries` or the stream's `max_retries`. A job that keeps killing its worker then reaches the dead-letter stream with `reason=redelivery_limit` instead of looping.
+
+Counted as a redelivery:
+
+- A steal from another consumer, and a pending re-read.
+- A failed release.
+- Survivors abandoned by a drain, a rotation or another job's timeout.
+- Entries still prefetched or held back when the worker is SIGKILLed or crashes.
+- A `>` reply lost to a failed connection, or still unanswered when the grace ends.
+
+Not counted:
+
+- A worker re-reading its own entry.
+- Entries returned at drain: prefetched entries and ones a `popUsing` callback held back that never started go back to Redis unchanged. They move to the tail of the stream, so processing order changes. This applies in every mode, `strict_attempts` or not.
+
+Consequences:
+
+- Leave `$tries` headroom. A job can reach its limit through other jobs' timeouts and rotations; raise `drain_grace_seconds` and keep concurrency low on hang-prone streams.
+- A job with `retryUntil` is limited only by its deadline.
+- A job running past `retry_after` on a live worker is charged when another worker steals it.
+
+### Blocked event loop watchdog
+
+A job that blocks the process (`sleep()`, a blocking PDO query, a blocking extension) freezes every slot and timer of its worker, so timeouts cannot fire. Set `loop_stall_kill_seconds` (`TORQUE_LOOP_STALL_KILL`, `0` is off) and workers touch a heartbeat file in `storage/framework/torque-heartbeats` about once a second; the master sends SIGKILL to a worker whose file is older than the limit and starts a replacement.
+
+- The heartbeat is local, so `storage` must be on a local disk (the mtime is compared to the host's clock). No Redis is involved, so an outage cannot kill workers.
+- A kill takes every slot in that worker, and also hits a process stopped with SIGSTOP or paused in a debugger.
+- Set the limit above the longest blocking call you accept. Set your cache store's timeout below the limit, as the boot WARN says: the worker's timers read the default cache store, so a network hang there blocks the loop.
+- Killed jobs stay pending and are redelivered after `retry_after`. Without `strict_attempts`, a job that always blocks loops forever.
+- A worker that has not yet written a heartbeat is never killed, so a hang during boot is not covered.
+
+### `Queue::popUsing()`
+
+Register the callback for the `torque` connection name: `Queue::popUsing('torque', fn ($queue) => ...)`. Registering under `default` has no effect. The callback receives the comma-joined list of queues this poll may read (those below their `max_concurrency`), not the full configured string.
+
 ## Live job progress (built in)
 
 Every job automatically records a lifecycle timeline to a per-job Redis Stream: queued, started, exception, completed, plus any custom events you emit. Watch it live from the CLI, the dashboard, or your own UI without instrumenting each job by hand.
@@ -330,10 +385,12 @@ All options are in `config/torque.php`. Key settings:
 | `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
 | `redis.read_timeout` | 30 | Seconds a slot waits for a Redis reply before it gives up and reconnects (`TORQUE_REDIS_READ_TIMEOUT`) |
-| `memory_limit` | 0 | Megabytes of real memory (`memory_get_usage(true)`) at which a worker drains and exits with status 12, like `queue:work --memory`; the master starts a replacement. Checked once a second. The drain waits for running jobs with no grace force exit, so a hung job holds that worker until a signal, `queue:restart`, the worker lifetime or `max_jobs_per_worker` ends it, and the stall watchdog only warns. Job timeouts arrive in 1.3.0. `0` is off |
+| `memory_limit` | 0 | Megabytes of real memory (`memory_get_usage(true)`) at which a worker drains and exits with status 12, like `queue:work --memory`; the master starts a replacement. Checked once a second. The drain waits for running jobs with no grace force exit, so a hung job holds that worker until a signal, `queue:restart`, the worker lifetime or `max_jobs_per_worker` ends it, and the stall watchdog only warns. Enable `timeouts.enabled` to end a hung job. `0` is off |
 | `force` | false | Keep processing during `artisan down`, like `queue:work --force`. Off, slots stop polling and claiming while the app is down; in-flight jobs finish and jobs wait in the stream |
 | `job_limits` | `job` | `job`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `stream`: kill switch, only `max_retries` and 2**attempts count, for every job |
 | `strict_attempts` | false | Also check attempts and `retryUntil` before a job runs, as `queue:work` does, which limits `release()`. Off, because `RateLimited` and `WithoutOverlapping` release loops use up attempts and would start failing |
+| `timeouts.enabled` | false | Enforce `$job->timeout() ?? stream timeout` (`TORQUE_TIMEOUTS`). A timeout rotates the whole worker; see Timeouts |
+| `loop_stall_kill_seconds` | 0 | SIGKILL a worker whose heartbeat file is older than this many seconds (`TORQUE_LOOP_STALL_KILL`); `0` is off. See Blocked event loop watchdog |
 
 ### Autoscaling
 
@@ -552,7 +609,7 @@ Redis Streams (not LISTs like Horizon) provide:
 | Worker pause/resume events | `WorkerPausing` / `WorkerResuming` (13.8) | Same events, dispatched on `torque:pause` flips |
 | Worker lifecycle events | `WorkerStarting`, `WorkerStopping`, `WorkerIdle`, `WorkerQueuePaused`, `WorkerQueueResumed`, `Looping` | `WorkerStarting` and `WorkerStopping` once per worker; `Looping` on every loop. A listener returning false from `Looping` is honoured |
 | Pop and release events | `JobPopping`, `JobPopped`, `JobReleased`, `JobReleasedAfterException` | Dispatched. `JobPopping` fires on every poll (about 25 per second at 50 slots), so keep its listeners cheap. A throwing listener on the job events does not change the job's outcome, unlike stock |
-| Job timeout event | `JobTimedOut` | Not dispatched yet: Torque does not enforce `$timeout` in 1.2.x. Arrives with timeouts in 1.3.0 |
+| Job timeout event | `JobTimedOut` | Dispatched when `timeouts.enabled` is on (opt-in, 1.3.0) |
 | Maintenance mode | `queue:work` waits while `artisan down`, `--force` overrides | Same: slots stop polling, `force` config overrides |
 | Framework queue pause | `queue:pause` / `queue:pause --all` (13.25) | Honored: global pause stops the worker, per-queue pause skips that stream (keys on the `torque` connection); `torque:pause` stays independent |
 | Enum queue names | `\UnitEnum` accepted by all drivers (13.25) | Same on `StreamQueue` via `enum_value()` |

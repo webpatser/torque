@@ -2,6 +2,26 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so. `torque:status` shows the recorded data version next to the installed one.
 
+## 1.2.x to 1.3.0
+
+No data step. Timeouts, the watchdog and strict attempts stay off until you opt in; the two behaviour changes below apply to every install.
+
+### New config keys (all optional, defaults apply when absent)
+
+| Key | Default | What it does |
+|---|---|---|
+| `timeouts.enabled` | `false` | Enforce `$job->timeout() ?? streams.<name>.timeout`; `0` is no limit. A timeout rotates the whole worker (exit 1): other slots get `drain_grace_seconds` and survivors are redelivered, so duplicates happen. `JobTimedOut` is dispatched |
+| `streams.<name>.timeout` | none | Seconds a job without its own `$timeout` may run. Keep it below `retry_after`; workers log a WARN at boot otherwise |
+| `loop_stall_kill_seconds` | `0` | Master SIGKILLs a worker whose local heartbeat (`storage/framework/torque-heartbeats`) is older than this; `0` is off. Set it above your longest accepted blocking call |
+
+`strict_attempts` (already present since 1.2.0) now also counts redeliveries: a job that keeps killing its worker reaches the dead-letter stream with reason `redelivery_limit`. Leave `$tries` headroom, since drains, rotations and other jobs' timeouts count too.
+
+### Behaviour changes
+
+- **Entries returned at drain change order, in every mode.** A worker that stops hands back what it prefetched or what a `popUsing` callback held back and never started. They go to the tail of the stream, so processing order changes. They are no longer left to be stolen after `retry_after`.
+- **Redelivery bookkeeping runs in every mode.** A pass over redelivery counters happens during housekeeping per queue, whether or not `strict_attempts` is on. Counting and the dead-letter reason apply only under `strict_attempts`.
+- **`Queue::popUsing('torque', ...)`** is supported: register under `torque` (`default` has no effect); the callback gets the comma-joined eligible queues.
+
 ## 1.1.x to 1.2.0
 
 No data step. Read the behaviour changes before deploying, in particular the first two.
@@ -12,7 +32,7 @@ No data step. Read the behaviour changes before deploying, in particular the fir
 |---|---|---|
 | `job_limits` | `job` | `job`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `stream`: kill switch, only `max_retries` and `2**attempts` count |
 | `strict_attempts` | `false` | Check attempts and `retryUntil` before a job runs, as `queue:work` does. Off, a job that calls `release()` is never stopped, which keeps `RateLimited` and `WithoutOverlapping` working. Workers log a boot line saying so |
-| `memory_limit` | `0` | Megabytes of real memory at which a worker drains and exits with status 12. The drain waits for running jobs with no grace force exit, so a hung job holds the worker until a signal, `queue:restart` or the lifetime ends it (timeouts arrive in 1.3.0). `0` is off |
+| `memory_limit` | `0` | Megabytes of real memory at which a worker drains and exits with status 12. The drain waits for running jobs with no grace force exit, so a hung job holds the worker until a signal, `queue:restart` or the lifetime ends it (enable `timeouts.enabled` to end a hung job). `0` is off |
 | `force` | `false` | Keep processing during `artisan down` |
 | `redis.read_timeout` | `30` | Seconds before a slot gives up on a Redis reply and reconnects (added in 1.1.2) |
 
@@ -28,7 +48,7 @@ No data step. Read the behaviour changes before deploying, in particular the fir
 
 ### Coming in 2.0
 
-2.0 will flip these defaults: `strict_attempts` on, `timeouts.enabled` on and a default `memory_limit`. Set them explicitly now if you want the current behaviour to stay. Job timeouts (`$timeout` enforcement, `JobTimedOut`) arrive in 1.3.0, opt-in.
+2.0 will flip these defaults: `strict_attempts` on, `timeouts.enabled` on and a default `memory_limit`. Set them explicitly now if you want the current behaviour to stay. Job timeouts (`$timeout` enforcement, `JobTimedOut`) are opt-in since 1.3.0.
 
 ## Coming from Horizon
 

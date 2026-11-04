@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Redis;
 
 use Fledge\Async\Redis\RedisClient;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Queue\StreamQueue;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -52,7 +53,13 @@ final class StreamHousekeeper
     /** Keys deleted per round trip while sweeping. */
     private const int BATCH_SIZE = 100;
 
+    /** The master's limit on redelivery fields looked at per stream per sweep. */
+    public const int REDELIVERY_FIELDS_PER_SWEEP = 1000;
+
     private ?RedisClient $redis = null;
+
+    /** @var array<string, string> Stream key => HSCAN cursor a capped sweep stopped at. */
+    private array $redeliveryCursors = [];
 
     /** Whether this Redis understands UNLINK (Redis 4+); resolved on first use. */
     private ?bool $supportsUnlink = null;
@@ -115,6 +122,28 @@ final class StreamHousekeeper
     }
 
     /**
+     * Continue a capped redelivery sweep where an earlier instance stopped.
+     *
+     * @param  array<string, string>  $cursors  From {@see redeliveryCursors()}.
+     */
+    public function resumeRedeliverySweep(array $cursors): self
+    {
+        $this->redeliveryCursors = $cursors;
+
+        return $this;
+    }
+
+    /**
+     * Where a capped redelivery sweep stopped, for the next instance.
+     *
+     * @return array<string, string>
+     */
+    public function redeliveryCursors(): array
+    {
+        return $this->redeliveryCursors;
+    }
+
+    /**
      * Apply the dead-letter retention policy and report the length change.
      *
      * @return array{before: int, after: int}
@@ -147,10 +176,15 @@ final class StreamHousekeeper
      * PEL, so those jobs would be lost instead of being reclaimed by the next
      * worker's XAUTOCLAIM.
      *
+     * @param  int|null  $redeliveryFieldLimit  Redelivery fields to look at per stream
+     *                                          before stopping; the next call on this
+     *                                          instance, or one resumed from it, continues
+     *                                          there. Null sweeps the whole hash, for a
+     *                                          one-shot `torque:prune`.
      * @return array<string, int> Removed (or removable, when dry running) consumers per queue.
      */
     #[\NoDiscard]
-    public function pruneConsumers(int $idleSeconds, bool $dryRun = false): array
+    public function pruneConsumers(int $idleSeconds, bool $dryRun = false, ?int $redeliveryFieldLimit = null): array
     {
         $idleMs = max(0, $idleSeconds) * 1000;
         $removed = [];
@@ -158,6 +192,12 @@ final class StreamHousekeeper
         foreach ($this->queues as $queue) {
             $streamKey = $this->streamKey($queue);
             $removed[$queue] = 0;
+
+            // Here because every sweep passes here: the master's timer, torque:prune
+            // and the deep clean. Not reported: a stale field is not worth a line.
+            if (! $dryRun) {
+                $this->pruneRedeliveries($streamKey, $redeliveryFieldLimit ?? PHP_INT_MAX);
+            }
 
             try {
                 $consumers = $this->redis()->execute('XINFO', 'CONSUMERS', $streamKey, $this->consumerGroup);
@@ -189,6 +229,59 @@ final class StreamHousekeeper
         }
 
         return $removed;
+    }
+
+    /**
+     * Drop redelivery counts whose entry has left the stream.
+     *
+     * The ack removes a count, unless the worker crashed just before that or runs
+     * without strict_attempts. Such a field is harmless, since stream ids are never
+     * reused, but on a queue with regular crashes the hash's TTL keeps being
+     * refreshed, so it would never go by itself. An entry still in the stream keeps
+     * its count: its next delivery needs it.
+     *
+     * Each field costs a round trip, and in the master that is time taken from its
+     * tick, so a capped sweep stops between HSCAN pages and leaves the cursor for the
+     * next call. It may overshoot by one page. The cursor moves on before a page is
+     * worked through, so a page that fails is not retried until the scan comes round
+     * again, and nothing is dropped on the way.
+     */
+    private function pruneRedeliveries(string $streamKey, int $fieldLimit): void
+    {
+        $hashKey = $streamKey.StreamQueue::REDELIVERIES_SUFFIX;
+        $visited = 0;
+
+        try {
+            do {
+                $result = $this->redis()->execute('HSCAN', $hashKey, $this->redeliveryCursors[$streamKey] ?? '0', 'COUNT', '100');
+
+                if (! is_array($result)) {
+                    return;
+                }
+
+                $cursor = (string) $result[0];
+                $this->redeliveryCursors[$streamKey] = $cursor;
+                $pairs = (array) ($result[1] ?? []);
+                $gone = [];
+
+                // A flat [field, value, field, value, ...] list.
+                for ($i = 0, $count = count($pairs); $i < $count; $i += 2) {
+                    $id = (string) $pairs[$i];
+
+                    if ($this->redis()->execute('XRANGE', $streamKey, $id, $id) === []) {
+                        $gone[] = $id;
+                    }
+                }
+
+                if ($gone !== []) {
+                    $this->redis()->execute('HDEL', $hashKey, ...$gone);
+                }
+
+                $visited += intdiv(count($pairs), 2);
+            } while ($cursor !== '0' && $visited < $fieldLimit);
+        } catch (\Throwable) {
+            // Best-effort, like every other sweep here.
+        }
     }
 
     /**

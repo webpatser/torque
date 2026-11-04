@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Support\StreamQueueResolver;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -84,6 +85,9 @@ final class TorqueFlushCommand extends Command
             if ($delayedSize > 0) {
                 $redis->execute('DEL', $delayedKey);
             }
+
+            // The redelivery counts of the entries just trimmed.
+            $redis->execute('DEL', $streamKey.StreamQueue::REDELIVERIES_SUFFIX);
 
             $totalStream += $streamSize;
             $totalDelayed += $delayedSize;

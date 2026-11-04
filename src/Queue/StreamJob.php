@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Queue;
 
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Job as JobContract;
+use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Jobs\Job;
+use Illuminate\Queue\TimeoutExceededException;
 
 /**
  * Represents a single job read from a Redis Stream via XREADGROUP.
@@ -21,6 +24,19 @@ class StreamJob extends Job implements JobContract
     private readonly array $decoded;
 
     private bool $releaseSucceeded = false;
+
+    /** Set when the attempt timed out: its outcome is no longer up to the job. */
+    private bool $abandoned = false;
+
+    /**
+     * The one Fiber that may still settle an abandoned attempt, until it is done.
+     *
+     * @var \Fiber<mixed, mixed, mixed, mixed>|null
+     */
+    private ?\Fiber $settler = null;
+
+    /** @var (\Closure(): int)|null */
+    private ?\Closure $attemptsInFlight = null;
 
     public function __construct(
         Container $container,
@@ -94,6 +110,10 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function delete(): void
     {
+        if ($this->outcomeIsNotOurs()) {
+            return;
+        }
+
         parent::delete();
 
         $this->streamQueue->deleteAndAcknowledge($this->queue, $this->messageId);
@@ -111,11 +131,144 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function release($delay = 0): void
     {
+        if ($this->outcomeIsNotOurs()) {
+            return;
+        }
+
         parent::release($delay);
 
         $this->streamQueue->release($this->queue, $this, (int) $delay);
 
         $this->releaseSucceeded = true;
+    }
+
+    /**
+     * Whether the job was released. To an abandoned job's own Fiber it always
+     * looks released, so CallQueuedHandler finishing late neither starts the next
+     * job in a chain, nor records a batch success, nor gives up a unique lock.
+     */
+    #[\Override]
+    public function isReleased(): bool
+    {
+        return $this->released || $this->outcomeIsNotOurs();
+    }
+
+    /**
+     * On a timeout the base class rolls the failed-jobs connection, and for a
+     * Batchable job the batch connection, back to level 0, so the failure can be
+     * recorded outside the transaction the job hung in. In a process running other
+     * attempts that connection is theirs too: a transaction of theirs would lose
+     * its writes so far, autocommit the rest and report success. So only the sole
+     * attempt gets it. The others run the rest of the base class's fail() as is.
+     */
+    #[\Override]
+    public function fail($e = null): void
+    {
+        if ($this->outcomeIsNotOurs()) {
+            return;
+        }
+
+        if (! $e instanceof TimeoutExceededException || $this->isSoleAttempt()) {
+            parent::fail($e);
+
+            return;
+        }
+
+        $this->markAsFailed();
+
+        if ($this->isDeleted()) {
+            return;
+        }
+
+        $this->warnAboutOpenTransaction();
+
+        try {
+            $this->delete();
+
+            $this->failed($e);
+        } finally {
+            $this->resolve(Dispatcher::class)->dispatch(new JobFailed($this->connectionName, $this, $e));
+        }
+    }
+
+    /**
+     * With the rollback skipped, the failure record joins any transaction open on
+     * the failed-jobs connection, and if that is the one the job hung in, it never
+     * commits. Nothing here can save the record without hurting the other attempts,
+     * so an operator at least gets to know. A warning must not stop the job failing.
+     */
+    private function warnAboutOpenTransaction(): void
+    {
+        try {
+            $connection = $this->container->make('db')->connection($this->container['config']['queue.failed.database']);
+
+            if ($connection->transactionLevel() > 0) {
+                fwrite(STDERR, "[torque:worker] WARN job {$this->messageId} timed out while connection {$connection->getName()} still has a transaction open; its failed_jobs row and batch counts are lost unless that transaction commits. Its dead-letter entry survives.\n");
+            }
+        } catch (\Throwable) {
+            // No database to ask, so nothing to warn about.
+        }
+    }
+
+    #[\Override]
+    public function markAsFailed(): void
+    {
+        if ($this->outcomeIsNotOurs()) {
+            return;
+        }
+
+        parent::markAsFailed();
+    }
+
+    /**
+     * Take the attempt away from the job, because it timed out. From here on only
+     * the calling Fiber can delete, release or fail it, until abandonmentSettled().
+     * The job's own Fiber is not stopped: throwing into it could return a
+     * connection to the pool in the middle of a reply. It runs on, or never
+     * resumes, and whatever it does to this object changes nothing.
+     *
+     * @param  (\Closure(): int)|null  $attemptsInFlight  Counts the worker's attempts in flight, this one included. Asked when the job fails, as others may have ended by then.
+     */
+    public function abandon(?\Closure $attemptsInFlight = null): void
+    {
+        $this->abandoned = true;
+        $this->settler = \Fiber::getCurrent();
+        $this->attemptsInFlight = $attemptsInFlight;
+    }
+
+    /**
+     * Let this Fiber settle the abandoned attempt instead, so the worker can run a
+     * callback it will not wait for forever: once the worker takes the attempt back,
+     * whatever that callback still does changes nothing.
+     *
+     * @param  \Fiber<mixed, mixed, mixed, mixed>|null  $fiber
+     */
+    public function settleFrom(?\Fiber $fiber): void
+    {
+        $this->settler = $fiber;
+    }
+
+    /**
+     * The worker has settled the attempt, so nobody can change its outcome any more.
+     */
+    public function abandonmentSettled(): void
+    {
+        $this->settler = null;
+    }
+
+    public function isAbandoned(): bool
+    {
+        return $this->abandoned;
+    }
+
+    private function outcomeIsNotOurs(): bool
+    {
+        return $this->abandoned && \Fiber::getCurrent() !== $this->settler;
+    }
+
+    private function isSoleAttempt(): bool
+    {
+        return $this->attemptsInFlight === null || ($this->attemptsInFlight)() <= 1;
     }
 
     /**
@@ -195,6 +348,26 @@ class StreamJob extends Job implements JobContract
         $until = $this->decoded['retryUntil'] ?? null;
 
         return $until === null ? null : (int) $until;
+    }
+
+    /**
+     * Get the seconds the job declares it may run, from the cached payload.
+     */
+    #[\Override]
+    public function timeout(): ?int
+    {
+        $timeout = $this->decoded['timeout'] ?? null;
+
+        return $timeout === null ? null : (int) $timeout;
+    }
+
+    /**
+     * Whether the job declares that a timeout fails it, from the cached payload.
+     */
+    #[\Override]
+    public function shouldFailOnTimeout(): bool
+    {
+        return (bool) ($this->decoded['failOnTimeout'] ?? false);
     }
 
     /**

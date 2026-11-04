@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Process;
 
 use Closure;
+use Illuminate\Support\ConfigurationUrlParser;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -31,6 +32,12 @@ final class MasterProcess
      * publish interval, and signal latency between master and workers.
      */
     private const int DRAIN_DEADLINE_SLACK = 15;
+
+    /** `Memcached::OPT_CONNECT_TIMEOUT`, in ms. By value: the extension is optional. */
+    private const int MEMCACHED_OPT_CONNECT_TIMEOUT = 14;
+
+    /** `Memcached::OPT_POLL_TIMEOUT`, in ms. */
+    private const int MEMCACHED_OPT_POLL_TIMEOUT = 8;
 
     /**
      * Compare-and-delete: remove the key only while it still holds the exact
@@ -91,6 +98,9 @@ LUA;
      */
     private ?int $housekeepingDueAt = null;
 
+    /** @var array<string, string> Where the housekeeper's capped sweep continues at the next run. */
+    private array $redeliveryCursors = [];
+
     /** Rolling throughput state for the aggregate metrics publisher. */
     private ?int $lastAggregateJobsTotal = null;
 
@@ -132,6 +142,21 @@ LUA;
     private ?StreamQueue $depthProbe = null;
 
     private ?float $lastAggregateAt = null;
+
+    /** @var array<int, int> Child PID => unix time it was spawned, for the stall watchdog. */
+    private array $workerSpawnedAt = [];
+
+    /** @var array<int, true> PIDs the watchdog has already sent SIGKILL, awaiting their reap. */
+    private array $stallKilledPids = [];
+
+    /** Start of the previous monitor tick, for spotting time the master itself lost. */
+    private ?float $watchdogLastTickAt = null;
+
+    /** No heartbeat counts as older than this: the last moment the master itself lost time. */
+    private int $watchdogBaseline = 0;
+
+    /** Unix time of the next heartbeat check; ticks run ten times more often. */
+    private float $watchdogNextCheckAt = 0.0;
 
     /** Current number of running worker processes. */
     public int $workerCount {
@@ -204,6 +229,9 @@ LUA;
 
         $this->warnIfPaused();
         $this->runDataUpgrade();
+
+        $this->prepareHeartbeatDirectory();
+        $this->warnIfCacheCanStall();
 
         $numWorkers = (int) ($this->config['workers'] ?? 4);
 
@@ -315,7 +343,23 @@ LUA;
 
         // Parent process — record the child PID.
         $this->workerPids[$pid] = true;
+        $this->workerSpawnedAt[$pid] = time();
         ($this->logger)("Worker spawned with PID {$pid}");
+    }
+
+    /**
+     * Drop everything kept per child once it has been reaped.
+     *
+     * Its heartbeat file goes too: nothing else removes it after a SIGKILL, and
+     * the kernel may hand the PID to a later worker.
+     */
+    private function forgetWorker(int $pid): void
+    {
+        unset($this->workerPids[$pid], $this->workerSpawnedAt[$pid], $this->stallKilledPids[$pid]);
+
+        if (self::loopStallKillSeconds($this->config) > 0) {
+            @unlink(self::heartbeatPath($pid));
+        }
     }
 
     /**
@@ -363,7 +407,7 @@ LUA;
             // Reap every exited child (SIGCHLD coalesces — one delivery may
             // cover multiple exits).
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
-                unset($this->workerPids[$pid]);
+                $this->forgetWorker($pid);
 
                 if (pcntl_wifexited($status)) {
                     $exitCode = pcntl_wexitstatus($status);
@@ -393,8 +437,14 @@ LUA;
             // and fire its watchdog if the grace period has elapsed.
             $this->handleDrainTick();
 
+            // Also while draining or stopping: a stalled worker cannot act on the
+            // SIGTERM, and would hold this master open until a supervisor gave up.
+            $this->handleWatchdogTick();
+
             if (++$maintenanceTick >= 10) {
                 $maintenanceTick = 0;
+                $maintenanceWall = microtime(true);
+                $maintenanceMonotonic = hrtime(true);
 
                 $this->maintainLease();
                 $this->publishAggregateMetrics();
@@ -403,12 +453,370 @@ LUA;
                 if ($this->autoScaler !== null) {
                     $this->evaluateAutoscale();
                 }
+
+                $this->discountMaintenanceTime($maintenanceWall, $maintenanceMonotonic);
             }
         }
 
         ($this->logger)('All workers exited. Master shutting down.');
 
         return 0;
+    }
+
+    /**
+     * Kill this master's own workers whose event loop stopped.
+     *
+     * Only {@see $workerPids} are judged: during a takeover the old and the new
+     * fleet share the heartbeat directory, and each master answers for its own.
+     * A kill goes through the reaper like any other crash, which respawns unless
+     * the master is stopping or the worker was being scaled down.
+     */
+    private function handleWatchdogTick(): void
+    {
+        $limit = self::loopStallKillSeconds($this->config);
+
+        if ($limit === 0) {
+            return;
+        }
+
+        $now = microtime(true);
+        $firstTick = $this->watchdogLastTickAt === null;
+        $gap = $firstTick ? 0.0 : $now - $this->watchdogLastTickAt;
+        $this->watchdogLastTickAt = $now;
+
+        if ($firstTick || self::watchdogShouldSkipPass($gap, $limit)) {
+            [
+                'baseline' => $this->watchdogBaseline,
+                'nextCheckAt' => $this->watchdogNextCheckAt,
+                'spawnedAt' => $this->workerSpawnedAt,
+            ] = self::watchdogRebase($this->workerSpawnedAt, $now);
+
+            if (abs($gap) >= $limit) {
+                ($this->logger)(sprintf('Loop stall check skipped: the master lost %ds (sleep, a frozen VM or a clock change); heartbeats get a new %ds.', abs($gap), $limit));
+            }
+
+            return;
+        }
+
+        if ($now < $this->watchdogNextCheckAt) {
+            return;
+        }
+
+        $this->watchdogNextCheckAt = $now + 1.0;
+
+        foreach (array_keys($this->workerPids) as $pid) {
+            if (isset($this->stallKilledPids[$pid])) {
+                continue;
+            }
+
+            $path = self::heartbeatPath($pid);
+
+            clearstatcache(true, $path);
+
+            $mtime = @filemtime($path);
+
+            $age = self::stalledHeartbeatAge(
+                $mtime === false ? null : $mtime,
+                $this->workerSpawnedAt[$pid] ?? (int) $now,
+                $this->watchdogBaseline,
+                (int) $now,
+                $limit,
+            );
+
+            if ($age !== null) {
+                $this->stallKilledPids[$pid] = true;
+                ($this->logger)("WARN Loop stall watchdog: worker PID {$pid} heartbeat is {$age}s old (limit {$limit}s), sending SIGKILL. Its jobs are redelivered after retry_after.");
+                posix_kill($pid, SIGKILL);
+            }
+        }
+    }
+
+    /**
+     * Keep time spent waiting on Redis out of the watchdog's tick gap.
+     *
+     * With Redis down, a maintenance call loses seconds to its connect attempts.
+     * Counted as lost time, every pass would be skipped, and the watchdog would
+     * depend on Redis after all. The master really was awake for that time if both
+     * clocks agree; sleep, a frozen VM or a clock step make them differ, and then
+     * the gap stands.
+     */
+    private function discountMaintenanceTime(float $wallStartedAt, int $monotonicStartedAt): void
+    {
+        if ($this->watchdogLastTickAt === null) {
+            return;
+        }
+
+        $this->watchdogLastTickAt = self::lastTickAfterMaintenance(
+            $this->watchdogLastTickAt,
+            microtime(true) - $wallStartedAt,
+            (hrtime(true) - $monotonicStartedAt) / 1e9,
+        );
+    }
+
+    /**
+     * The previous tick's time once a maintenance call of this duration is left out.
+     *
+     * @see discountMaintenanceTime()
+     */
+    public static function lastTickAfterMaintenance(float $lastTickAt, float $wallSeconds, float $monotonicSeconds): float
+    {
+        return abs($wallSeconds - $monotonicSeconds) < 1.0 ? $lastTickAt + $wallSeconds : $lastTickAt;
+    }
+
+    /**
+     * The watchdog state after a skipped pass, whichever way the clock moved.
+     *
+     * After a backward step the next check lies in the future, and a heartbeat
+     * written on the new clock reads older than a spawn time from the old one, which
+     * {@see stalledHeartbeatAge()} takes for a leftover. Both would turn the watchdog
+     * off for the size of the step, so the check is due at once and no spawn time
+     * lies ahead of the clock.
+     *
+     * @param  array<int, int>  $spawnedAt  Child PID => unix time it was spawned.
+     * @return array{baseline: int, nextCheckAt: float, spawnedAt: array<int, int>}
+     */
+    public static function watchdogRebase(array $spawnedAt, float $now): array
+    {
+        $baseline = (int) $now;
+
+        return [
+            'baseline' => $baseline,
+            'nextCheckAt' => 0.0,
+            'spawnedAt' => array_map(static fn (int $at): int => min($at, $baseline), $spawnedAt),
+        ];
+    }
+
+    /**
+     * The WARN for a default cache store that can stall a worker into a kill, or null.
+     *
+     * The worker's timers read the cache synchronously (the framework's paused
+     * queues, `queue:restart`, a cache-backed down state), so a blackholed cache
+     * server stops the event loop for as long as the client waits. If that reaches
+     * the limit the whole fleet gets killed, and again after every respawn, which
+     * is the mass kill the local heartbeat files exist to prevent.
+     *
+     * Stores that are local or suspend say nothing, and neither does a custom or
+     * composite driver, which may well be either.
+     *
+     * @param  array<string, mixed>  $cache  The app's `cache` config.
+     * @param  array<string, mixed>  $database  The app's `database` config.
+     * @param  int  $socketTimeout  The `default_socket_timeout` ini value.
+     */
+    public static function cacheStallWarning(array $cache, array $database, int $limit, int $socketTimeout): ?string
+    {
+        $name = (string) ($cache['default'] ?? '');
+        $store = (array) ($cache['stores'][$name] ?? []);
+        $driver = (string) ($store['driver'] ?? '');
+
+        if ($driver === 'database') {
+            $connection = (string) ($store['connection'] ?? $database['default'] ?? '');
+            $connectionDriver = (string) ($database['connections'][$connection]['driver'] ?? '');
+
+            if ($connectionDriver === 'sqlite' || str_starts_with($connectionDriver, 'fledge-')) {
+                return null;
+            }
+        } elseif (! in_array($driver, ['redis', 'memcached', 'dynamodb'], true)) {
+            return null;
+        }
+
+        $seconds = match ($driver) {
+            'redis' => self::redisStoreTimeout($store, (array) ($database['redis'] ?? []), $socketTimeout),
+            'memcached' => self::memcachedStoreTimeout($store),
+            default => null,
+        };
+
+        if ($seconds !== null && $seconds < $limit) {
+            return null;
+        }
+
+        return sprintf(
+            "WARN Loop stall watchdog: worker timers read the default cache store '%s' (%s) synchronously, so a network hang can block the event loop %s. At or past loop_stall_kill_seconds (%ds) that kills every worker, and again after each respawn. Set a lower timeout on the store's connection or raise the limit. Predis on an app with php-fiberio enabled suspends instead.",
+            $name,
+            $driver,
+            $seconds === null ? 'for a time Torque cannot determine' : sprintf('for up to %gs', $seconds),
+            $limit,
+        );
+    }
+
+    /**
+     * How long one Redis call can wait, the longer of connecting and reading, per
+     * attempt. Null when that is unknown or unbounded.
+     *
+     * phpredis takes 0 as `default_socket_timeout` for both. Predis has its own
+     * `read_write_timeout`, where 0 or less means never, and connects within 5s by
+     * default.
+     *
+     * @param  array<string, mixed>  $store
+     * @param  array<string, mixed>  $redis  The `database.redis` config.
+     */
+    private static function redisStoreTimeout(array $store, array $redis, int $socketTimeout): ?float
+    {
+        $connection = $redis[(string) ($store['connection'] ?? 'default')] ?? null;
+
+        if (! is_array($connection)) {
+            return null;
+        }
+
+        try {
+            $connection = (new ConfigurationUrlParser)->parseConfiguration($connection);
+        } catch (\InvalidArgumentException) {
+            return null;
+        }
+
+        $fallback = $socketTimeout > 0 ? (float) $socketTimeout : null;
+
+        if (($redis['client'] ?? 'phpredis') === 'predis') {
+            $read = $connection['read_write_timeout'] ?? null;
+            $read = $read === null ? $fallback : ((float) $read > 0 ? (float) $read : null);
+            $connect = (float) ($connection['timeout'] ?? 5.0);
+        } else {
+            $read = (float) ($connection['read_timeout'] ?? 0.0);
+            $read = $read < 0 ? null : ($read > 0 ? $read : $fallback);
+            $connect = (float) ($connection['timeout'] ?? 0.0);
+            $connect = $connect > 0 ? $connect : $fallback;
+        }
+
+        return $read === null || $connect === null ? null : max($read, $connect);
+    }
+
+    /**
+     * How long one Memcached call can wait, in seconds, or null when the options do
+     * not state it: the defaults live in the C library and differ per build.
+     *
+     * @param  array<string, mixed>  $store
+     */
+    private static function memcachedStoreTimeout(array $store): ?float
+    {
+        $options = (array) ($store['options'] ?? []);
+        $connect = $options[self::MEMCACHED_OPT_CONNECT_TIMEOUT] ?? null;
+        $poll = $options[self::MEMCACHED_OPT_POLL_TIMEOUT] ?? null;
+
+        return $connect === null || $poll === null ? null : max((float) $connect, (float) $poll) / 1000;
+    }
+
+    /**
+     * The effective `loop_stall_kill_seconds`, 0 when off.
+     *
+     * Heartbeats come once a second and an mtime only has whole seconds, so a
+     * limit of 1 would kill healthy workers on ordinary timer jitter.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    public static function loopStallKillSeconds(array $config): int
+    {
+        $seconds = (int) ($config['loop_stall_kill_seconds'] ?? 0);
+
+        return $seconds > 0 ? max(2, $seconds) : 0;
+    }
+
+    /**
+     * Whether the gap since the master's previous tick means it lost time itself.
+     *
+     * After laptop sleep, a frozen VM or a clock step every heartbeat looks old at
+     * once though no worker stalled, and a pass would kill the whole fleet. A tick
+     * is normally 100 ms plus a maintenance call. The threshold scales down with
+     * short limits, where a smaller loss is already enough to pass the limit, and
+     * caps out because any longer loss may as well be skipped: the only cost of a
+     * skip is that a real stall is caught one limit later.
+     */
+    public static function watchdogShouldSkipPass(float $gapSeconds, int $limit): bool
+    {
+        return abs($gapSeconds) > max(1.0, min(5.0, $limit / 2));
+    }
+
+    /**
+     * The age to report if this heartbeat means a stalled worker, otherwise null.
+     *
+     * No file means no heartbeat yet, and so does a file older than the spawn,
+     * which an earlier process with this PID left behind. Neither is ever a stall,
+     * however long ago the spawn was: a slow boot must not die, and a heartbeat
+     * directory that became unwritable must not put the fleet in a kill loop. The
+     * price is that a worker hanging before its first heartbeat is not covered.
+     *
+     * Whole seconds on both sides, because an mtime has no more.
+     */
+    public static function stalledHeartbeatAge(?int $mtime, int $spawnedAt, int $baseline, int $now, int $limit): ?int
+    {
+        if ($mtime === null || $mtime < $spawnedAt) {
+            return null;
+        }
+
+        $age = $now - max($mtime, $baseline);
+
+        return $age > $limit ? $age : null;
+    }
+
+    /**
+     * Directory of the per-PID heartbeat files.
+     *
+     * Next to the PID file on purpose: storage is already where a master must be
+     * able to write, is per app so several Torque apps on one host cannot collide,
+     * and the master lock in the same place means one fleet per directory, bar a
+     * takeover on one host, where PIDs are distinct.
+     */
+    public static function heartbeatDirectory(): string
+    {
+        return storage_path('framework/torque-heartbeats');
+    }
+
+    public static function heartbeatPath(int $pid): string
+    {
+        return self::heartbeatDirectory().'/'.$pid;
+    }
+
+    /**
+     * Create the heartbeat directory and clear what dead workers left behind.
+     *
+     * A file whose PID is alive stays: during a takeover it belongs to the old
+     * fleet, which is still running and still being watched. If it is an
+     * unrelated process instead, {@see stalledHeartbeatAge()} ignores the file.
+     */
+    private function prepareHeartbeatDirectory(): void
+    {
+        if (self::loopStallKillSeconds($this->config) === 0) {
+            return;
+        }
+
+        $directory = self::heartbeatDirectory();
+        $previousUmask = umask(0002);
+
+        try {
+            if (! is_dir($directory) && ! @mkdir($directory, 0775, true) && ! is_dir($directory)) {
+                ($this->logger)("WARN Loop stall watchdog: cannot create {$directory}; workers will report no heartbeat and none will be killed.");
+
+                return;
+            }
+        } finally {
+            umask($previousUmask);
+        }
+
+        foreach (glob($directory.'/*') ?: [] as $file) {
+            $pid = (int) basename($file);
+
+            if ($pid > 0 && (string) $pid === basename($file) && ! posix_kill($pid, 0)) {
+                @unlink($file);
+            }
+        }
+    }
+
+    private function warnIfCacheCanStall(): void
+    {
+        $limit = self::loopStallKillSeconds($this->config);
+
+        if ($limit === 0) {
+            return;
+        }
+
+        $warning = self::cacheStallWarning(
+            (array) config('cache'),
+            (array) config('database'),
+            $limit,
+            (int) ini_get('default_socket_timeout'),
+        );
+
+        if ($warning !== null) {
+            ($this->logger)($warning);
+        }
     }
 
     /**
@@ -670,7 +1078,12 @@ LUA;
         $this->housekeepingDueAt = $now + $interval;
 
         try {
-            $housekeeper = StreamHousekeeper::fromConfig($this->config);
+            // New each run, with its own connections: its client has no read timeout,
+            // so a socket silently dropped in the wait between runs would stall this
+            // synchronous loop, and with it reaping and the watchdog, until TCP gives
+            // up. Only the scan position of a capped sweep is kept.
+            $housekeeper = StreamHousekeeper::fromConfig($this->config)
+                ->resumeRedeliverySweep($this->redeliveryCursors);
 
             $deadLetter = $housekeeper->pruneDeadLetter();
 
@@ -682,7 +1095,12 @@ LUA;
             // idle for longer than a full worker lifetime belongs to a
             // process that is gone.
             $idleSeconds = max(3600, (int) ($this->config['max_worker_lifetime'] ?? 3600));
-            $removed = array_sum($housekeeper->pruneConsumers($idleSeconds));
+            $removed = array_sum($housekeeper->pruneConsumers(
+                $idleSeconds,
+                redeliveryFieldLimit: StreamHousekeeper::REDELIVERY_FIELDS_PER_SWEEP,
+            ));
+
+            $this->redeliveryCursors = $housekeeper->redeliveryCursors();
 
             if ($removed > 0) {
                 ($this->logger)("Housekeeping: removed {$removed} stale stream consumers.");
@@ -1003,7 +1421,7 @@ LUA;
 
         while (microtime(true) < $deadline && ! $this->shouldStop) {
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
-                unset($this->workerPids[$pid]);
+                $this->forgetWorker($pid);
                 ($this->logger)("Worker PID {$pid} exited during takeover readiness.");
             }
 

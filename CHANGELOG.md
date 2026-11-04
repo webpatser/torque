@@ -5,6 +5,39 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-04
+
+Job timeouts, redelivery counting and a blocked-loop watchdog, all opt-in. Two changes apply without opting in: entries a stopping worker never started return to the stream, and `Queue::popUsing()` works. `UPGRADE.md` has the new keys and what 2.0 will flip.
+
+### Added
+- **Job timeouts** (`timeouts.enabled`, `TORQUE_TIMEOUTS`, off by default). A job gets `$job->timeout() ?? streams.<name>.timeout`; `0` is no limit. At expiry the job gets `interrupted()`, then fails if `$failOnTimeout` is set or its attempts are up, and is otherwise released with a delay of at least `drain_grace_seconds`. `JobTimedOut` and `JobExceptionOccurred` are dispatched.
+- **A timeout rotates the whole worker** (exit 1). Other slots get `drain_grace_seconds`; survivors are redelivered, so duplicates happen. Keep concurrency low on hang-prone streams and timeouts below `retry_after` (boot WARN).
+- **`loop_stall_kill_seconds`** (`TORQUE_LOOP_STALL_KILL`, off at 0): the master SIGKILLs a worker whose local heartbeat file in `storage/framework/torque-heartbeats` is older than the limit. No Redis is involved. A worker with no heartbeat yet is never killed.
+- **Redelivery counting under `strict_attempts`**: steals, pending re-reads, failed releases, survivors abandoned by a drain, rotation or timeout, and entries lost with a crashed worker count against `$tries` or `max_retries`. A job over the limit goes to the dead-letter stream with reason `redelivery_limit`. A job with `retryUntil` is limited only by its deadline.
+- **`Queue::popUsing('torque', ...)`** is honoured; the callback receives the comma-joined eligible queues.
+
+### Changed
+- **Entries a stopping worker never started return to the stream**, in every mode: prefetched entries and ones a `popUsing` callback held back. They move to the tail, so order changes, and they are not charged as redeliveries.
+- **The timer spans `handle()` only.** Stock's alarm also covers the `JobProcessing` and `JobProcessed` listeners; Torque's does not. `interrupted()` and timeout listeners share `min(drain_grace_seconds / 2, 5)` seconds.
+- **A timeout with other jobs in flight skips stock's rollback** of the failed-jobs and batch connections, so it cannot destroy the other slots' transactions. A timeout on the only job in flight keeps the stock rollback.
+- **The master opens new Redis connections each housekeeping tick**, so an idle dropped connection cannot freeze it. A pending re-read gives up after `redis.read_timeout`, or 30 seconds when none is set, with a WARN.
+
+### Fixed
+- **A worker leaving the consumer group could drop a delivery that landed while it was leaving**, permanently losing that job. `releaseConsumer` now checks and deletes atomically. This affects every version before 1.3.0.
+- **Entries a worker hands back at drain are never also run by that worker.** Entries from a failing stream no longer stop the other streams' handback.
+- **At `drain_grace_seconds` 0 a timed-out attempt still settles**, as the grace is floored at 1 second while it does.
+
+### Behaviour changes
+- **New WARN lines.** A timeout with other jobs in flight and an open transaction on the failed-jobs connection warns that the `failed_jobs` row may be lost unless that transaction commits. A stream's failed handback and a read that never ended each log a WARN too.
+- **Only a job suspended on the event loop can time out.** Blocking code needs the watchdog. An abandoned job's code may run briefly until the worker exits.
+- **Shared transactions are a documented risk.** If a job hangs in a transaction while another runs, the other nests in it and is rolled back silently at exit; see the Concurrency contract.
+- **A job running past `retry_after` on a live worker is charged when stolen**, under `strict_attempts`.
+- **A killed or SIGSTOPped worker is hit by the watchdog**, and a job that always blocks loops forever without `strict_attempts`.
+
+### Parity
+- Worker event parity against framework v13.40.0: every event the stock `Worker` imports is now dispatched or referenced by Torque. `JobTimedOut` is dispatched when `timeouts.enabled` is on.
+- Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-11-04; nothing new since the 1.2.0 review (#1819 and #1817 need no port).
+
 ## [1.2.0] - 2026-11-04
 
 Limits declared on jobs now apply, `size()` changes meaning, and workers honour `artisan down`. Read the behaviour changes before deploying; `UPGRADE.md` has the new config keys and what 2.0 will flip.
@@ -684,7 +717,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/webpatser/torque/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/webpatser/torque/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/webpatser/torque/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/webpatser/torque/compare/v1.1.0...v1.1.1

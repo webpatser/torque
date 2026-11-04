@@ -302,6 +302,46 @@ function torque_steal_age(StreamQueue $queue, string $streamKey, string $id, str
     $queue->getRedisClient()->execute('XCLAIM', $streamKey, TORQUE_STEAL_GROUP, $owner, '0', $id, 'IDLE', '120000', 'JUSTID');
 }
 
+/*
+ * A delivery landing between a separate XPENDING and DELCONSUMER would be dropped
+ * from every PEL for good. No client can place one in that gap on demand, so this
+ * pins what closes it: one script, as well as what the script decides.
+ */
+it('deletes its consumer in one script, and only with nothing pending', function () {
+    $redis = torqueRedis();
+    $stream = 'torque-steal-release-'.bin2hex(random_bytes(4));
+    $redis->execute('XGROUP', 'CREATE', $stream, TORQUE_STEAL_GROUP, '$', 'MKSTREAM');
+
+    $worker = new WorkerProcess(['redis' => ['uri' => torqueRedisUri()]]);
+    $consumer = (string) (new ReflectionProperty($worker, 'consumerId'))->getValue($worker);
+    $release = static fn () => $worker->releaseConsumer(torqueRedisUri(), ['q'], TORQUE_STEAL_GROUP, static fn (string $queue): string => $stream);
+    $scripts = static function () use ($redis): int {
+        preg_match('/^cmdstat_eval:calls=(\d+)/m', (string) $redis->execute('INFO', 'commandstats'), $found);
+
+        return (int) ($found[1] ?? 0);
+    };
+    $consumers = static fn (): int => count($redis->execute('XINFO', 'CONSUMERS', $stream, TORQUE_STEAL_GROUP));
+
+    try {
+        $id = (string) $redis->execute('XADD', $stream, '*', 'payload', '{}');
+        $redis->execute('XREADGROUP', 'GROUP', TORQUE_STEAL_GROUP, $consumer, 'COUNT', '1', 'STREAMS', $stream, '>');
+
+        $before = $scripts();
+        $release();
+
+        expect($scripts() - $before)->toBe(1)
+            ->and($consumers())->toBe(1)
+            ->and((int) $redis->execute('XPENDING', $stream, TORQUE_STEAL_GROUP)[0])->toBe(1);
+
+        $redis->execute('XACK', $stream, TORQUE_STEAL_GROUP, $id);
+        $release();
+
+        expect($consumers())->toBe(0);
+    } finally {
+        $redis->execute('DEL', $stream);
+    }
+});
+
 it('runs a job that outlives the steal threshold exactly once in a worker with free slots', function () {
     $run = torque_steal_run(
         [

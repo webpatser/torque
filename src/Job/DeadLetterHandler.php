@@ -52,13 +52,15 @@ final class DeadLetterHandler
      * @param  string  $payload  The raw JSON payload of the failed job.
      * @param  string  $messageId  The original stream message ID.
      * @param  \Throwable  $exception  The exception that caused the final failure.
+     * @param  string|null  $reason  Short machine-readable reason, e.g. `redelivery_limit`, stored as in {@see quarantine()}.
      */
-    public function handle(string $queue, string $payload, string $messageId, \Throwable $exception): void
+    public function handle(string $queue, string $payload, string $messageId, \Throwable $exception, ?string $reason = null): void
     {
         $this->write($queue, $payload, [
             'exception_class', $exception::class,
             'exception_message', substr($exception->getMessage(), 0, 1000),
             'exception_trace', substr($exception->getTraceAsString(), 0, 5000),
+            ...($reason === null ? [] : ['reason', substr($reason, 0, 200), 'original_message_id', $messageId]),
         ]);
     }
 

@@ -111,6 +111,28 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Blocked event loop kill (seconds)
+    |--------------------------------------------------------------------------
+    | A job that blocks the whole event loop (`sleep()`, a blocking PDO query, a
+    | blocking C extension) freezes every slot and timer of its worker, so job
+    | timeouts cannot fire. Above 0, workers touch a heartbeat file in
+    | storage/framework/torque-heartbeats about once a second and the master
+    | sends SIGKILL to a worker whose heartbeat is older than this, then replaces
+    | it. Set it above the longest blocking call you accept: it also kills healthy
+    | slots that happen to share the worker. Values of 1 count as 2. 0 is off: no
+    | file and no check.
+    |
+    | No Redis is involved, so an outage cannot kill workers. The killed worker's
+    | jobs stay pending and are redelivered after `retry_after`; only with
+    | `strict_attempts` do those redeliveries count, otherwise a job that always
+    | blocks loops. A worker that never reaches its first heartbeat (a hang during
+    | boot) is not killed. storage must be on a local disk: the file's mtime is
+    | compared to this host's clock.
+    */
+    'loop_stall_kill_seconds' => (int) env('TORQUE_LOOP_STALL_KILL', 0),
+
+    /*
+    |--------------------------------------------------------------------------
     | Memory limit (MB)
     |--------------------------------------------------------------------------
     | A worker whose real memory usage (memory_get_usage(true)) reaches this
@@ -169,6 +191,10 @@ return [
     | 0 or 1 is one run and no retry. `backoff` is `exponential` (2, 4, 8, ...),
     | seconds, or seconds per attempt as a list or "1,5,10", the last step
     | repeating. Anything else logs a WARN at boot and is `exponential`.
+    |
+    | `timeout` is the seconds a job that declares none may run (see `timeouts`
+    | below). Keep it below `retry_after`, or another worker can steal the job
+    | while it still runs. The worker logs a WARN at boot if it is not.
     */
     'streams' => [
         'default' => [
@@ -203,8 +229,42 @@ return [
     | On, a job is checked before it runs, as with queue:work, and fails once it
     | is past its attempts or `retryUntil`. Give rate-limited jobs a `retryUntil`
     | or a high `$tries` first, or they will start failing.
+    |
+    | On, a delivery after the first also counts against `$tries` or `max_retries`,
+    | so a job that kills its worker reaches the dead letter (reason
+    | `redelivery_limit`) instead of looping forever. Any worker going away counts:
+    | a job left running past `drain_grace_seconds` by a restart, a rotation or
+    | another job's timeout uses up a try as well, so leave room in the limit.
     */
     'strict_attempts' => (bool) env('TORQUE_STRICT_ATTEMPTS', false),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Job timeouts
+    |--------------------------------------------------------------------------
+    | Off, `$timeout` and a stream's `timeout` mean nothing and a job runs for as
+    | long as it runs. On, a job gets its `$timeout`, else its stream's `timeout`,
+    | else no limit; 0 is no limit. Independent of `job_limits`.
+    |
+    | A job past its limit is told through interrupted(SIGALRM), then fails if
+    | `$failOnTimeout` is set or its attempts are up, and is otherwise released
+    | with a delay of at least `drain_grace_seconds`. The whole worker then
+    | rotates: the other slots get `drain_grace_seconds`, and what is still
+    | running after that is redelivered. A hang-prone stream is best off with a
+    | low `coroutines_per_worker`.
+    |
+    | The limit can only hit a job that is waiting on the event loop. Code that
+    | blocks the process never lets the timer run.
+    |
+    | The timer spans the job's handle() only. The stock worker's alarm also covers
+    | the JobProcessing and JobProcessed listeners; here those are not timed.
+    | interrupted() and the JobInterrupted, JobTimedOut and JobExceptionOccurred
+    | listeners share half of `drain_grace_seconds`, 5 seconds at most. The job is
+    | failed or released after that, also when one of them has not returned.
+    */
+    'timeouts' => [
+        'enabled' => (bool) env('TORQUE_TIMEOUTS', false),
+    ],
 
     /*
     |--------------------------------------------------------------------------

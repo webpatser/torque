@@ -356,7 +356,7 @@ describe('strict_attempts', function () {
             ->and($run['backoffs'])->toBe([])
             ->and($run['deadLetters'])->toBe(0)
             ->and(substr_count($run['output'], 'strict_attempts is off'))->toBe(1)
-            ->and($run['output'])->toContain('in either mode')
+            ->and($run['output'])->toContain('is not counted either')
             ->and($run['output'])->not->toContain('neither is one whose worker keeps dying');
     });
 
