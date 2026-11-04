@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-10-20: the security policy removal in favor of the org-wide default and a follow-redirects dashboard dependency bump; nothing to port.
 - Reviewed framework v13.39.0: `JobAttempted` gained a `duration` (ms) property, computed in a `finally` around `fire()`; Torque's `WorkerProcess` does not dispatch `JobAttempted` and already times `fire()` for `JobProcessed`, so nothing carried. The other touched queue files (`Queue.php`, `CallQueuedHandler.php`, `Jobs/Job.php`, `Jobs/FakeJob.php`) were docblock-only.
 
+## [1.1.0] - 2026-10-27
+
+No change to the public API. The behavior differences below are small edge cases; everything else is a Larastan level 8 pass.
+
+### Added
+- **Larastan level 8 static analysis.** `larastan/larastan ^3.10` is a dev dependency, `phpstan.neon.dist` configures it, `composer analyse` runs it, and CI has a `Static analysis` step.
+- `tests/Feature/RetryCommandTest.php`, a regression test for `queue:retry`, and `phpunit.xml.dist` pins `CACHE_STORE=array`.
+
+### Changed
+- `MysqlPool::query()` with parameters now runs them as a one-off prepared statement through the inner pool's `execute()`; the inner `query()` bound nothing. Without parameters it is still a plain query.
+- `JobStreamRecorder` records the `started` event's queue as `default` when `getQueue()` returns an empty string, not only when it returns `null`, and `extractUuid()` returns `null` for a non-object job instead of calling `method_exists()` on it.
+- `TorqueServiceProvider` casts the stream names it hands the dead-letter handler's retry whitelist to strings, so numeric stream names match its strict comparison.
+- `StreamQueue` throws a `RuntimeException` when `igbinary_serialize()` fails to encode or transcode a payload, instead of passing `false` on.
+- `ConnectionPool`, `HttpPool` and `MysqlPool` validate their size in the constructor and throw the same `ValueError` / `Error` the underlying semaphore or pool threw before.
+- `MasterProcess` skips autoscaling when the scaler or metrics publisher is not set, and treats a failed `getmypid()` as not stale in the drain pause check.
+- `torque:stop` and `torque:reload` poll the old master through the new `ProcessInspector::isAlive()` (`posix_kill($pid, 0)`).
+- Type-only: PHPDoc array shapes, return types on the dashboard Livewire `render()` methods and `Dead::retry()`, redundant null and `array_values()` checks dropped, and the worker's shared pause state built in a `newPauseState()` helper.
+
 ## [1.0.0] - 2026-10-24
 
 First stable release. From here on Torque follows semantic versioning strictly: breaking changes wait for 2.0. See UPGRADE.md for the 0.18 to 1.0 notes.
