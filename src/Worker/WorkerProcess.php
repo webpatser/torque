@@ -11,6 +11,7 @@ use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Queue\Interruptible;
 use Illuminate\Queue\CallQueuedHandler;
+use Illuminate\Queue\Events\JobAttempted;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobInterrupted;
@@ -25,6 +26,7 @@ use Illuminate\Queue\QueueManager;
 use Illuminate\Queue\Worker;
 use Revolt\EventLoop;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
+use Webpatser\Torque\Job\AttemptDeferredCallbacks;
 use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Job\CoroutineContext;
 use Webpatser\Torque\Job\DeadLetterHandler;
@@ -76,6 +78,15 @@ LUA;
     public private(set) int $jobsProcessed = 0;
 
     private bool $stopRequested = false;
+
+    /**
+     * Set once the process is going down: on the worker's own exit paths and,
+     * through a shutdown function, on any other exit such as a job's exit() or
+     * dd(). Exiting destroys the suspended job Fibers, and PHP runs their
+     * `finally` blocks while doing so, after the shutdown functions. Those jobs
+     * were abandoned, so they must not be reported as attempted.
+     */
+    private bool $exiting = false;
 
     /** Whether a graceful stop has been requested (via SIGTERM/SIGINT or max limits). */
     public bool $shouldStop {
@@ -166,6 +177,10 @@ LUA;
     {
         CoroutineContext::init();
 
+        register_shutdown_function(function (): void {
+            $this->exiting = true;
+        });
+
         $this->isRunning = true;
 
         $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
@@ -212,6 +227,10 @@ LUA;
 
         $events = app(Dispatcher::class);
         $queueManager = app('queue');
+
+        // defer() callbacks belong to the attempt that registered them; the
+        // framework's shared collection assumes one job at a time.
+        $deferredCallbacks = AttemptDeferredCallbacks::install(app());
 
         // Mirror queue:work's failed-job bookkeeping (WorkCommand::listenForEvents):
         // the failed-jobs provider write is a listener concern of the worker command
@@ -395,6 +414,7 @@ LUA;
                 $pauseState,
                 $concurrency,
                 $buildStreamKey,
+                $deferredCallbacks,
                 &$slotStarts,
                 &$slotJobs,
             ) {
@@ -525,8 +545,16 @@ LUA;
                     $slotJobs[$fiberIndex] = $streamJob;
                     $this->streamActive[$queueName] = ($this->streamActive[$queueName] ?? 0) + 1;
 
+                    // Locals, not properties: every slot runs its own attempt.
+                    $attemptDuration = null; // Set by processMessage().
+                    $attemptException = null;
+                    $attemptEnded = false;
+
+                    $deferredCallbacks->beginAttempt();
+
                     try {
-                        $this->processMessage($streamJob, $events, $connectionName);
+                        $this->processMessage($streamJob, $events, $connectionName, $attemptDuration);
+                        $attemptEnded = true;
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
                         $metrics->recordJobCompleted($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
 
@@ -537,15 +565,33 @@ LUA;
                             $circuitBreaker->recordSuccess($queueName);
                         }
                     } catch (\Throwable $e) {
+                        $attemptEnded = true;
+                        $attemptException = $e;
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
                         $metrics->recordJobFailed($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
                         $this->handleFailure($streamJob, $message, $e, $events, $connectionName, $streams, $deadLetterHandler, $circuitBreaker);
                     } finally {
-                        // The attempt ran to an end (completed, released or
-                        // failed), so it is not a crash: drop its marker.
-                        $this->forgetProcessingMarker($streamJob);
+                        // The command is done: a signal arriving while a
+                        // listener below suspends must not interrupt it.
+                        // $slotStarts stays set so a drain still waits.
+                        unset($slotJobs[$fiberIndex]);
+
+                        // PHP also runs this block when it destroys the Fiber at
+                        // shutdown, whatever the attempt was doing. That job was
+                        // abandoned, so it reports nothing. After a job's own
+                        // exit() it also keeps its marker, since its redelivery
+                        // is a crash; the forced exit clears markers itself.
+                        // @phpstan-ignore booleanAnd.leftAlwaysTrue (that unwind is not a Throwable, so analysis cannot see it)
+                        if ($attemptEnded && ! $this->exiting) {
+                            // The attempt ran to an end (completed, released or
+                            // failed), so it is not a crash: drop its marker.
+                            $this->forgetProcessingMarker($streamJob);
+                            $this->dispatchJobAttempted($events, $connectionName, $streamJob, $attemptException, $attemptDuration);
+                        }
+
+                        $deferredCallbacks->endAttempt();
                         $this->streamActive[$queueName] = max(0, ($this->streamActive[$queueName] ?? 1) - 1);
-                        unset($slotStarts[$fiberIndex], $slotJobs[$fiberIndex]);
+                        unset($slotStarts[$fiberIndex]);
                         $this->releaseInFlight($inFlightKey);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
@@ -635,6 +681,10 @@ LUA;
             fwrite(STDERR, $idle
                 ? "[torque:worker] Drain complete; no jobs in flight, exiting.\n"
                 : "[torque:worker] Drain window expired; forcing exit.\n");
+
+            // Set last: the cleanup above suspends, and a job finishing in that
+            // gap ran to a real end and still reports it.
+            $this->exiting = true;
             exit(0);
         });
 
@@ -654,6 +704,9 @@ LUA;
 
         $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
 
+        // The loop stopped or crashed: any Fiber still suspended is destroyed
+        // when the process ends, just as on the forced exit.
+        $this->exiting = true;
         $this->isRunning = false;
     }
 
@@ -1252,11 +1305,19 @@ LUA;
 
     /**
      * Fire the job and dispatch the surrounding processing events.
+     *
+     * @param  float|null  $duration  Receives the handler's run time in
+     *                                milliseconds, also when it throws. Left
+     *                                untouched when the attempt ends before fire().
+     *
+     * @param-out float|null $duration
      */
+    // @phpstan-ignore paramOut.unusedType (the null is what a throw before fire() leaves behind)
     private function processMessage(
         StreamJob $job,
         Dispatcher $events,
         string $connectionName,
+        &$duration = null,
     ): void {
         $events->dispatch(new JobProcessing($connectionName, $job));
 
@@ -1267,9 +1328,11 @@ LUA;
         // is timed, not the event dispatch or the stream acknowledgement.
         $startedAt = hrtime(true);
 
-        $job->fire();
-
-        $duration = round((hrtime(true) - $startedAt) / 1_000_000, 2);
+        try {
+            $job->fire();
+        } finally {
+            $duration = round((hrtime(true) - $startedAt) / 1_000_000, 2);
+        }
 
         // If the job handler did not explicitly delete, release, or fail the job,
         // treat it as successfully completed.
@@ -1278,6 +1341,47 @@ LUA;
         }
 
         $events->dispatch(new JobProcessed($connectionName, $job, $duration));
+    }
+
+    /**
+     * Announce that an attempt has ended, whatever its outcome.
+     *
+     * Same semantics as Illuminate\Queue\Worker::process() as of
+     * laravel/framework 13.40.0: once per attempt, after the job was released
+     * or failed so listeners see its final state, carrying the exception (if
+     * any) and the run time in milliseconds, which is null when the attempt
+     * ended before fire(). Called from one place only, the reader Fiber's
+     * `finally`, so a release or a permanent failure cannot fire it twice.
+     *
+     * Two exceptions to those semantics. A corrupt payload is discarded before a
+     * job object exists, so there is nothing to announce (the stock worker has no
+     * such path: it fails the job while decoding it in the attempt). A job the
+     * worker abandons by exiting fires nothing, since it never ended.
+     *
+     * A throwing listener must not take the slot down with it. The stock worker
+     * catches this in runJob() and reports it when job exception reporting is on;
+     * here it would end the reader Fiber for good.
+     */
+    private function dispatchJobAttempted(
+        Dispatcher $events,
+        string $connectionName,
+        StreamJob $job,
+        ?\Throwable $exception,
+        ?float $duration,
+    ): void {
+        try {
+            $events->dispatch(new JobAttempted($connectionName, $job, $exception, $duration));
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] JobAttempted dispatch failed: {$e->getMessage()}\n");
+
+            if (Worker::$reportJobExceptions) {
+                try {
+                    app(ExceptionHandler::class)->report($e);
+                } catch (\Throwable $reportFailure) {
+                    fwrite(STDERR, "[torque:worker] Reporting that failure threw: {$reportFailure->getMessage()}\n");
+                }
+            }
+        }
     }
 
     /**

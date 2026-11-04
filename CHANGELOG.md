@@ -5,11 +5,16 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1] - 2026-11-04
+
+### Fixed
+- **`WorkerProcess` now dispatches `JobAttempted`.** The stock worker fires it for every attempt, but Torque never did, so existing `JobAttempted` listeners and the new `Queue::whenJobRunsLongerThan` (laravel/framework v13.40.0) stayed silent. It now fires once per attempt, after the job was released or failed so listeners see its final state, with the exception (if any) and the handler's run time in milliseconds; the duration is null when the attempt ends before the handler runs, as in the stock worker. A throwing listener is logged to STDERR and reported through the exception handler (unless `Worker::$reportJobExceptions` is off), and does not cost the worker its slot. A corrupt payload discarded before a job object exists fires nothing, and neither does a job abandoned by the worker exiting: a forced exit at the end of the drain window destroys the suspended job, which is not an attempt that ended, and its redelivery fires the event in its own right. The `illuminate/*` floor stays `^13.34`: before v13.39.0 the event simply has no `duration` property.
+- **`defer()` callbacks in jobs now run under Torque, per attempt.** They used to sit in the framework's shared collection for the life of the worker and never ran: nothing dispatched `JobAttempted`, and the worker's hard exit skips `CommandFinished`. The framework's listener assumes one job at a time, so with `JobAttempted` dispatched, jobs in concurrent slots would have run, dropped or doubled each other's callbacks. `WorkerProcess` now binds `AttemptDeferredCallbacks`, which keeps every attempt's callbacks apart: `JobAttempted` runs only that attempt's, by the stock rule (the attempt succeeded, or the callback is `always()`). A `defer()` in a child fiber started through `async()` counts for the attempt that started it; code without that link, like a raw `Fiber` or an event loop timer, does not belong to any attempt and its callbacks do not run with one.
 
 ### Parity
+- Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-11-04: #1842 and #1844 dashboard dependency bumps; nothing to port.
 - Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-10-20: the security policy removal in favor of the org-wide default and a follow-redirects dashboard dependency bump; nothing to port.
-- Reviewed framework v13.39.0: `JobAttempted` gained a `duration` (ms) property, computed in a `finally` around `fire()`; Torque's `WorkerProcess` does not dispatch `JobAttempted` and already times `fire()` for `JobProcessed`, so nothing carried. The other touched queue files (`Queue.php`, `CallQueuedHandler.php`, `Jobs/Job.php`, `Jobs/FakeJob.php`) were docblock-only.
+- Reviewed framework v13.39.0: `JobAttempted` gained a `duration` (ms) property, computed in a `finally` around `fire()`; at that review Torque's `WorkerProcess` did not dispatch `JobAttempted` and already timed `fire()` for `JobProcessed`, so nothing carried (the dispatch, with this `duration`, arrives under Fixed above). The other touched queue files (`Queue.php`, `CallQueuedHandler.php`, `Jobs/Job.php`, `Jobs/FakeJob.php`) were docblock-only.
 
 ## [1.1.0] - 2026-10-27
 
@@ -619,7 +624,9 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/webpatser/torque/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/webpatser/torque/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/webpatser/torque/compare/v0.18.4...v1.0.0
 [0.18.4]: https://github.com/webpatser/torque/compare/v0.18.3...v0.18.4
 [0.18.3]: https://github.com/webpatser/torque/compare/v0.18.2...v0.18.3
