@@ -191,6 +191,36 @@ $tenantId = CoroutineContext::get('tenant_id');
 
 State is automatically cleaned up when the Fiber completes (backed by `WeakMap`).
 
+### Concurrency contract
+
+One worker runs up to `coroutines_per_worker` jobs at once in a single PHP process and a single container. Torque isolates the framework state that jobs commonly write to; everything else is shared by all jobs on that worker. At `coroutines_per_worker = 1` nothing is shared and the stock worker semantics apply to every job.
+
+**Isolated per attempt:**
+
+- `Context`, including child fibers started through `async()`. A job starts with an empty `Context` plus its payload's, and dispatched child jobs carry only their parent's.
+- `Log` context (`Log::withContext()` and `Log::channel('x')->withContext()`) on every channel.
+- `Auth` guards, including `async()` children.
+- `Cache::memo()` stores that exist at boot.
+- `defer()` callbacks.
+
+One gap: `Auth::setUser()` from a raw Fiber, an `EventLoop::delay()` callback, or a `Looping` or `JobPopping` listener writes to the ambient guard, which later attempts clone, for the worker's lifetime.
+
+**Shared by every job on the worker:**
+
+- The locale (`app()->setLocale()`), `config()->set()` and the default DB connection.
+- Transactions on a shared connection: a `DB::beginTransaction()` in one job is visible to every job using that connection. Use a pool per job (`MysqlPool`) or keep transactions out of async handlers.
+- User scoped bindings. The stock reset closure that drops scoped instances runs when a job starts and nothing else is in flight. At one slot that is every job; at more than one it happens only in quiet moments and may never happen under sustained load. At more than one slot the worker logs a boot WARN naming the scoped bindings that stay shared. Resolve per-job state inside the job instead of at boot.
+- Services that captured the log manager, the auth manager or a guard during boot (mail log transports, for example), and objects nested inside a custom guard.
+- `Cache::memo()` for a store added after boot, and the `image` binding.
+- `Auth::shouldUse()`.
+- Apps that bind their own log or auth manager: the boot WARN names them and Torque does not route them.
+- `Log::build()` channels are not cached, so a later `Log::shareContext()` does not reach them.
+
+If your jobs rely on any of the shared items, lower `coroutines_per_worker` for those streams or run them on a dedicated worker.
+
+> [!NOTE]
+> Laravel Cloud's queue listeners hold the current job in process-wide state. Torque dispatches the events anyway, but at more than one slot exception attribution on Cloud (which job an exception is reported against) is unreliable.
+
 ## Live job progress (built in)
 
 Every job automatically records a lifecycle timeline to a per-job Redis Stream: queued, started, exception, completed, plus any custom events you emit. Watch it live from the CLI, the dashboard, or your own UI without instrumenting each job by hand.
@@ -272,6 +302,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
 | `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
 | `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--deep` also sweeps orphaned job streams, stale index members and stale worker hashes; `--dry-run` to preview |
+| `torque:forget {id?} {--all} {--queue=} {--force}` | Delete a dead-letter entry by its stream id (like `1700000000000-0`, shown by the dashboard and `torque:tail`), or with `--all` every entry; uuids and `queue:failed` ids are rejected. `--queue` limits `--all` to one queue, `--force` skips the confirmation. Only `database-uuids` `failed_jobs` rows are removed with the entry; `--all` leaves rows that have no dead-letter entry. Horizon's `horizon:forget` |
 | `torque:supervisor` | Generate a Supervisor config file |
 
 ## Configuration
@@ -298,6 +329,11 @@ All options are in `config/torque.php`. Key settings:
 | `circuit_breaker.enabled` | true | Pause a stream whose jobs are failing permanently at a high rate |
 | `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
+| `redis.read_timeout` | 30 | Seconds a slot waits for a Redis reply before it gives up and reconnects (`TORQUE_REDIS_READ_TIMEOUT`) |
+| `memory_limit` | 0 | Megabytes of real memory (`memory_get_usage(true)`) at which a worker drains and exits with status 12, like `queue:work --memory`; the master starts a replacement. Checked once a second. The drain waits for running jobs with no grace force exit, so a hung job holds that worker until a signal, `queue:restart`, the worker lifetime or `max_jobs_per_worker` ends it, and the stall watchdog only warns. Job timeouts arrive in 1.3.0. `0` is off |
+| `force` | false | Keep processing during `artisan down`, like `queue:work --force`. Off, slots stop polling and claiming while the app is down; in-flight jobs finish and jobs wait in the stream |
+| `job_limits` | `job` | `job`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `stream`: kill switch, only `max_retries` and 2**attempts count, for every job |
+| `strict_attempts` | false | Also check attempts and `retryUntil` before a job runs, as `queue:work` does, which limits `release()`. Off, because `RateLimited` and `WithoutOverlapping` release loops use up attempts and would start failing |
 
 ### Autoscaling
 
@@ -420,7 +456,7 @@ Default: `['web', 'auth']`. Override in config:
 Jobs that exhaust all retries are moved to a dead-letter Redis Stream. You can:
 
 - View them in the dashboard
-- Retry or delete via dashboard or programmatically
+- Retry or delete via dashboard or programmatically. A retry resets attempts, refreshes `retryUntil`, clears the `maxExceptions` counter, refuses when the job class no longer exists, and deletes the `failed_jobs` row (`database-uuids` failer only)
 - Listen for the `JobPermanentlyFailed` event for custom notifications
 
 ```php
@@ -514,12 +550,27 @@ Redis Streams (not LISTs like Horizon) provide:
 | Per-job event timeline   | Logs + failed-job retry | First-class, live-tailable per UUID   |
 | Live job progress        | Custom code per job     | `$this->emit(...)` via `Streamable`   |
 | Worker pause/resume events | `WorkerPausing` / `WorkerResuming` (13.8) | Same events, dispatched on `torque:pause` flips |
+| Worker lifecycle events | `WorkerStarting`, `WorkerStopping`, `WorkerIdle`, `WorkerQueuePaused`, `WorkerQueueResumed`, `Looping` | `WorkerStarting` and `WorkerStopping` once per worker; `Looping` on every loop. A listener returning false from `Looping` is honoured |
+| Pop and release events | `JobPopping`, `JobPopped`, `JobReleased`, `JobReleasedAfterException` | Dispatched. `JobPopping` fires on every poll (about 25 per second at 50 slots), so keep its listeners cheap. A throwing listener on the job events does not change the job's outcome, unlike stock |
+| Job timeout event | `JobTimedOut` | Not dispatched yet: Torque does not enforce `$timeout` in 1.2.x. Arrives with timeouts in 1.3.0 |
+| Maintenance mode | `queue:work` waits while `artisan down`, `--force` overrides | Same: slots stop polling, `force` config overrides |
 | Framework queue pause | `queue:pause` / `queue:pause --all` (13.25) | Honored: global pause stops the worker, per-queue pause skips that stream (keys on the `torque` connection); `torque:pause` stays independent |
 | Enum queue names | `\UnitEnum` accepted by all drivers (13.25) | Same on `StreamQueue` via `enum_value()` |
 | Queue inspection (`all*`) | `allPendingJobs` / `allReservedJobs` / `allDelayedJobs` (13.8) | Same API on `StreamQueue` |
 | Job interrupt event | `JobInterrupted` per `Interruptible` job on SIGTERM/SIGINT (13.31) | Same event per in-flight slot, carrying the `StreamJob` and signal |
 | Job run time | `JobProcessed::$duration` in milliseconds (13.34) | Same, timed around `fire()` per slot |
-| Crash counting | `#[CountCrashesAsExceptions]` counts a worker death mid-job against `maxExceptions` (13.34) | Crashes are counted per slot against `maxExceptions` (thrown exceptions follow the stream's `max_retries`); a forced drain exit is not counted as a crash. Known limitation: a job still running past `retry_after` that another worker steals (XAUTOCLAIM) reuses its attempt number and is counted as a crash, so set `retry_after` longer than the longest job |
+| Crash counting | `#[CountCrashesAsExceptions]` counts a worker death mid-job against `maxExceptions` (13.34) | Crashes are counted per slot against `maxExceptions`, and so are thrown exceptions; `max_retries` is only the limit for a job that declares no `$tries` or `retryUntil`. A forced drain exit is not counted as a crash. Known limitation: a job still running past `retry_after` that another worker steals (XAUTOCLAIM) reuses its attempt number and is counted as a crash, so set `retry_after` longer than the longest job |
+
+### Not planned
+
+These Horizon features have no Torque equivalent in 1.x, each for a reason:
+
+| Horizon feature | Why not |
+|---|---|
+| Per-environment supervisors | Torque has one master with one slot pool. Per-stream `max_concurrency`, `prefix` isolation and `env()` in `config/torque.php` cover the main uses |
+| Queue grouping and per-supervisor pause | Same single pool. Pause a stream with `queue:pause`, or all of Torque with `torque:pause` |
+| Tag monitoring with retention | Not planned; open an issue if you need it |
+| Fast termination | `torque:reload` takes over with a new fleet while the old one drains, which makes it unnecessary |
 
 ## Production deployment
 

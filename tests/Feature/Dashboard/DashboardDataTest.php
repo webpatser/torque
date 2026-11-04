@@ -147,7 +147,7 @@ it('builds one queue entry per configured stream', function () {
 
         $default = collect($queues)->firstWhere('name', 'default');
 
-        expect($default)->toHaveKeys(['name', 'pending', 'delayed', 'reserved', 'processed', 'failed', 'throughput', 'wait', 'history', 'paused', 'circuit'])
+        expect($default)->toHaveKeys(['name', 'pending', 'delayed', 'reserved', 'consumers', 'idle', 'processed', 'failed', 'throughput', 'wait', 'history', 'paused', 'circuit'])
             ->and($default['pending'])->toBeInt()
             ->and($default['delayed'])->toBeInt()
             ->and($default['reserved'])->toBeInt()
@@ -435,7 +435,11 @@ it('reads a stream configured under a cluster hash tag by its bare name', functi
             ->and($queues[0]['failed'])->toBe(1)
             ->and(array_sum($queues[0]['history']))->toBe(3)
             ->and($queues[0]['paused'])->toBeTrue()
-            ->and($queues[0]['pending'])->toBe(1);
+            // Read by the consumer: in flight, no longer waiting.
+            ->and($queues[0]['pending'])->toBe(0)
+            ->and($queues[0]['reserved'])->toBe(1)
+            ->and($queues[0]['consumers'])->toBe(1)
+            ->and($queues[0]['idle'])->toBeInt();
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     } finally {

@@ -5,6 +5,12 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Job;
 
 use Fledge\Async\Redis\RedisClient;
+use Illuminate\Container\Container;
+use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Illuminate\Contracts\Encryption\Encrypter;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Queue\Failed\DatabaseUuidFailedJobProvider;
+use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -152,14 +158,130 @@ final class DeadLetterHandler
         // StreamQueue::getStreamKey() for it.
         $streamKey = $this->prefix.($this->cluster ? '{'.$queue.'}' : $queue);
 
+        // Built before anything is written, so a job class that no longer
+        // exists throws here and the dead-letter entry stays where it is.
+        [$payload, $uuid] = $this->freshPayload($fields['payload'] ?? '');
+
         $this->redis->execute(
             'XADD',
             $streamKey,
             '*',
-            'payload', $fields['payload'] ?? '',
+            'payload', $payload,
         );
 
         $this->redis->execute('XDEL', $this->deadLetterStream, $deadLetterId);
+
+        if ($uuid !== null) {
+            $this->forgetExceptionCount($uuid);
+
+            // As stock queue:retry does: the job keeps its uuid, a unique column
+            // in failed_jobs, so a stale row would reject the next failure's
+            // insert and keep the old exception.
+            try {
+                $this->forgetFailedJob($uuid);
+            } catch (\Throwable) {
+                // A database outage must not undo a retry that already happened.
+            }
+        }
+    }
+
+    /**
+     * Remove the `failed_jobs` row of a job, by uuid.
+     *
+     * Only the uuid-keyed database provider can be matched without guessing:
+     * the plain database provider keys on an auto-increment id, and the
+     * dead-letter id (a stream id) is unrelated to either. Any other failer
+     * is left alone.
+     *
+     * @return bool Whether a row was removed.
+     */
+    public function forgetFailedJob(string $uuid): bool
+    {
+        if ($uuid === '') {
+            return false;
+        }
+
+        try {
+            /** @var mixed $failer Any failer may be bound; only the uuid provider is handled. */
+            $failer = Container::getInstance()->make('queue.failer');
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return $failer instanceof DatabaseUuidFailedJobProvider && $failer->forget($uuid);
+    }
+
+    /**
+     * The payload as a new job: attempts back to 0 and `retryUntil` refreshed,
+     * as stock `queue:retry` does, in the format the entry came in.
+     *
+     * An entry that cannot be decoded (a serializer mismatch, a corrupt body)
+     * is returned byte for byte, as before.
+     *
+     * @return array{0: string, 1: string|null} The payload and the job's uuid.
+     *
+     * @throws \RuntimeException When the job class can no longer be loaded.
+     */
+    private function freshPayload(string $raw): array
+    {
+        try {
+            $payload = StreamQueue::decodePayload($raw);
+        } catch (\Throwable) {
+            return [$raw, null];
+        }
+
+        $payload['attempts'] = 0;
+
+        if (isset($payload['data']['command']) && is_string($payload['data']['command'])) {
+            try {
+                $instance = $this->commandInstance($payload['data']['command']);
+            } catch (ModelNotFoundException) {
+                $instance = null;
+            }
+
+            if ($instance instanceof \__PHP_Incomplete_Class) {
+                throw new \RuntimeException('Cannot retry: the job class no longer exists.');
+            }
+
+            if (is_object($instance) && method_exists($instance, 'retryUntil')) {
+                $retryUntil = $instance->retryUntil();
+
+                $payload['retryUntil'] = $retryUntil instanceof \DateTimeInterface
+                    ? $retryUntil->getTimestamp()
+                    : $retryUntil;
+            }
+        }
+
+        $encoded = $raw[0] === '{' || $raw[0] === '['
+            ? json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)
+            : (igbinary_serialize($payload) ?? throw new \RuntimeException('igbinary_serialize() failed to encode the job payload.'));
+
+        return [$encoded, is_string($payload['uuid'] ?? null) ? $payload['uuid'] : null];
+    }
+
+    /**
+     * Unserialize the job command, decrypting it first when it is encrypted.
+     */
+    private function commandInstance(string $command): mixed
+    {
+        if (! str_starts_with($command, 'O:')) {
+            $command = Container::getInstance()->make(Encrypter::class)->decrypt($command);
+        }
+
+        return unserialize($command);
+    }
+
+    /**
+     * A retried job starts with a clean `maxExceptions` count; a used-up one
+     * would fail it on its first exception. Same key as the worker's counter.
+     */
+    private function forgetExceptionCount(string $uuid): void
+    {
+        try {
+            Container::getInstance()->make(CacheRepository::class)->forget('job-exceptions:'.$uuid);
+        } catch (\Throwable) {
+            // A cache outage must not undo a retry that already happened.
+        }
     }
 
     /**
@@ -170,6 +292,105 @@ final class DeadLetterHandler
     public function purge(string $deadLetterId): void
     {
         $this->redis->execute('XDEL', $this->deadLetterStream, $deadLetterId);
+    }
+
+    /**
+     * Remove one dead-lettered entry and report whether it existed.
+     *
+     * Touches only the dead-letter stream, never a live queue stream.
+     *
+     * @return array{id: string, uuid: string|null}|null The removed entry's id and job uuid, or null when the id is unknown.
+     */
+    public function forget(string $deadLetterId): ?array
+    {
+        $entries = $this->redis->execute('XRANGE', $this->deadLetterStream, $deadLetterId, $deadLetterId);
+
+        if (! is_array($entries) || $entries === []) {
+            return null;
+        }
+
+        $fields = $this->parseFields($entries[0][1]);
+
+        $this->redis->execute('XDEL', $this->deadLetterStream, $deadLetterId);
+
+        return ['id' => (string) $entries[0][0], 'uuid' => self::payloadUuid($fields['payload'] ?? '')];
+    }
+
+    /**
+     * The job uuid of a stored payload, or null when it cannot be decoded.
+     */
+    private static function payloadUuid(string $payload): ?string
+    {
+        try {
+            $uuid = StreamQueue::decodePayload($payload)['uuid'] ?? null;
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return is_string($uuid) && $uuid !== '' ? $uuid : null;
+    }
+
+    /**
+     * Remove every dead-lettered entry, or only those from one queue.
+     *
+     * Walks the stream in pages so a large stream is never held in memory:
+     * payloads are decoded for their uuid and dropped, only ids and uuids are
+     * kept. The queue is compared by bare name, so `{q}` and `q` match each
+     * other in cluster mode, as for {@see retry()}.
+     *
+     * @param  (\Closure(list<string>): void)|null  $beforeDelete  Called with each page's uuids before the page is deleted, so a crash mid-walk
+     *                                                             never leaves a `failed_jobs` row behind for an entry that is already gone.
+     * @return list<array{id: string, uuid: string|null}> The removed entries.
+     */
+    public function forgetAll(?string $queue = null, ?\Closure $beforeDelete = null): array
+    {
+        $wanted = $queue === null ? null : WorkerProcess::bareQueueName($queue, $this->cluster);
+        $removed = [];
+        $from = '-';
+
+        while (true) {
+            $page = $this->redis->execute('XRANGE', $this->deadLetterStream, $from, '+', 'COUNT', '500');
+
+            if (! is_array($page) || $page === []) {
+                break;
+            }
+
+            $ids = [];
+            $uuids = [];
+
+            foreach ($page as $entry) {
+                $fields = $this->parseFields($entry[1]);
+
+                if ($wanted !== null && WorkerProcess::bareQueueName($fields['original_queue'] ?? '', $this->cluster) !== $wanted) {
+                    continue;
+                }
+
+                $uuid = self::payloadUuid($fields['payload'] ?? '');
+
+                $ids[] = (string) $entry[0];
+                $removed[] = ['id' => (string) $entry[0], 'uuid' => $uuid];
+
+                if ($uuid !== null) {
+                    $uuids[] = $uuid;
+                }
+            }
+
+            if ($ids !== []) {
+                if ($beforeDelete !== null && $uuids !== []) {
+                    $beforeDelete($uuids);
+                }
+
+                $this->redis->execute('XDEL', $this->deadLetterStream, ...$ids);
+            }
+
+            if (count($page) < 500) {
+                break;
+            }
+
+            $from = '('.$page[array_key_last($page)][0];
+        }
+
+        return $removed;
     }
 
     /**

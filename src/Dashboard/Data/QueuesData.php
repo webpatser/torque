@@ -66,11 +66,18 @@ final class QueuesData
             // reload.
             $series = $this->metrics->series($window->tier, $window->count, $name);
 
+            $depths = $queue->depths($name);
+            $consumers = $queue->consumers($name);
+
             $queues[] = [
                 'name' => $name,
-                'pending' => $queue->pendingSize($name),
-                'delayed' => $queue->delayedSize($name),
-                'reserved' => $queue->reservedSize($name),
+                'pending' => $depths['waiting'],
+                'delayed' => $depths['delayed'],
+                'reserved' => $depths['reserved'],
+                'consumers' => count($consumers),
+                // Shortest idle time among the consumers, in milliseconds: how
+                // long ago the group last did anything. Null without consumers.
+                'idle' => $consumers === [] ? null : min(array_column($consumers, 'idle')),
                 'processed' => $totals['processed'],
                 'failed' => $totals['failed'],
                 // Jobs per minute across the whole range, so the column reads

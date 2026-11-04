@@ -60,7 +60,7 @@ function torque_steal_queue(string $prefix, string $queueName, bool $cluster): S
  * @param  Closure(StreamQueue, string $streamKey): void  $arrange  Runs before the worker starts.
  * @param  (Closure(StreamQueue, string $streamKey, Closure(string): void $waitForStart, Closure(string): void $waitForOutput): void)|null  $whileRunning
  * @param  (Closure(StreamQueue, string $prefix): void)|null  $afterExit  Runs after the worker exits, before the counts are read.
- * @return array{rows: list<array<string, mixed>>, output: string, pending: int, size: int, keys: list<string>}
+ * @return array{rows: list<array<string, mixed>>, output: string, reserved: int, size: int, keys: list<string>}
  */
 function torque_steal_run(array $settings, Closure $arrange, ?Closure $whileRunning = null, ?Closure $afterExit = null): array
 {
@@ -160,7 +160,7 @@ function torque_steal_run(array $settings, Closure $arrange, ?Closure $whileRunn
         return [
             'rows' => $readRows(),
             'output' => $output,
-            'pending' => $queue->pendingSize(),
+            'reserved' => $queue->reservedSize(),
             'size' => $queue->size(),
             'keys' => torque_steal_keys($prefix),
         ];
@@ -315,7 +315,7 @@ it('runs a job that outlives the steal threshold exactly once in a worker with f
     );
 
     expect(torque_steal_starts($run['rows']))->toBe(['long' => 1])
-        ->and($run['pending'])->toBe(0);
+        ->and($run['reserved'])->toBe(0);
 });
 
 it('still steals a dead consumer\'s message behind a job the worker is running', function () {
@@ -357,7 +357,7 @@ it('still steals a dead consumer\'s message behind a job the worker is running',
 
     expect(torque_steal_starts($run['rows']))->toEqualCanonicalizing(['long' => 1, 'dead' => 1])
         ->and($finished)->toBe(['dead', 'long'])
-        ->and($run['pending'])->toBe(0);
+        ->and($run['reserved'])->toBe(0);
 });
 
 it('survives a dead consumer\'s entry trimmed by clear(), leaving an empty PEL', function () {
@@ -393,7 +393,7 @@ it('survives a dead consumer\'s entry trimmed by clear(), leaving an empty PEL',
     expect(torque_steal_starts($run['rows']))->toBe(['after-clear' => 1])
         ->and($run['output'])->not->toContain('failed to read')
         ->and($run['output'])->not->toContain('TypeError')
-        ->and($run['pending'])->toBe(0);
+        ->and($run['reserved'])->toBe(0);
 });
 
 // Reading a consumer's own PEL lists a trimmed entry as [id, nil] on every Redis
@@ -419,7 +419,7 @@ it('survives its own in-flight entry being trimmed when a free slot re-reads the
 
     expect(torque_steal_starts($run['rows']))->toBe(['in-flight' => 1])
         ->and($run['output'])->not->toContain('failed to read')
-        ->and($run['pending'])->toBe(0);
+        ->and($run['reserved'])->toBe(0);
 });
 
 it('applies a stream\'s max_concurrency under a cluster hash tag', function (string $queueName, string $streamsKey) {
@@ -440,7 +440,7 @@ it('applies a stream\'s max_concurrency under a cluster hash tag', function (str
     expect(array_sum(torque_steal_starts($run['rows'])))->toBe(3)
         ->and(torque_steal_peak($run['rows']))->toBe(1)
         ->and(array_unique(array_column(array_filter($run['rows'], static fn (array $row): bool => $row['type'] === 'attempted'), 'queue')))->toBe(['capped'])
-        ->and($run['pending'])->toBe(0)
+        ->and($run['reserved'])->toBe(0)
         ->and($run['size'])->toBe(0)
         ->and($run['keys'])->toContain('{capped}')
         ->and($run['keys'])->not->toContain('capped');
@@ -471,7 +471,7 @@ it('keeps max_concurrency when many slots poll at the same moment', function (in
 
     expect(array_sum(torque_steal_starts($run['rows'])))->toBe(20)
         ->and(torque_steal_peak($run['rows']))->toBe($cap)
-        ->and($run['pending'])->toBe(0)
+        ->and($run['reserved'])->toBe(0)
         ->and($run['size'])->toBe(0);
 })->with([
     'cap of one' => [1],
@@ -556,7 +556,7 @@ it('serves a capped stream again after a read that never got an answer', functio
         );
 
         expect(torque_steal_starts($run['rows']))->toBe(['after-silence' => 1], $run['output'])
-            ->and($run['pending'])->toBe(0)
+            ->and($run['reserved'])->toBe(0)
             ->and($run['size'])->toBe(0);
     } finally {
         proc_terminate($proxy, SIGKILL);
@@ -582,7 +582,7 @@ it('serves a capped stream again after a failing read', function () {
             $waitForStart('before');
 
             // The job must finish and acknowledge before its group goes away.
-            while ($queue->pendingSize('capped') > 0) {
+            while ($queue->reservedSize('capped') > 0) {
                 usleep(10_000);
             }
 
@@ -599,7 +599,7 @@ it('serves a capped stream again after a failing read', function () {
 
     expect(torque_steal_starts($run['rows']))->toBe(['before' => 1, 'after' => 1])
         ->and($run['output'])->toContain('NOGROUP')
-        ->and($run['pending'])->toBe(0)
+        ->and($run['reserved'])->toBe(0)
         ->and($run['size'])->toBe(0);
 });
 
@@ -622,7 +622,7 @@ it('applies a stream\'s max_retries under a cluster hash tag', function () {
         ->and($attempted[0]['failed'])->toBeTrue()
         ->and($attempted[0]['released'])->toBeFalse()
         ->and($attempted[0]['queue'])->toBe('capped')
-        ->and($run['pending'])->toBe(0)
+        ->and($run['reserved'])->toBe(0)
         ->and($run['size'])->toBe(0);
 });
 
@@ -640,7 +640,7 @@ it('leaves one copy of a released job under a cluster hash tag', function () {
     );
 
     expect(torque_steal_starts($run['rows']))->toBe(['released' => 2])
-        ->and($run['pending'])->toBe(0)
+        ->and($run['reserved'])->toBe(0)
         ->and($run['size'])->toBe(0);
 });
 
@@ -664,13 +664,15 @@ it('retries a job a cluster worker dead-lettered into the stream it reads', func
             torque_steal_retry($handler, $deadLetter['id']);
 
             expect($handler->count())->toBe(0)
-                ->and(torque_steal_payloads($prefix.'{capped}'))->toBe([$deadLetter['payload']]);
+                // The retried job is a new one: the same payload with attempts back at 0.
+                ->and(array_map(static fn (string $p): array => json_decode($p, true), torque_steal_payloads($prefix.'{capped}')))
+                ->toBe([array_replace(json_decode($deadLetter['payload'], true), ['attempts' => 0])]);
         },
     );
 
     expect($deadLetter['original_queue'])->toBe('capped')
         ->and($run['size'])->toBe(1)
-        ->and($run['pending'])->toBe(0)
+        ->and($run['reserved'])->toBe(0)
         ->and($run['keys'])->not->toContain('capped');
 });
 
@@ -683,7 +685,7 @@ it('retries a dead-letter entry into the hash-tagged stream', function (string $
 
         torque_steal_retry($handler, $handler->list(1)[0]['id']);
 
-        expect(torque_steal_payloads($prefix.'{capped}'))->toBe(['{"uuid":"dl"}'])
+        expect(torque_steal_payloads($prefix.'{capped}'))->toBe(['{"uuid":"dl","attempts":0}'])
             ->and($handler->count())->toBe(0)
             ->and(torque_steal_keys($prefix))->not->toContain('capped');
     } finally {
@@ -721,7 +723,7 @@ it('retries a dead-letter entry into the plain stream without cluster mode', fun
 
         torque_steal_retry($handler, $handler->list(1)[0]['id']);
 
-        expect(torque_steal_payloads($prefix.'capped'))->toBe(['{"uuid":"dl"}'])
+        expect(torque_steal_payloads($prefix.'capped'))->toBe(['{"uuid":"dl","attempts":0}'])
             ->and($handler->count())->toBe(0)
             ->and(torque_steal_keys($prefix))->not->toContain('{capped}');
     } finally {

@@ -5,6 +5,39 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-04
+
+Limits declared on jobs now apply, `size()` changes meaning, and workers honour `artisan down`. Read the behaviour changes before deploying; `UPGRADE.md` has the new config keys and what 2.0 will flip.
+
+### Added
+- **`torque:forget {id?} {--all} {--queue=} {--force}`** deletes dead-letter entries by stream id (not uuids or `queue:failed` ids), the counterpart of `horizon:forget`. Only `database-uuids` `failed_jobs` rows go with them; `--all` leaves rows with no dead-letter entry. `DeadLetterHandler::forget()` and `forgetAll()` back it.
+- **Worker events:** `WorkerStarting`, `WorkerStopping` (after the drain, or at the force exit; `memoryUsage` in MB; a hung listener blocks exit), `WorkerIdle`, `WorkerQueuePaused` and `WorkerQueueResumed`, plus `JobPopping`, `JobPopped`, `JobReleased` and `JobReleasedAfterException`. `JobPopping` fires on every poll, about 25 per second at 50 slots.
+- **`memory_limit`** (`TORQUE_MEMORY_LIMIT`, megabytes, default off): a worker at that real memory usage drains and exits with status 12, and the master starts a replacement. The drain waits for running jobs with no grace force exit, as `queue:work --memory` does, so a hung job holds the worker until a signal, `queue:restart`, the lifetime or `max_jobs_per_worker` ends it; the stall watchdog only warns. Timeouts arrive in 1.3.0.
+- **`force`** (`TORQUE_FORCE`) to keep processing during `artisan down`.
+- **`job_limits` and `strict_attempts`**; see Behaviour changes.
+- **Per-attempt isolation** of `Log` context on every channel, `Auth` guards (including `async()` children) and `Cache::memo()`. The README documents what stays shared in a new Concurrency contract section, and workers log a boot WARN at more than one slot naming scoped bindings that stay shared.
+- **Dead-letter retry** resets attempts, refreshes `retryUntil`, clears the `maxExceptions` counter, refuses when the job class is gone, and deletes the `failed_jobs` row (`database-uuids` failer only).
+- `WorkerOptions` in worker events carries real values: `memory` is 0 when the limit is off, `maxTries` defaults to 3.
+- `creationTimeOfOldestPendingJob` means the oldest waiting job; `depths()` and `consumers()` are public; the dashboard has a Consumers column.
+- A README "Not planned" list and a Horizon-to-Torque mapping in `UPGRADE.md`.
+
+### Changed
+- **`size()` is waiting plus delayed plus reserved and `pendingSize()` is waiting only**, as in the stock Redis queue. `pendingSize()` used to equal `reservedSize()` and `size()` left out delayed jobs. Autoscalers and alerts built on them see new numbers; the dashboard gauges and Overview now show waiting jobs. The `torque:monitor` and `torque:status` columns follow the same meaning, and `size()` after `queue:clear` still counts a running job.
+
+### Behaviour changes
+- **Workers honour `artisan down`.** Slots stop polling and claiming; in-flight jobs finish, and jobs wait in the stream. Set `force` to keep the old behaviour.
+- **Per-job limits win over the stream's** when `job_limits` is `job` (the default): `retryUntil`, `$tries` (0 is unlimited), `maxExceptions` and `$backoff`. A job that declares nothing behaves as before. `job_limits: stream` is the kill switch. A non-default stream `backoff` now takes effect, exponential retries (`2**attempts`) are capped at 1 hour, also under `job_limits: stream`, and stop 2 seconds short of `retryUntil`. A declared `$backoff` or stream `backoff` stays as set.
+- **`strict_attempts` is off by default**, so a job that calls `release()` is never stopped, which keeps `RateLimited` and `WithoutOverlapping` working. Workers log a line at boot saying so.
+- **`JobExceptionOccurred` fires after `JobFailed` on the fail path**, as in stock.
+- **A throwing listener on the four job events does not change the job's outcome**, unlike stock. `Looping` honours a false return.
+- **A self-release followed by a throw does not count against `maxExceptions`**, where stock counts it.
+- **A delivery after a worker died never counts as an attempt**, in either `strict_attempts` mode, so only `maxExceptions` limits a job whose worker keeps dying, until 1.3.0.
+- **Laravel Cloud:** its queue listeners hold one process-wide job, so exception attribution is unreliable at more than one slot. `Looping` and `WorkerStopping` flush its job context.
+
+### Parity
+- Worker event parity against framework v13.40.0: of the events the stock `Worker` imports, `JobTimedOut` is the only one Torque does not dispatch. It needs timeouts first, which arrive in 1.3.0 (opt-in, `timeouts.enabled`). `WorkerStarting`, `WorkerStopping`, `WorkerIdle`, `WorkerQueuePaused`, `WorkerQueueResumed`, `JobPopping`, `JobPopped`, `JobReleased` and `JobReleasedAfterException` are now dispatched (see Added).
+- Reviewed Horizon v5.50.1 and the unreleased 5.x branch through 2026-11-04, comparing #1819 (v5.50.0, "Delayed Until" shown as "Pushed" for `DateInterval` delays) and #1817 (v5.49.0, Redis Cluster CI fix) at the level of their descriptions: #1819 is a dashboard front-end bug in how Horizon renders an interval; Torque's dashboard shows delayed counts rather than a per-job "Delayed Until", and `StreamQueue` turns an interval into a timestamp server-side with the framework's `availableAt()`, so there is no behaviour to port. #1817 is CI setup for Horizon's own cluster tests and never applies.
+
 ## [1.1.2] - 2026-11-04
 
 Upgrade if you rely on `Context` for tenancy or anything similar: on any install with more than one slot per worker (`coroutines_per_worker` defaults to 50), jobs could read each other's data. Read the behaviour changes below before deploying.
@@ -651,7 +684,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v1.1.2...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/webpatser/torque/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/webpatser/torque/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/webpatser/torque/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/webpatser/torque/compare/v1.0.0...v1.1.0

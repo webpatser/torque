@@ -285,37 +285,100 @@ it('reports pending messages that are read but not acknowledged', function () {
         $job = $this->streamQueue->pop();
         expect($job)->not->toBeNull();
 
-        $pending = $this->streamQueue->pendingSize();
-        expect($pending)->toBe(1);
+        // Read but unacknowledged is reserved, no longer waiting.
+        expect($this->streamQueue->reservedSize())->toBe(1)
+            ->and($this->streamQueue->pendingSize())->toBe(0);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
 });
 
 // -------------------------------------------------------------------------
-//  10. reservedSize equals pendingSize
+//  10. size, pendingSize, delayedSize, reservedSize with W waiting, D delayed, R reserved
 // -------------------------------------------------------------------------
 
-it('returns the same value for reservedSize and pendingSize', function () {
+/**
+ * @return array{0: int, 1: int, 2: int} Waiting, delayed and reserved counts seeded.
+ */
+function seedDepths(StreamQueue $queue, int $waiting, int $delayed, int $reserved): array
+{
+    $redis = $queue->getRedisClient();
+
+    for ($i = 0; $i < $waiting + $reserved; $i++) {
+        $queue->pushRaw(json_encode(['uuid' => 'depth-'.$i, 'attempts' => 0]));
+    }
+
+    for ($i = 0; $i < $reserved; $i++) {
+        $queue->pop();
+    }
+
+    for ($i = 0; $i < $delayed; $i++) {
+        $redis->execute('ZADD', $queue->getStreamKey().':delayed', (string) (time() + 3600), '{"uuid":"later-'.$i.'"}');
+    }
+
+    return [$waiting, $delayed, $reserved];
+}
+
+it('reports waiting, delayed and reserved jobs separately', function (bool $cluster) {
     try {
-        (void) $this->streamQueue->pushRaw(json_encode([
-            'uuid' => 'reserved-test-1',
-            'attempts' => 0,
-        ]));
-        (void) $this->streamQueue->pushRaw(json_encode([
-            'uuid' => 'reserved-test-2',
-            'attempts' => 0,
-        ]));
+        $queue = $cluster
+            ? new StreamQueue(
+                redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
+                default: 'default',
+                blockFor: 100,
+                prefix: $this->testPrefix,
+                consumerGroup: 'test-group',
+                cluster: true,
+            )
+            : $this->streamQueue;
+        $queue->setContainer(app());
+        $queue->setConnectionName('torque');
 
-        // Pop both but don't acknowledge.
-        $this->streamQueue->pop();
-        $this->streamQueue->pop();
+        seedDepths($queue, waiting: 3, delayed: 2, reserved: 4);
 
-        $pending = $this->streamQueue->pendingSize();
-        $reserved = $this->streamQueue->reservedSize();
+        expect($queue->pendingSize())->toBe(3)
+            ->and($queue->delayedSize())->toBe(2)
+            ->and($queue->reservedSize())->toBe(4)
+            ->and($queue->size())->toBe(9)
+            ->and($queue->depths())->toBe(['waiting' => 3, 'delayed' => 2, 'reserved' => 4, 'oldest' => null]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+})->with(['plain naming' => [false], 'cluster-tagged naming' => [true]]);
 
-        expect($reserved)->toBe($pending);
-        expect($reserved)->toBe(2);
+it('counts a queue without stream or group as empty', function () {
+    expect($this->streamQueue->size('never-used'))->toBe(0)
+        ->and($this->streamQueue->pendingSize('never-used'))->toBe(0)
+        ->and($this->streamQueue->reservedSize('never-used'))->toBe(0)
+        ->and($this->streamQueue->consumers('never-used'))->toBe([]);
+});
+
+it('does not go negative when clear() trims entries that are still in flight', function () {
+    try {
+        seedDepths($this->streamQueue, waiting: 2, delayed: 1, reserved: 2);
+
+        $this->streamQueue->clear();
+
+        // The two in-flight entries left the stream but their PEL records stay.
+        expect($this->streamQueue->pendingSize())->toBe(0)
+            ->and($this->streamQueue->delayedSize())->toBe(0)
+            ->and($this->streamQueue->reservedSize())->toBe(2)
+            ->and($this->streamQueue->size())->toBe(2);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+it('lists the consumers of the group with pending and idle time', function () {
+    try {
+        seedDepths($this->streamQueue, waiting: 0, delayed: 0, reserved: 2);
+
+        $consumers = $this->streamQueue->consumers();
+
+        expect($consumers)->toHaveCount(1)
+            ->and($consumers[0]['name'])->toBe($this->streamQueue->getConsumerId())
+            ->and($consumers[0]['pending'])->toBe(2)
+            ->and($consumers[0]['idle'])->toBeInt();
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
@@ -334,15 +397,25 @@ it('returns the creation timestamp of the oldest pending job', function () {
             'attempts' => 0,
         ]));
 
-        // Pop but don't acknowledge — now it's pending.
+        // Only the entry after the in-flight one waits.
+        (void) $this->streamQueue->pushRaw(json_encode(['uuid' => 'oldest-pending-2', 'attempts' => 0]));
+
         $job = $this->streamQueue->pop();
         expect($job)->not->toBeNull();
 
         $timestamp = $this->streamQueue->creationTimeOfOldestPendingJob();
+        $inFlightMs = (int) explode('-', $job->getMessageId())[0];
 
         expect($timestamp)->not->toBeNull();
         expect($timestamp)->toBeGreaterThanOrEqual($before - 1);
         expect($timestamp)->toBeLessThanOrEqual(microtime(true) + 1);
+
+        // Pop the second one too: nothing waits, so no time. An in-flight
+        // entry must never be reported.
+        $this->streamQueue->pop();
+
+        expect($this->streamQueue->creationTimeOfOldestPendingJob())->toBeNull()
+            ->and($inFlightMs)->toBeGreaterThan(0);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
@@ -619,15 +692,15 @@ it('allows different consumer groups to independently read the same stream', fun
         expect($jobFromSecond->getMessageId())->toBe($messageId);
 
         // Each group has its own pending entry.
-        expect($this->streamQueue->pendingSize())->toBe(1);
-        expect($secondQueue->pendingSize())->toBe(1);
+        expect($this->streamQueue->reservedSize())->toBe(1);
+        expect($secondQueue->reservedSize())->toBe(1);
 
         // Delete from first group doesn't affect second group's pending.
         $jobFromFirst->delete();
 
         // The stream message is now deleted, but second group still has a pending entry.
         // After XDEL the pending entry remains in the PEL until acknowledged.
-        expect($secondQueue->pendingSize())->toBe(1);
+        expect($secondQueue->reservedSize())->toBe(1);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }

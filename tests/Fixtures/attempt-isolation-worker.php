@@ -11,13 +11,17 @@ declare(strict_types=1);
  * concurrency, whether the reset suspends (1 or 0).
  */
 
+use Illuminate\Auth\GenericUser;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Queue\Events\JobInterrupted;
 use Illuminate\Queue\Events\WorkerInterrupted;
 use Illuminate\Queue\Worker;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Context;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Livewire\LivewireServiceProvider;
+use Monolog\Formatter\JsonFormatter;
 use Orchestra\Testbench\Foundation\Application;
 use Webpatser\Torque\Tests\Fixtures\ScopedProbe;
 use Webpatser\Torque\TorqueServiceProvider;
@@ -47,7 +51,16 @@ config([
     'torque.redis.cluster' => false,
     'torque.consumer_group' => $group,
     'torque.serializer' => 'json',
+    'logging.default' => 'records',
+    'logging.channels.records' => ['driver' => 'single', 'name' => 'records', 'path' => "{$logFile}.records", 'formatter' => JsonFormatter::class],
+    'logging.channels.other' => ['driver' => 'single', 'name' => 'other', 'path' => "{$logFile}.records", 'formatter' => JsonFormatter::class],
 ]);
+
+// Boot-time values, through the framework's own managers: the worker has not
+// installed anything yet.
+Log::withContext(['boot_context' => 'yes']);
+Log::shareContext(['boot_shared' => 'yes']);
+Auth::setUser(new GenericUser(['id' => 'boot']));
 
 // Written where a signal callback's ambient scope sees it, so a checkpoint job
 // that carries ambient Context shows it.

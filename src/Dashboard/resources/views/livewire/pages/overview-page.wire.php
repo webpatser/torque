@@ -51,17 +51,14 @@ new class extends Component
 
         foreach ($streams as $name => $config) {
             try {
-                $streamKey = $config['stream'] ?? ('torque:stream:'.$name);
-                $size = (int) $queue->getRedisClient()->execute('XLEN', $streamKey);
-                $pending = $queue->pendingSize($name);
-                $delayed = $queue->delayedSize($name);
+                $depths = $queue->depths($name);
 
                 $rows[] = [
                     'name' => $name,
-                    'size' => $size,
-                    'pending' => $pending,
-                    'delayed' => $delayed,
-                    'processing' => max(0, $size - $pending - $delayed),
+                    'size' => $depths['waiting'] + $depths['delayed'] + $depths['reserved'],
+                    'pending' => $depths['waiting'],
+                    'delayed' => $depths['delayed'],
+                    'processing' => $depths['reserved'],
                 ];
             } catch (Throwable) {
                 $rows[] = [

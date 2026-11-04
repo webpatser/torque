@@ -103,7 +103,7 @@ new class extends Component
                         <flux:table.cell class="tabular-nums">{{ $stream['priority'] ?? 0 }}</flux:table.cell>
                         <flux:table.cell class="tabular-nums">{{ $stream['retry_after'] ?? 60 }}s</flux:table.cell>
                         <flux:table.cell class="tabular-nums">{{ $stream['max_retries'] ?? 3 }}</flux:table.cell>
-                        <flux:table.cell>{{ $stream['backoff'] ?? 'exponential' }}</flux:table.cell>
+                        <flux:table.cell>{{ is_array($stream['backoff'] ?? null) ? implode(',', $stream['backoff']) : ($stream['backoff'] ?? 'exponential') }}</flux:table.cell>
                     </flux:table.row>
                 @endforeach
             </flux:table.rows>

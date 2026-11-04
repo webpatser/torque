@@ -111,6 +111,28 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Memory limit (MB)
+    |--------------------------------------------------------------------------
+    | A worker whose real memory usage (memory_get_usage(true)) reaches this
+    | many megabytes drains like at max_jobs_per_worker and exits with status
+    | 12, as queue:work does; the master starts a replacement. Checked once a
+    | second. 0 or null turns it off.
+    */
+    'memory_limit' => (int) env('TORQUE_MEMORY_LIMIT', 0),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Force (run while in maintenance mode)
+    |--------------------------------------------------------------------------
+    | While `artisan down` is active, slots neither poll nor claim; in-flight
+    | jobs finish and polling resumes after `artisan up`. The state is read
+    | once a second per worker, not per slot. Set to true to keep processing
+    | while down, like `queue:work --force`.
+    */
+    'force' => (bool) env('TORQUE_FORCE', false),
+
+    /*
+    |--------------------------------------------------------------------------
     | Redis connection
     |--------------------------------------------------------------------------
     */
@@ -141,6 +163,12 @@ return [
     | single worker processes simultaneously (fleet-wide cap = workers x
     | max_concurrency). Use it to keep bulk queues from hammering external
     | APIs; the cap is approximate under bursts (bounded by fiber count).
+    |
+    | `max_retries` and `backoff` apply to jobs that declare no limit of their
+    | own (see `job_limits` below). `max_retries` counts runs: 3 is three runs,
+    | 0 or 1 is one run and no retry. `backoff` is `exponential` (2, 4, 8, ...),
+    | seconds, or seconds per attempt as a list or "1,5,10", the last step
+    | repeating. Anything else logs a WARN at boot and is `exponential`.
     */
     'streams' => [
         'default' => [
@@ -150,6 +178,33 @@ return [
             'backoff' => 'exponential',
         ],
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Job limits
+    |--------------------------------------------------------------------------
+    | 'job'    : what a job declares wins over its stream, as with queue:work:
+    |            `retryUntil`, then `$tries` (0 is no limit), `maxExceptions` and
+    |            `$backoff`.
+    | 'stream' : kill switch. Only `max_retries` and 2**attempts count, for every
+    |            job. Also ignores a stream's `backoff` and `strict_attempts`.
+    */
+    'job_limits' => env('TORQUE_JOB_LIMITS', 'job'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Strict attempts
+    |--------------------------------------------------------------------------
+    | Off, limits are only checked after a thrown exception. A job that calls
+    | release() is never stopped, which is what keeps the RateLimited and
+    | WithoutOverlapping middleware working: their releases use up attempts.
+    | Each worker logs one line at boot to say so.
+    |
+    | On, a job is checked before it runs, as with queue:work, and fails once it
+    | is past its attempts or `retryUntil`. Give rate-limited jobs a `retryUntil`
+    | or a high `$tries` first, or they will start failing.
+    */
+    'strict_attempts' => (bool) env('TORQUE_STRICT_ATTEMPTS', false),
 
     /*
     |--------------------------------------------------------------------------
@@ -201,7 +256,7 @@ return [
     |--------------------------------------------------------------------------
     | Dead letter
     |--------------------------------------------------------------------------
-    | Jobs that exceed max_retries go to the dead letter stream.
+    | Jobs that use up their limits go to the dead letter stream.
     |
     | 'ttl'         : entries older than this are trimmed (XTRIM MINID).
     | 'max_entries' : hard cap enforced at write time (XADD MAXLEN ~), so a

@@ -56,7 +56,8 @@ function torque_release_reserved_job(StreamQueue $queue): StreamJob
     $job = $queue->pop(TORQUE_RELEASE_QUEUE);
 
     expect($job)->toBeInstanceOf(StreamJob::class)
-        ->and($queue->pendingSize(TORQUE_RELEASE_QUEUE))->toBe(1);
+        ->and($queue->reservedSize(TORQUE_RELEASE_QUEUE))->toBe(1)
+        ->and($queue->pendingSize(TORQUE_RELEASE_QUEUE))->toBe(0);
 
     return $job;
 }
@@ -122,7 +123,8 @@ it('moves a released job to the stream as exactly one new copy', function (bool 
         $copy = StreamQueue::decodePayload((string) $rows[0][1][1], 'json');
 
         expect($job->isReleased())->toBeTrue()
-            ->and($queue->pendingSize(TORQUE_RELEASE_QUEUE))->toBe(0)
+            ->and($queue->reservedSize(TORQUE_RELEASE_QUEUE))->toBe(0)
+            ->and($queue->pendingSize(TORQUE_RELEASE_QUEUE))->toBe(1)
             ->and($rows)->toHaveCount(1)
             ->and((string) $rows[0][0])->not->toBe($job->getMessageId())
             ->and($copy['attempts'])->toBe(1)
@@ -150,7 +152,8 @@ it('moves a delayed release to the delayed set as exactly one new copy', functio
         $copy = StreamQueue::decodePayload((string) $members[0], 'json');
         $score = (int) $redis->execute('ZSCORE', $key.':delayed', (string) $members[0]);
 
-        expect($queue->pendingSize(TORQUE_RELEASE_QUEUE))->toBe(0)
+        expect($queue->reservedSize(TORQUE_RELEASE_QUEUE))->toBe(0)
+            ->and($queue->pendingSize(TORQUE_RELEASE_QUEUE))->toBe(0)
             ->and((int) $redis->execute('XLEN', $key))->toBe(0)
             ->and($members)->toHaveCount(1)
             ->and($copy['attempts'])->toBe(1)

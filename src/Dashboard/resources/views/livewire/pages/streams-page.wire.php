@@ -29,12 +29,14 @@ new class extends Component
             $streamKey = $config['stream'] ?? ('torque:stream:'.$name);
 
             try {
-                $size = (int) $queue->getRedisClient()->execute('XLEN', $streamKey);
-                $pending = $queue->pendingSize($name);
-                $delayed = $queue->delayedSize($name);
+                $depths = $queue->depths($name, true);
+                $pending = $depths['waiting'];
+                $delayed = $depths['delayed'];
+                $size = $pending + $delayed + $depths['reserved'];
 
-                $oldestPending = $queue->creationTimeOfOldestPendingJob($name);
-                $oldestAge = $oldestPending !== null ? time() - (int) $oldestPending : null;
+                $oldestAge = $depths['oldest'] !== null
+                    ? max(0, time() - (int) (((int) explode('-', $depths['oldest'])[0]) / 1000))
+                    : null;
             } catch (Throwable $e) {
                 report($e);
                 $errors[$name] = 'Stream unavailable.';

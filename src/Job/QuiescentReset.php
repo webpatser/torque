@@ -141,8 +141,8 @@ final class QuiescentReset
 
     /**
      * Scoped bindings of the application and its packages: what a slot shares
-     * with the other slots until a reset, since only the framework's Context and
-     * deferred callbacks are routed per attempt.
+     * with the other slots until a reset, since only the framework's Context,
+     * deferred callbacks and Cache::memo are routed per attempt.
      *
      * Bindings of a deferred provider that has not loaded and classes marked
      * `#[Scoped]` that nothing has resolved yet cannot be known at boot.

@@ -13,6 +13,7 @@ use Webpatser\Torque\Process\DrainPause;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\ProcessInspector;
+use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -163,23 +164,26 @@ final class TorqueStatusCommand extends Command
             // Placeholders below.
         }
 
-        $pending = null;
+        $waiting = $delayed = $reserved = null;
         $failed = null;
 
         try {
-            $consumerGroup = (string) ($config['consumer_group'] ?? 'torque');
-            $cluster = (bool) ($config['cluster'] ?? ($config['redis']['cluster'] ?? false));
+            // The dashboard's split, from StreamQueue::depths(): waiting, delayed, reserved.
+            $streamQueue = StreamQueueResolver::make();
             $streams = array_keys((array) ($config['streams'] ?? []));
-            $pendingCount = 0;
+            $waitingCount = $delayedCount = $reservedCount = 0;
 
             foreach ($streams === [] ? ['default'] : $streams as $name) {
-                $streamKey = $prefix.($cluster && ! str_contains((string) $name, '{') ? '{'.$name.'}' : $name);
+                $depths = $streamQueue->depths((string) $name);
 
-                $pendingCount += max(0, (int) $redis->execute('XLEN', $streamKey));
-                $pendingCount += max(0, (int) $redis->execute('ZCARD', $streamKey.':delayed'));
+                $waitingCount += $depths['waiting'];
+                $delayedCount += $depths['delayed'];
+                $reservedCount += $depths['reserved'];
             }
 
-            $pending = (string) $pendingCount;
+            $waiting = (string) $waitingCount;
+            $delayed = (string) $delayedCount;
+            $reserved = (string) $reservedCount;
             $failed = (string) max(0, (int) $redis->execute('XLEN', $prefix.'dead-letter'));
         } catch (\Throwable) {
             // Placeholders below.
@@ -188,7 +192,9 @@ final class TorqueStatusCommand extends Command
         $this->components->twoColumnDetail('Throughput (jobs/sec)', $this->formatMetric($throughput, '/s'));
         $this->components->twoColumnDetail('Concurrent Jobs', $this->formatMetric($concurrent));
         $this->components->twoColumnDetail('Avg Latency', $this->formatMetric($avgLatency, ' ms'));
-        $this->components->twoColumnDetail('Pending', $this->formatMetric($pending));
+        $this->components->twoColumnDetail('Waiting', $this->formatMetric($waiting));
+        $this->components->twoColumnDetail('Delayed', $this->formatMetric($delayed));
+        $this->components->twoColumnDetail('Reserved', $this->formatMetric($reserved));
         $this->components->twoColumnDetail('Failed (dead letter)', $this->formatMetric($failed));
 
         $this->newLine();

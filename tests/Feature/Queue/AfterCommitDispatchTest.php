@@ -110,7 +110,7 @@ it('enqueues an afterCommit job at once outside a transaction', function () {
     // its result, so the framework contract returns null here as well.
     expect($queue->push(new TorqueAfterCommitJob, '', $this->queueName))->toBeNull()
         ->and($queue->later(60, new TorqueAfterCommitJob, '', $this->queueName))->toBeNull()
-        ->and($queue->size($this->queueName))->toBe(1)
+        ->and($queue->pendingSize($this->queueName))->toBe(1)
         ->and($queue->delayedSize($this->queueName))->toBe(1);
 });
 
@@ -119,6 +119,6 @@ it('still returns ids for a regular job', function () {
 
     expect($queue->push(new TorqueRegularJob, '', $this->queueName))->toBeString()->not->toBeEmpty()
         ->and($queue->later(60, new TorqueRegularJob, '', $this->queueName))->toBeString()->not->toBeEmpty()
-        ->and($queue->size($this->queueName))->toBe(1)
+        ->and($queue->pendingSize($this->queueName))->toBe(1)
         ->and($queue->delayedSize($this->queueName))->toBe(1);
 });

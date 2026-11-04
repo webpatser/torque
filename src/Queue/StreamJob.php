@@ -20,6 +20,8 @@ class StreamJob extends Job implements JobContract
      */
     private readonly array $decoded;
 
+    private bool $releaseSucceeded = false;
+
     public function __construct(
         Container $container,
         public private(set) StreamQueue $streamQueue,
@@ -100,9 +102,9 @@ class StreamJob extends Job implements JobContract
     /**
      * Release the job back onto the queue after an optional delay.
      *
-     * The base class fires the "released" event. The StreamQueue handles
-     * ACKing the original message and re-enqueuing with an incremented
-     * attempt counter.
+     * The base class only sets the released flag, also when the write below
+     * then throws. The StreamQueue handles ACKing the original message and
+     * re-enqueuing with an incremented attempt counter.
      *
      * @param  int  $delay  Seconds to delay before the job becomes available again.
      */
@@ -112,6 +114,17 @@ class StreamJob extends Job implements JobContract
         parent::release($delay);
 
         $this->streamQueue->release($this->queue, $this, (int) $delay);
+
+        $this->releaseSucceeded = true;
+    }
+
+    /**
+     * Whether a release actually reached the queue. isReleased() also says yes
+     * after one that threw, when the entry is still in the PEL for reclaim.
+     */
+    public function releaseSucceeded(): bool
+    {
+        return $this->releaseSucceeded;
     }
 
     /**
@@ -145,6 +158,43 @@ class StreamJob extends Job implements JobContract
         $max = $this->decoded['maxExceptions'] ?? null;
 
         return $max === null ? null : (int) $max;
+    }
+
+    /**
+     * Get the number of attempts the job declares, from the cached payload.
+     */
+    #[\Override]
+    public function maxTries(): ?int
+    {
+        $max = $this->decoded['maxTries'] ?? null;
+
+        return $max === null ? null : (int) $max;
+    }
+
+    /**
+     * Get the backoff the job declares, from the cached payload.
+     *
+     * Unlike Laravel's base implementation this does not fall back to the
+     * payload's `delay`: a job dispatched with a delay has declared no backoff,
+     * and its retries must not wait that delay again.
+     *
+     * @return int|int[]|string|null
+     */
+    #[\Override]
+    public function backoff(): mixed
+    {
+        return $this->decoded['backoff'] ?? null;
+    }
+
+    /**
+     * Get the timestamp the job declares retries end at, from the cached payload.
+     */
+    #[\Override]
+    public function retryUntil(): ?int
+    {
+        $until = $this->decoded['retryUntil'] ?? null;
+
+        return $until === null ? null : (int) $until;
     }
 
     /**

@@ -65,7 +65,9 @@ it('implements ClearableQueue and returns stream plus delayed jobs removed', fun
             (void) $queue->later(3600, new AttemptProbeJob('ok'), '', 'clearing');
         }
 
-        expect($queue->size('clearing'))->toBe(3)
+        // size() is waiting (3) + delayed (2) + reserved (0).
+        expect($queue->size('clearing'))->toBe(5)
+            ->and($queue->pendingSize('clearing'))->toBe(3)
             ->and($queue->delayedSize('clearing'))->toBe(2);
 
         expect($queue->clear('clearing'))->toBe(5)
@@ -95,14 +97,14 @@ it('leaves a trimmed PEL entry reclaimable without crashing or looping', functio
         expect($queue->clear('clearing'))->toBe(1);
 
         // The PEL record stays: clear() does not claim to have removed it.
-        expect($queue->pendingSize('clearing'))->toBe(1);
+        expect($queue->reservedSize('clearing'))->toBe(1);
 
         // Same call the worker's steal path makes. Must return cleanly and, on
         // Redis 7+, drop the dead id from the PEL instead of returning it forever.
         $claim = $redis->execute('XAUTOCLAIM', $key, 'clear-group', 'c2', '0', '0-0', 'COUNT', '1');
         expect($claim[1] ?? [])->toBe([])
             ->and(array_map('strval', $claim[2] ?? []))->toBe([$id])
-            ->and($queue->pendingSize('clearing'))->toBe(0);
+            ->and($queue->reservedSize('clearing'))->toBe(0);
 
         // Acking an id that is no longer pending is harmless.
         expect((int) $redis->execute('XACK', $key, 'clear-group', $id))->toBe(0);
@@ -135,14 +137,17 @@ it('lets a real worker finish its in-flight job and consume one dispatched after
 
         // Wait until the worker holds the slow job in its PEL.
         $deadline = microtime(true) + 20;
-        while ($queue->pendingSize('clearing') < 1 && microtime(true) < $deadline) {
+        while ($queue->reservedSize('clearing') < 1 && microtime(true) < $deadline) {
             usleep(50_000);
         }
-        expect($queue->pendingSize('clearing'))->toBe(1);
+        expect($queue->reservedSize('clearing'))->toBe(1);
 
         // Waiting ok job (1) + the in-flight entry trimmed from the stream (1) + delayed (1).
+        // size() is 1 afterwards, not 0: the slow job really is still running and
+        // its PEL record counts as reserved until the worker acks it.
         expect($queue->clear('clearing'))->toBe(3)
-            ->and($queue->size('clearing'))->toBe(0)
+            ->and($queue->size('clearing'))->toBe(1)
+            ->and($queue->reservedSize('clearing'))->toBe(1)
             ->and($queue->delayedSize('clearing'))->toBe(0);
 
         (void) $queue->push(new AttemptProbeJob('ok'), '', 'clearing');
@@ -168,7 +173,7 @@ it('lets a real worker finish its in-flight job and consume one dispatched after
 
         expect(array_column($attempted, 'job'))->toBe(['probe:slow', 'probe:ok'])
             ->and(array_column($attempted, 'successful'))->toBe([true, true])
-            ->and($queue->pendingSize('clearing'))->toBe(0);
+            ->and($queue->reservedSize('clearing'))->toBe(0);
     } finally {
         @unlink($logFile);
         @unlink($outputFile);

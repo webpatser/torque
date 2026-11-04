@@ -2,17 +2,33 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Future;
+use Illuminate\Auth\AuthManager;
+use Illuminate\Auth\GenericUser;
+use Illuminate\Auth\GuardHelpers;
 use Illuminate\Bus\Dispatcher as BusDispatcher;
+use Illuminate\Cache\MemoizedStore;
 use Illuminate\Container\Container;
+use Illuminate\Contracts\Auth\Authenticatable;
+use Illuminate\Contracts\Auth\Guard;
+use Illuminate\Contracts\Auth\UserProvider;
 use Illuminate\Contracts\Events\Dispatcher as EventDispatcher;
 use Illuminate\Contracts\Queue\Interruptible;
 use Illuminate\Log\Context\Repository;
+use Illuminate\Log\LogManager;
 use Illuminate\Queue\CallQueuedHandler;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Queue\Jobs\Job as IlluminateJob;
 use Illuminate\Queue\Jobs\SyncJob;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Log;
+use Webpatser\Torque\Job\AttemptAuthManager;
 use Webpatser\Torque\Job\AttemptContextRepository;
+use Webpatser\Torque\Job\AttemptLogManager;
+use Webpatser\Torque\Job\AttemptMemoizedCache;
 use Webpatser\Torque\Job\AttemptScope;
 use Webpatser\Torque\Job\QuiescentReset;
 use Webpatser\Torque\Queue\StreamJob;
@@ -21,9 +37,11 @@ use Webpatser\Torque\Tests\Fixtures\InterruptProbeJob;
 use Webpatser\Torque\Tests\Fixtures\IsolationProbeJob;
 use Webpatser\Torque\Tests\Fixtures\ResetProbeJob;
 use Webpatser\Torque\Tests\Fixtures\ScopedProbe;
+use Webpatser\Torque\Tests\Fixtures\ServicesProbeJob;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\async;
+use function Fledge\Async\delay;
 
 /*
 |--------------------------------------------------------------------------
@@ -45,7 +63,7 @@ use function Fledge\Async\async;
  * @param  list<object>  $jobs
  * @param  int|null  $maxJobs  How many jobs the worker runs before it exits, when jobs dispatch more of them.
  * @param  bool  $slowReset  Whether the worker's reset closure suspends.
- * @return array{rows: list<array<string, mixed>>, children: array<string, array<string, mixed>>, output: string}
+ * @return array{rows: list<array<string, mixed>>, children: array<string, array<string, mixed>>, output: string, records: list<array<string, mixed>>}
  */
 function torque_run_isolation_worker(array $jobs, int $concurrency, ?int $maxJobs = null, bool $slowReset = false): array
 {
@@ -116,9 +134,14 @@ function torque_run_isolation_worker(array $jobs, int $concurrency, ?int $maxJob
             'rows' => array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR), $lines),
             'children' => $children,
             'output' => (string) file_get_contents($outputFile),
+            'records' => array_map(
+                static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR),
+                is_file("{$logFile}.records") ? file("{$logFile}.records", FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : [],
+            ),
         ];
     } finally {
         @unlink($logFile);
+        @unlink("{$logFile}.records");
         @unlink($outputFile);
 
         $cursor = '0';
@@ -271,6 +294,367 @@ it('starts a job with empty Context after another job added to it on the same sl
 
     expect($start['data'])->toBe([])
         ->and($start['hidden'])->toBe([]);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Logging, auth and Cache::memo
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Two ServicesProbeJob jobs in two slots of one worker, each past the other's writes.
+ *
+ * @return array{rows: list<array<string, mixed>>, records: list<array<string, mixed>>}
+ */
+function torque_interleaved_services_run(): array
+{
+    static $run = null;
+
+    return $run ??= torque_run_isolation_worker([
+        new ServicesProbeJob('tenant-a', waitFor: ['tenant-b']),
+        new ServicesProbeJob('tenant-b', waitFor: ['tenant-a']),
+    ], concurrency: 2);
+}
+
+/**
+ * The context of the real log record a job wrote.
+ *
+ * @param  list<array<string, mixed>>  $records
+ * @return array<string, mixed>
+ */
+function torque_record_context(array $records, string $message, string $job): array
+{
+    foreach ($records as $record) {
+        if ($record['message'] === $message && $record['context']['job'] === $job) {
+            return $record['context'];
+        }
+    }
+
+    throw new RuntimeException("No {$message} record for {$job}.");
+}
+
+it('really interleaves two jobs writing to the services', function () {
+    ['rows' => $rows] = torque_interleaved_services_run();
+
+    $position = static fn (string $type, string $job): int => torque_isolation_position($rows, $type, $job);
+
+    expect(array_filter($rows, static fn (array $row): bool => $row['type'] === 'rendezvous-timeout'))->toBe([])
+        ->and($position('written', 'tenant-a'))->toBeLessThan($position('end', 'tenant-b'))
+        ->and($position('written', 'tenant-b'))->toBeLessThan($position('end', 'tenant-a'));
+});
+
+it('keeps Log::withContext and Log::shareContext of one job off the records of another', function () {
+    ['records' => $records] = torque_interleaved_services_run();
+
+    foreach (['tenant-a', 'tenant-b'] as $tenant) {
+        expect(torque_record_context($records, 'probe-line', $tenant))
+            ->toMatchArray(['from' => $tenant, 'shared_from' => $tenant]);
+
+        expect(torque_record_context($records, 'probe-other-line', $tenant))
+            ->toMatchArray(['other_from' => $tenant, 'shared_from' => $tenant]);
+    }
+});
+
+it('keeps Auth::setUser of one job from Auth::user of another, and shares it with the job\'s async() child', function () {
+    ['rows' => $rows] = torque_interleaved_services_run();
+
+    foreach (['tenant-a', 'tenant-b'] as $tenant) {
+        $end = $rows[torque_isolation_position($rows, 'end', $tenant)];
+
+        expect($end)->toMatchArray([
+            'user' => $tenant,
+            'guard_user' => $tenant,
+            'resolver_user' => $tenant,
+            'async_user' => $tenant,
+        ]);
+    }
+});
+
+it('does not return another attempt\'s value from Cache::memo', function () {
+    ['rows' => $rows] = torque_interleaved_services_run();
+
+    $memo = static fn (string $tenant): mixed => $rows[torque_isolation_position($rows, 'end', $tenant)]['memo'];
+
+    expect(['tenant-a' => $memo('tenant-a'), 'tenant-b' => $memo('tenant-b')])
+        ->toBe(['tenant-a' => 'tenant-a', 'tenant-b' => 'tenant-b']);
+});
+
+it('shows boot-time log context and the boot-time user in every concurrent attempt', function () {
+    ['rows' => $rows, 'records' => $records] = torque_interleaved_services_run();
+
+    foreach (['tenant-a', 'tenant-b'] as $tenant) {
+        expect($rows[torque_isolation_position($rows, 'start', $tenant)]['user'])->toBe('boot');
+
+        expect(torque_record_context($records, 'probe-line', $tenant))
+            ->toMatchArray(['boot_context' => 'yes', 'boot_shared' => 'yes']);
+
+        expect(torque_record_context($records, 'probe-other-line', $tenant))
+            ->toMatchArray(['boot_shared' => 'yes']);
+    }
+});
+
+it('isolates the services at one slot across the reset, which drops boot-time log context as stock does', function () {
+    ['rows' => $rows, 'records' => $records] = torque_run_isolation_worker([
+        new ServicesProbeJob('first'),
+        new ServicesProbeJob('second'),
+    ], concurrency: 1);
+
+    $row = static fn (string $type, string $job): array => $rows[torque_isolation_position($rows, $type, $job)];
+
+    expect($row('start', 'first')['user'])->toBe('boot')
+        ->and($row('start', 'second')['user'])->toBe('boot')
+        ->and($row('end', 'second')['user'])->toBe('second')
+        ->and($row('end', 'second')['memo'])->toBe('second')
+        ->and($row('end', 'second')['log_manager'])->toBe(AttemptLogManager::class)
+        ->and($row('end', 'second')['auth_manager'])->toBe(AttemptAuthManager::class);
+
+    expect(torque_record_context($records, 'probe-line', 'first'))->toMatchArray(['boot_context' => 'yes', 'boot_shared' => 'yes']);
+
+    expect(torque_record_context($records, 'probe-line', 'second'))
+        ->toMatchArray(['from' => 'second', 'shared_from' => 'second'])
+        ->not->toHaveKey('boot_context')
+        ->not->toHaveKey('boot_shared');
+});
+
+/**
+ * Run a callback as an attempt of its own.
+ *
+ * @template T
+ *
+ * @param  Closure(): T  $callback
+ * @return Future<T>
+ */
+function torque_attempt(Closure $callback): Future
+{
+    return async(static function () use ($callback): mixed {
+        AttemptScope::begin();
+
+        try {
+            return $callback();
+        } finally {
+            AttemptScope::end();
+        }
+    });
+}
+
+it('gives every attempt its own copy of a custom guard\'s own state', function () {
+    config(['auth.guards.custom' => ['driver' => 'custom'], 'auth.defaults.guard' => 'custom']);
+
+    $built = 0;
+
+    Auth::extend('custom', static function () use (&$built): Guard {
+        $built++;
+
+        return new class implements Guard
+        {
+            use GuardHelpers;
+
+            public ?string $tenant = null;
+
+            public function user(): ?Authenticatable
+            {
+                return $this->user;
+            }
+
+            public function validate(array $credentials = []): bool
+            {
+                return false;
+            }
+        };
+    });
+
+    AttemptAuthManager::install(app());
+
+    $first = torque_attempt(static function (): ?string {
+        Auth::guard()->tenant = 'a';
+        delay(0.01);
+
+        return Auth::guard()->tenant;
+    });
+
+    $second = torque_attempt(static fn (): ?string => Auth::guard()->tenant);
+
+    expect($first->await())->toBe('a')
+        ->and($second->await())->toBeNull()
+        ->and(Auth::guard()->tenant)->toBeNull()
+        ->and($built)->toBe(1);
+});
+
+it('keeps Auth::login of one attempt out of another through the shared session', function () {
+    $alice = new GenericUser(['id' => 'alice']);
+
+    config(['auth.guards.web' => ['driver' => 'session', 'provider' => 'probe'], 'auth.providers.probe' => ['driver' => 'probe']]);
+
+    Auth::provider('probe', static fn (): UserProvider => new class($alice) implements UserProvider
+    {
+        public function __construct(private GenericUser $user) {}
+
+        public function retrieveById($identifier): ?Authenticatable
+        {
+            return $this->user;
+        }
+
+        public function retrieveByToken($identifier, #[SensitiveParameter] $token): ?Authenticatable
+        {
+            return null;
+        }
+
+        public function updateRememberToken(Authenticatable $user, #[SensitiveParameter] $token): void {}
+
+        public function retrieveByCredentials(#[SensitiveParameter] array $credentials): ?Authenticatable
+        {
+            return null;
+        }
+
+        public function validateCredentials(Authenticatable $user, #[SensitiveParameter] array $credentials): bool
+        {
+            return false;
+        }
+
+        public function rehashPasswordIfRequired(Authenticatable $user, #[SensitiveParameter] array $credentials, bool $force = false): void {}
+    });
+
+    AttemptAuthManager::install(app());
+
+    $seen = torque_attempt(static function () use ($alice): mixed {
+        Auth::login($alice);
+
+        return torque_attempt(static fn (): mixed => Auth::id())->await();
+    })->await();
+
+    expect($seen)->toBeNull();
+});
+
+it('does not pile up request callbacks with the guards of finished attempts', function () {
+    AttemptAuthManager::install(app());
+
+    $callbacks = static fn (): int => count((new ReflectionProperty(Container::class, 'reboundCallbacks'))->getValue(app())['request'] ?? []);
+
+    torque_attempt(static fn (): mixed => Auth::guard())->await();
+
+    $before = $callbacks();
+
+    foreach (range(1, 5) as $ignored) {
+        torque_attempt(static fn (): mixed => Auth::guard())->await();
+    }
+
+    expect($callbacks())->toBe($before);
+});
+
+it('keeps a user resolver set in an attempt to that attempt, and one set at boot in all of them', function () {
+    $boot = new GenericUser(['id' => 'boot']);
+
+    Auth::resolveUsersUsing(static fn (): GenericUser => $boot);
+
+    AttemptAuthManager::install(app());
+
+    $resolved = static fn (): mixed => Auth::userResolver()()?->getAuthIdentifier();
+
+    $mine = torque_attempt(static function () use ($resolved): mixed {
+        Auth::resolveUsersUsing(static fn (): GenericUser => new GenericUser(['id' => 'mine']));
+
+        return $resolved();
+    })->await();
+
+    expect($mine)->toBe('mine')
+        ->and(torque_attempt($resolved)->await())->toBe('boot')
+        ->and($resolved())->toBe('boot');
+});
+
+it('resolves the Gate\'s user and the Guard contract through the attempt\'s guard', function () {
+    config(['auth.guards.custom' => ['driver' => 'custom'], 'auth.defaults.guard' => 'custom']);
+
+    Auth::extend('custom', static fn (): Guard => new class implements Guard
+    {
+        use GuardHelpers;
+
+        public function user(): ?Authenticatable
+        {
+            return $this->user;
+        }
+
+        public function validate(array $credentials = []): bool
+        {
+            return false;
+        }
+    });
+
+    // Held by the framework's singleton and Gate from before the install.
+    (void) app(Guard::class);
+    Gate::define('is-mine', static fn (Authenticatable $user): bool => $user->getAuthIdentifier() === 'mine');
+
+    AttemptAuthManager::install(app());
+
+    $mine = torque_attempt(static function (): array {
+        Auth::setUser(new GenericUser(['id' => 'mine']));
+
+        return [Gate::allows('is-mine'), app(Guard::class)->id()];
+    })->await();
+
+    $other = torque_attempt(static fn (): array => [Gate::allows('is-mine'), app(Guard::class)->id()])->await();
+
+    expect($mine)->toBe([true, 'mine'])
+        ->and($other)->toBe([false, null]);
+});
+
+it('keeps the routed managers and guards through a reset', function () {
+    Log::withContext(['boot' => 'yes']);
+    Auth::setUser(new GenericUser(['id' => 'boot']));
+
+    AttemptLogManager::install(app());
+    AttemptAuthManager::install(app());
+
+    $reset = QuiescentReset::for(app());
+    $reset->attemptFinished();
+    $reset->beforeAttempt(1);
+
+    expect(Log::getFacadeRoot())->toBeInstanceOf(AttemptLogManager::class)
+        ->and(Auth::getFacadeRoot())->toBeInstanceOf(AttemptAuthManager::class)
+        ->and(app('log'))->toBeInstanceOf(AttemptLogManager::class)
+        ->and(app('auth'))->toBeInstanceOf(AttemptAuthManager::class)
+        ->and(Auth::id())->toBe('boot')
+        ->and(torque_attempt(static fn (): mixed => Auth::id())->await())->toBe('boot');
+});
+
+it('leaves a manager the application bound itself alone', function () {
+    $auth = new class(app()) extends AuthManager {};
+    $log = new class(app()) extends LogManager {};
+
+    app()->instance('auth', $auth);
+    app()->instance('log', $log);
+
+    expect(AttemptAuthManager::install(app()))->toBeNull()
+        ->and(AttemptLogManager::install(app()))->toBeNull()
+        ->and(app('auth'))->toBe($auth)
+        ->and(app('log'))->toBe($log);
+});
+
+it('gives every attempt its own Cache::memo, with the framework\'s classes', function () {
+    config(['cache.default' => 'array']);
+
+    AttemptMemoizedCache::install(app());
+
+    $read = static function (string $value): mixed {
+        Cache::put('key', $value);
+
+        return Cache::memo()->get('key');
+    };
+
+    $first = torque_attempt(static function () use ($read): array {
+        $value = $read('first');
+        delay(0.01);
+
+        return [$value, Cache::memo()->get('key')];
+    });
+
+    $second = torque_attempt(static fn (): mixed => $read('second'));
+
+    expect($second->await())->toBe('second')
+        ->and($first->await())->toBe(['first', 'first'])
+        ->and(Cache::memo()->getStore())->toBeInstanceOf(MemoizedStore::class);
+
+    expect(QuiescentReset::userScopedBindings(app()))->not->toContain('cache.__memoized:array');
 });
 
 /*

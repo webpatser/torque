@@ -16,19 +16,34 @@ use Illuminate\Queue\Events\JobAttempted;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobInterrupted;
+use Illuminate\Queue\Events\JobPopped;
+use Illuminate\Queue\Events\JobPopping;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\Events\JobReleased;
+use Illuminate\Queue\Events\JobReleasedAfterException;
 use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Events\WorkerIdle;
 use Illuminate\Queue\Events\WorkerInterrupted;
 use Illuminate\Queue\Events\WorkerPausing;
+use Illuminate\Queue\Events\WorkerQueuePaused;
+use Illuminate\Queue\Events\WorkerQueueResumed;
 use Illuminate\Queue\Events\WorkerResuming;
+use Illuminate\Queue\Events\WorkerStarting;
+use Illuminate\Queue\Events\WorkerStopping;
 use Illuminate\Queue\MaxAttemptsExceededException;
 use Illuminate\Queue\QueueManager;
+use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Queue\Worker;
+use Illuminate\Queue\WorkerOptions;
+use Illuminate\Queue\WorkerStopReason;
 use Revolt\EventLoop;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
+use Webpatser\Torque\Job\AttemptAuthManager;
 use Webpatser\Torque\Job\AttemptContextRepository;
 use Webpatser\Torque\Job\AttemptDeferredCallbacks;
+use Webpatser\Torque\Job\AttemptLogManager;
+use Webpatser\Torque\Job\AttemptMemoizedCache;
 use Webpatser\Torque\Job\AttemptScope;
 use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Job\CoroutineContext;
@@ -83,6 +98,12 @@ LUA;
      * ten PEL entries at COUNT 1; the cursor carries on from there at the next poll.
      */
     private const STEAL_SCANS_PER_POLL = 8;
+
+    /** Longest exponential retry delay in seconds: release() loops raise attempts, and with it 2**attempts, to days. */
+    private const int MAX_EXPONENTIAL_BACKOFF = 3600;
+
+    /** Seconds an exponential retry stays ahead of retryUntil: the delayed job migration runs once a second. */
+    private const int RETRY_DEADLINE_MARGIN = 2;
 
     /** Seconds a slot's read waits for a reply when `redis.read_timeout` is not set. */
     private const DEFAULT_READ_TIMEOUT = 30.0;
@@ -168,12 +189,36 @@ LUA;
      */
     private array $stealCursors = [];
 
+    /** Why the worker is going down; the first reason to be set wins. */
+    private ?WorkerStopReason $stopReason = null;
+
+    /** Set by the first requested stop that is not the memory limit, even after a memory stop. */
+    private bool $stopHasGrace = false;
+
+    /** True while a drain tick runs, which can suspend, so the next tick stays out. */
+    private bool $drainTickRunning = false;
+
+    /** Set before WorkerStopping is dispatched, so the event fires once per process. */
+    private bool $stoppingAnnounced = false;
+
+    /** Unix time the last job finished, for WorkerStopping. */
+    private ?int $lastJobProcessedAt = null;
+
+    /** hrtime seconds of the last WorkerIdle, so idle slots do not flood listeners. */
+    private ?float $lastIdleAt = null;
+
     /** Limits — set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
     private int $maxLifetime = 3600;
 
     private int $startTime = 0;
+
+    /** Memory limit in MB; 0 is off. */
+    private int $memoryLimit = 0;
+
+    /** True while `artisan down` is active and `force` is off; refreshed once a second. */
+    private bool $down = false;
 
     /** @var array<string, mixed> */
     private readonly array $config;
@@ -283,10 +328,14 @@ LUA;
         $events = app(Dispatcher::class);
         $queueManager = app('queue');
 
-        // Context and defer() callbacks belong to the attempt that registered
-        // them; the framework's shared instances assume one job at a time.
+        // Context, defer() callbacks, log context, guards and Cache::memo belong to
+        // the attempt using them; the framework's shared instances assume one job
+        // at a time.
         AttemptContextRepository::install(app());
         AttemptDeferredCallbacks::install(app());
+        AttemptLogManager::install(app());
+        AttemptAuthManager::install(app());
+        AttemptMemoizedCache::install(app());
 
         // Not a job's exception, so like a failed read it is reported whatever
         // Worker::$reportJobExceptions says, and at most once a minute: it fails
@@ -300,6 +349,8 @@ LUA;
         if ($concurrency > 1 && ($shared = QuiescentReset::userScopedBindings(app())) !== []) {
             fwrite(STDERR, "[torque:worker] WARN coroutines_per_worker={$concurrency}: these scoped bindings are shared by concurrent jobs and reset only when no job is in flight, which may never happen under sustained load: ".implode(', ', $shared)."\n");
         }
+
+        $this->announceLimitSettings($streams);
 
         // Mirror queue:work's failed-job bookkeeping (WorkCommand::listenForEvents):
         // the failed-jobs provider write is a listener concern of the worker command
@@ -380,12 +431,36 @@ LUA;
             }
         }
 
-        fwrite(STDERR, "[torque:worker] Setup complete, entering event loop\n");
-
         $this->maxJobs = $maxJobs;
         $this->maxLifetime = $maxLifetime;
+        $this->memoryLimit = max(0, (int) ($this->config['memory_limit'] ?? 0));
         $this->startTime = time();
+
+        // Maintenance mode is read once a second for the whole worker, not per
+        // slot per poll: the file driver would hit the disk 50 times a poll.
+        // Read once now too, so no slot claims a job in the first second.
+        $force = (bool) ($this->config['force'] ?? false);
+        $this->refreshDownState($force);
+        EventLoop::repeat(1.0, fn () => $this->refreshDownState($force));
         $startTime = $this->startTime;
+
+        // Built once for the event payloads. Torque has no per-job timeout yet, so
+        // that carries the stock default. `memory` is 0 while the limit is off.
+        $workerOptions = new WorkerOptions(
+            name: 'torque',
+            backoff: 0,
+            memory: $this->memoryLimit,
+            timeout: 60,
+            sleep: max(1, (int) ceil($pollInterval)),
+            maxTries: max(1, (int) ($streams[$queues[0] ?? 'default']['max_retries'] ?? 3)),
+            force: $force,
+            maxJobs: $maxJobs,
+            maxTime: $maxLifetime,
+        );
+
+        $this->dispatchSafely($events, new WorkerStarting($connectionName, $queues[0] ?? 'default', $workerOptions));
+
+        fwrite(STDERR, "[torque:worker] Setup complete, entering event loop\n");
 
         // Shared pause state, mutated by the 2s timer and read by every reader Fiber.
         $pauseState = self::newPauseState();
@@ -418,7 +493,7 @@ LUA;
         // JobInterrupted event, adapted for N concurrent fibers.
         $primaryQueue = $queues[0] ?? 'default';
         $shutdownHandler = function (int $signal) use ($events, $connectionName, $primaryQueue, &$slotJobs, &$slotScopes) {
-            $this->stopRequested = true;
+            $this->requestStop(WorkerStopReason::Interrupted);
             $this->notifyInterrupted($signal, $slotJobs, $events, $connectionName, $primaryQueue, $slotScopes);
         };
 
@@ -436,8 +511,20 @@ LUA;
             $fetched = self::fetchFrameworkPausedQueues($queueManager, $connectionName, $queues);
 
             if ($fetched !== null) {
+                $queueDiff = self::diffPausedQueues($pauseState->frameworkPausedQueues, $fetched);
                 $pauseState->frameworkPausedQueues = $fetched;
                 $pauseFetchFailed = false;
+
+                // Framework pauses only: a tripped circuit breaker has its own
+                // events. State is updated first, so a suspending listener
+                // cannot make the next tick announce the same change again.
+                foreach ($queueDiff['paused'] as $pausedQueue) {
+                    $this->dispatchSafely($events, new WorkerQueuePaused($connectionName, $pausedQueue), announceEverySeconds: 60);
+                }
+
+                foreach ($queueDiff['resumed'] as $resumedQueue) {
+                    $this->dispatchSafely($events, new WorkerQueueResumed($connectionName, $resumedQueue), announceEverySeconds: 60);
+                }
             } elseif (! $pauseFetchFailed) {
                 $pauseFetchFailed = true;
                 fwrite(STDERR, "[torque:worker] Framework pause state unreadable (cache store down?), keeping last known state\n");
@@ -478,15 +565,15 @@ LUA;
         // forever. Detect the reparenting and drain out through the normal stop path.
         $masterPid = posix_getppid();
         EventLoop::repeat(2.0, function () use ($masterPid, &$restartBaseline, &$restartBaselineKnown, &$restartReadFailed) {
-            if (! $this->stopRequested && posix_getppid() !== $masterPid) {
+            if (! $this->stopHasGrace && posix_getppid() !== $masterPid) {
                 fwrite(STDERR, "[torque:worker] Master (PID {$masterPid}) is gone, shutting down orphaned worker\n");
-                $this->stopRequested = true;
+                $this->requestStop(WorkerStopReason::Interrupted);
             }
 
             // queue:restart: the same timestamp comparison as the stock worker,
             // checked here so an idle worker notices too. A change drains out
             // through the normal stop path (exit 0, which the master respawns).
-            if ($this->stopRequested || ! Worker::$restartable || $this->restartChecking
+            if ($this->stopHasGrace || ! Worker::$restartable || $this->restartChecking
                 || ($cache = $this->crashCache()) === null) {
                 return;
             }
@@ -504,7 +591,7 @@ LUA;
                     $restartBaselineKnown = true;
                 } elseif ($current != $restartBaseline) {
                     fwrite(STDERR, "[torque:worker] Received queue:restart signal, draining and exiting.\n");
-                    $this->stopRequested = true;
+                    $this->requestStop(WorkerStopReason::ReceivedRestartSignal);
                 }
             } catch (\Throwable $e) {
                 if (! $restartReadFailed) {
@@ -543,6 +630,7 @@ LUA;
                 $buildStreamKey,
                 $quiescentReset,
                 $cluster,
+                $workerOptions,
                 &$slotStarts,
                 &$slotJobs,
                 &$slotScopes,
@@ -559,15 +647,21 @@ LUA;
                         return;
                     }
 
-                    if ($pauseState->paused) {
+                    // Like a paused worker: no Looping, no polling, no claiming.
+                    if ($this->down || $pauseState->paused) {
                         \Fledge\Async\delay(1.0);
 
                         continue;
                     }
 
                     // Fires on every poll of every slot, so a broken listener is
-                    // announced once a minute, not once per poll.
-                    $this->dispatchSafely($events, new Looping($connectionName, $queues[0] ?? 'default'), announceEverySeconds: 60);
+                    // announced once a minute, not once per poll. A listener
+                    // returning false skips this poll, as in the stock worker.
+                    if ($this->untilSafely($events, new Looping($connectionName, $queues[0] ?? 'default', $workerOptions), announceEverySeconds: 60)) {
+                        \Fledge\Async\delay($pollInterval);
+
+                        continue;
+                    }
 
                     // Per-stream concurrency cap: exclude streams that already
                     // have max_concurrency jobs or reads in flight in this
@@ -592,6 +686,11 @@ LUA;
 
                     try {
                         try {
+                            // Inside the reservation above: a listener may suspend.
+                            // Fires on every read of every slot, like Looping, so a
+                            // broken listener is announced once a minute.
+                            $this->dispatchSafely($events, new JobPopping($connectionName, implode(',', $pollQueues)), announceEverySeconds: 60);
+
                             // Non-blocking poll for new messages.
                             $message = $this->readNextMessage($fiberRedis, $pollQueues, $prefix, $consumerGroup, $buildStreamKey);
 
@@ -635,6 +734,13 @@ LUA;
                     }
 
                     if ($message === null) {
+                        // Every slot polls on its own, so idleness is announced
+                        // only when no job runs anywhere, and at most once per
+                        // poll interval (one second at least) for the whole worker.
+                        if ($slotStarts === [] && $this->prefetched === [] && $this->idleAnnouncementDue($pollInterval)) {
+                            $this->dispatchSafely($events, new WorkerIdle($connectionName, $queues[0] ?? 'default', $workerOptions), announceEverySeconds: 60);
+                        }
+
                         // No work: yield to event loop and wait before polling again.
                         \Fledge\Async\delay($pollInterval);
 
@@ -721,6 +827,7 @@ LUA;
                             $this->releaseInFlight($inFlightKey);
                             CoroutineContext::flush();
                             $this->jobsProcessed++;
+                            $this->lastJobProcessedAt = time();
 
                             continue;
                         }
@@ -748,12 +855,18 @@ LUA;
                     // flight, and with $slotStarts set, so a drain waits for it.
                     $quiescentReset->beforeAttempt(count($this->inFlight));
 
-                    // Before JobProcessing: its Context hydrate flushes, and that
-                    // must reach this attempt only. Ends after JobAttempted.
+                    // Before JobPopped and JobProcessing: what a listener adds to
+                    // Context, and the flush of JobProcessing's hydrate, must reach
+                    // this attempt only. Ends after JobAttempted.
                     $slotScopes[$fiberIndex] = AttemptScope::begin();
 
                     try {
-                        $this->processMessage($streamJob, $events, $connectionName, $attemptDuration);
+                        // Safe, unlike the stock worker: there a throw here skips
+                        // the job until retry_after. As in stock, the hydrate at
+                        // JobProcessing drops Context added by a listener of this.
+                        $this->dispatchSafely($events, new JobPopped($connectionName, $streamJob));
+
+                        $this->processMessage($streamJob, $events, $connectionName, $attemptDuration, $streams);
                         $attemptEnded = true;
                         $durationMs = (hrtime(true) - $jobStartTime) / 1_000_000;
                         $metrics->recordJobCompleted($durationMs, $queueName, rescue(fn (): string => $streamJob->resolveName(), null, false));
@@ -811,6 +924,7 @@ LUA;
                         $this->releaseInFlight($inFlightKey);
                         CoroutineContext::flush();
                         $this->jobsProcessed++;
+                        $this->lastJobProcessedAt = time();
                     }
                 }
             });
@@ -856,60 +970,98 @@ LUA;
         // Fiber suspended inside processMessage() or a half-open Redis socket
         // would keep the EventLoop running indefinitely and the worker would
         // never rotate.
+        //
+        // The memory limit alone has no such deadline: as in the stock worker,
+        // which exits between jobs, the running jobs finish first. Forcing them
+        // out would rerun them in a new worker with their attempts unchanged, and
+        // the same memory growth would abandon them again, forever.
         $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
         $drainStartedAt = null;
-        EventLoop::repeat(1.0, function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey) {
-            if (! $this->hasReachedLimits()) {
+        EventLoop::repeat(1.0, function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey, $events, $workerOptions, $connectionName, $primaryQueue) {
+            // Revolt re-enables a repeat timer before invoking it, so a tick that
+            // suspends in a listener or in the cleanup would be overtaken by the
+            // next one, which could exit underneath it.
+            if ($this->drainTickRunning) {
                 return;
             }
 
-            if ($drainStartedAt === null) {
-                $drainStartedAt = time();
-                fwrite(STDERR, "[torque:worker] Limits reached; draining for up to {$drainGrace}s.\n");
-            }
-
-            // The reader Fibers stop polling once limits are reached, so the
-            // drain is complete as soon as no slot is processing a job. Waiting
-            // out the whole window with idle slots kept a rotated worker (and
-            // with it a draining master) parked for the full grace period.
-            $idle = self::drainComplete($slotStarts);
-
-            if (! $idle && time() - $drainStartedAt < $drainGrace) {
-                return;
-            }
+            $this->drainTickRunning = true;
 
             try {
-                $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
-                $metricsPublisher->removeWorkerMetrics($this->consumerId);
-            } catch (\Throwable) {
-                // Best-effort cleanup; do not block the hard exit.
+                // Real usage, as the stock worker measures it. Slots stop polling
+                // once the stop is requested.
+                if ($this->memoryLimit > 0 && ! $this->stopRequested
+                    && memory_get_usage(true) / 1024 / 1024 >= $this->memoryLimit) {
+                    fwrite(STDERR, "[torque:worker] Memory limit of {$this->memoryLimit} MB reached; claiming no more jobs, exiting once in-flight jobs finish.\n");
+                    $this->requestStop(WorkerStopReason::MaxMemoryExceeded);
+                }
+
+                if (! $this->hasReachedLimits()) {
+                    return;
+                }
+
+                // The first reason wins, including over a signal during the drain.
+                $this->noteLimitReason();
+
+                if ($drainStartedAt === null && $this->drainHasDeadline()) {
+                    $drainStartedAt = time();
+                    fwrite(STDERR, "[torque:worker] Limits reached; draining for up to {$drainGrace}s.\n");
+                }
+
+                // The reader Fibers stop polling once limits are reached, so the
+                // drain is complete as soon as no slot is processing a job. Waiting
+                // out the whole window with idle slots kept a rotated worker (and
+                // with it a draining master) parked for the full grace period.
+                if (! self::drainComplete($slotStarts)
+                    && ($drainStartedAt === null || time() - $drainStartedAt < $drainGrace)) {
+                    return;
+                }
+
+                // As in stock, not while jobs run, except for those a forced exit
+                // abandons. A listener may suspend: the guard above lets it finish.
+                $this->announceStopping($events, $workerOptions, $connectionName, $primaryQueue);
+
+                try {
+                    $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
+                    $metricsPublisher->removeWorkerMetrics($this->consumerId);
+                } catch (\Throwable) {
+                    // Best-effort cleanup; do not block the hard exit.
+                }
+
+                // A forced exit abandons the in-flight jobs on purpose, the way the
+                // stock worker's timeout kill does. Their redelivery is not a crash,
+                // so drop their processing markers before going down.
+                foreach ($slotJobs as $abandoned) {
+                    $this->forgetProcessingMarker($abandoned);
+                }
+
+                $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
+
+                fwrite(STDERR, self::drainComplete($slotStarts)
+                    ? "[torque:worker] Drain complete; no jobs in flight, exiting.\n"
+                    : "[torque:worker] Drain window expired; forcing exit.\n");
+
+                // Set last: the cleanup above suspends, and a job finishing in that
+                // gap ran to a real end and still reports it.
+                $this->exiting = true;
+                exit(self::stopStatusFor($this->stopReason));
+            } finally {
+                $this->drainTickRunning = false;
             }
-
-            // A forced exit abandons the in-flight jobs on purpose, the way the
-            // stock worker's timeout kill does. Their redelivery is not a crash,
-            // so drop their processing markers before going down.
-            foreach ($slotJobs as $abandoned) {
-                $this->forgetProcessingMarker($abandoned);
-            }
-
-            $this->releaseConsumer($redisUri, $queues, $consumerGroup, $buildStreamKey);
-
-            fwrite(STDERR, $idle
-                ? "[torque:worker] Drain complete; no jobs in flight, exiting.\n"
-                : "[torque:worker] Drain window expired; forcing exit.\n");
-
-            // Set last: the cleanup above suspends, and a job finishing in that
-            // gap ran to a real end and still reports it.
-            $this->exiting = true;
-            exit(0);
         });
+
+        $crashed = false;
 
         try {
             EventLoop::run();
         } catch (\Throwable $e) {
+            $crashed = true;
             fwrite(STDERR, "[torque:worker] EventLoop crashed: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
             fwrite(STDERR, $e->getTraceAsString()."\n");
         }
+
+        // A no-op after the drain timer announced; here only for a loop that ended on its own.
+        $this->announceStopping($events, $workerOptions, $connectionName, $primaryQueue, $crashed ? Worker::EXIT_ERROR : null);
 
         // Remove this worker's metrics key from Redis so it doesn't linger as a ghost.
         try {
@@ -1383,6 +1535,23 @@ LUA;
     }
 
     /**
+     * Refresh $down from the application's maintenance state. A throwing
+     * check (unreadable store) keeps the worker running: it never counts as down.
+     */
+    private function refreshDownState(bool $force): void
+    {
+        try {
+            $this->down = ! $force && app()->isDownForMaintenance();
+        } catch (\Throwable $e) {
+            $this->down = false;
+
+            if ($this->mayAnnounce('maintenance check', 60)) {
+                fwrite(STDERR, "[torque:worker] Maintenance mode check failed ({$e->getMessage()}), treating as up\n");
+            }
+        }
+    }
+
+    /**
      * Check if the worker should stop due to any reason: signal, max jobs, or max lifetime.
      */
     private function hasReachedLimits(): bool
@@ -1390,6 +1559,119 @@ LUA;
         return $this->stopRequested
             || $this->jobsProcessed >= $this->maxJobs
             || (time() - $this->startTime) >= $this->maxLifetime;
+    }
+
+    /**
+     * Ask the worker to drain and exit, remembering why. The first reason wins:
+     * a limit that was already reached counts before a signal arriving after it.
+     */
+    private function requestStop(WorkerStopReason $reason): void
+    {
+        $this->noteLimitReason();
+        $this->stopReason ??= $reason;
+        $this->stopRequested = true;
+        $this->stopHasGrace = $this->stopHasGrace || $reason !== WorkerStopReason::MaxMemoryExceeded;
+    }
+
+    /**
+     * Whether in-flight jobs are out of time drain_grace_seconds from now: for
+     * every stop reason except the memory limit on its own, however late it
+     * joins, so a hung job in a memory stop can still be signalled out.
+     */
+    private function drainHasDeadline(): bool
+    {
+        return $this->stopHasGrace
+            || $this->jobsProcessed >= $this->maxJobs
+            || (time() - $this->startTime) >= $this->maxLifetime;
+    }
+
+    /**
+     * Record the limit that ended the worker, when one did and nothing else
+     * was recorded first. Only valid once run() set the limits.
+     */
+    private function noteLimitReason(): void
+    {
+        if ($this->stopReason !== null) {
+            return;
+        }
+
+        if ($this->jobsProcessed >= $this->maxJobs) {
+            $this->stopReason = WorkerStopReason::MaxJobsExceeded;
+        } elseif ((time() - $this->startTime) >= $this->maxLifetime) {
+            $this->stopReason = WorkerStopReason::MaxTimeExceeded;
+        }
+    }
+
+    /**
+     * Exit status for a stop reason, as the stock worker reports it: 0 for
+     * every orderly stop, 12 for the memory limit.
+     */
+    public static function stopStatusFor(?WorkerStopReason $reason): int
+    {
+        return match ($reason) {
+            WorkerStopReason::MaxMemoryExceeded => Worker::EXIT_MEMORY_LIMIT,
+            default => Worker::EXIT_SUCCESS,
+        };
+    }
+
+    /**
+     * Dispatch WorkerStopping, once per process: the flag is set before the
+     * dispatch, so a second stop path (or a listener that suspends) cannot repeat it.
+     */
+    private function announceStopping(Dispatcher $events, WorkerOptions $options, string $connectionName, string $queue, ?int $status = null): void
+    {
+        if ($this->stoppingAnnounced) {
+            return;
+        }
+
+        $this->stoppingAnnounced = true;
+        $this->noteLimitReason();
+
+        $this->dispatchSafely($events, new WorkerStopping(
+            $status ?? self::stopStatusFor($this->stopReason),
+            $options,
+            $this->stopReason,
+            $this->jobsProcessed,
+            $this->lastJobProcessedAt,
+            memory_get_usage(true) / 1024 / 1024,
+            $connectionName,
+            $queue,
+        ));
+    }
+
+    /**
+     * Whether WorkerIdle may fire now: at most once per poll interval, and at
+     * least one second apart, however many slots are polling.
+     */
+    private function idleAnnouncementDue(float $pollInterval): bool
+    {
+        $now = hrtime(true) / 1_000_000_000;
+
+        if ($this->lastIdleAt !== null && $now - $this->lastIdleAt < max(1.0, $pollInterval)) {
+            return false;
+        }
+
+        $this->lastIdleAt = $now;
+
+        return true;
+    }
+
+    /**
+     * Queues that became paused and queues that resumed between two reads of
+     * the framework's paused set.
+     *
+     * Static and pure for unit testing.
+     *
+     * @param  list<string>  $before
+     * @param  list<string>  $after
+     * @return array{paused: list<string>, resumed: list<string>}
+     */
+    public static function diffPausedQueues(array $before, array $after): array
+    {
+        return [
+            'paused' => array_values(array_diff($after, $before)),
+            'resumed' => array_values(array_diff($before, $after)),
+        ];
     }
 
     /**
@@ -1654,6 +1936,7 @@ LUA;
      * @param  float|null  $duration  Receives the handler's run time in
      *                                milliseconds, also when it throws. Left
      *                                untouched when the attempt ends before fire().
+     * @param  array<string, array<string, mixed>>  $streams
      *
      * @param-out float|null $duration
      */
@@ -1663,8 +1946,11 @@ LUA;
         Dispatcher $events,
         string $connectionName,
         &$duration = null,
+        array $streams = [],
     ): void {
         $events->dispatch(new JobProcessing($connectionName, $job));
+
+        $this->guardAgainstExceededAttempts($job, $streams[$job->getQueue()] ?? []);
 
         $this->guardAgainstRepeatedCrashes($job);
 
@@ -1686,6 +1972,14 @@ LUA;
         }
 
         $events->dispatch(new JobProcessed($connectionName, $job, $duration));
+
+        // As in the stock worker's process(), so only on this path without a throw.
+        // isReleased() is no proof: it is set before the release runs, and a failed
+        // one leaves the entry in the PEL for reclaim. Safe, because the job is out
+        // by now: a stock listener throwing here could still fail it on top of that.
+        if ($job->releaseSucceeded() && ! $job->isDeleted()) {
+            $this->dispatchSafely($events, new JobReleased($connectionName, $job));
+        }
     }
 
     /**
@@ -1732,17 +2026,37 @@ LUA;
         try {
             $events->dispatch($event);
         } catch (\Throwable $e) {
-            if ($announceEverySeconds > 0 && ! $this->mayAnnounce($event::class, $announceEverySeconds)) {
-                return;
-            }
+            $this->announceListenerFailure($event, $e, $announceEverySeconds);
+        }
+    }
 
-            $name = class_basename($event);
+    /**
+     * Like dispatchSafely() for an event whose listeners can veto: true when a
+     * listener returned false. A throwing listener vetoes nothing.
+     */
+    private function untilSafely(Dispatcher $events, object $event, int $announceEverySeconds = 0): bool
+    {
+        try {
+            return $events->until($event) === false;
+        } catch (\Throwable $e) {
+            $this->announceListenerFailure($event, $e, $announceEverySeconds);
 
-            fwrite(STDERR, "[torque:worker] {$name} dispatch failed: {$e->getMessage()}\n");
+            return false;
+        }
+    }
 
-            if (Worker::$reportJobExceptions) {
-                $this->reportSafely($e);
-            }
+    private function announceListenerFailure(object $event, \Throwable $e, int $announceEverySeconds): void
+    {
+        if ($announceEverySeconds > 0 && ! $this->mayAnnounce($event::class, $announceEverySeconds)) {
+            return;
+        }
+
+        $name = class_basename($event);
+
+        fwrite(STDERR, "[torque:worker] {$name} dispatch failed: {$e->getMessage()}\n");
+
+        if (Worker::$reportJobExceptions) {
+            $this->reportSafely($e);
         }
     }
 
@@ -1947,12 +2261,13 @@ LUA;
     /**
      * Handle a job that threw an exception during processing.
      *
-     * Releases the job with exponential backoff if attempts remain, otherwise
-     * marks it as permanently failed. A job that already released, deleted or
-     * failed itself before throwing keeps that outcome, as in the stock worker's
-     * handleJobException(), and is neither added again nor dead-lettered. That
-     * includes a release on the last attempt: its copy runs once more and is the
-     * one that can still reach the dead-letter stream.
+     * Fails the job if a limit says so, otherwise releases it with its backoff,
+     * in the stock worker's order: a failure comes before JobExceptionOccurred, a
+     * release after it. A job that already released, deleted or failed itself
+     * before throwing keeps that outcome and is neither added again nor
+     * dead-lettered, and it does not count against any limit. That includes a
+     * release on the last attempt: its copy runs once more and is the one that can
+     * still reach the dead-letter stream.
      *
      * @param  array{stream: string, id: string, payload: string}  $message
      * @param  array<string, array<string, mixed>>  $streams
@@ -1967,11 +2282,31 @@ LUA;
         DeadLetterHandler $deadLetterHandler,
         ?CircuitBreaker $circuitBreaker = null,
     ): void {
-        $queueName = $job->getQueue();
+        $streamConfig = $streams[$job->getQueue()] ?? [];
+        $exceptionOccurred = new JobExceptionOccurred($connectionName, $job, $exception);
 
-        $this->dispatchSafely($events, new JobExceptionOccurred($connectionName, $job, $exception));
+        $shouldFail = ! self::settledItself($job) && $this->shouldFailAfter($exception, $job, $streamConfig);
 
-        if ($job->isDeleted() || $job->isReleased() || $job->hasFailed()) {
+        // Counting maxExceptions suspends, and something the job started can still
+        // settle it in that time, so its state is read again here.
+        // @phpstan-ignore booleanNot.alwaysTrue (analysis cannot see that suspension)
+        if ($shouldFail && ! self::settledItself($job)) {
+            try {
+                $this->failPermanently($job, $message, $exception, $events, $deadLetterHandler, $circuitBreaker);
+            } catch (\Throwable $handlingFailure) {
+                $this->dispatchSafely($events, $exceptionOccurred);
+
+                throw $handlingFailure;
+            }
+
+            $this->dispatchSafely($events, $exceptionOccurred);
+
+            return;
+        }
+
+        $this->dispatchSafely($events, $exceptionOccurred);
+
+        if (self::settledItself($job)) {
             // delete() and fail() have acknowledged the message by now, and so has
             // a release() that succeeded; after one that threw, the entry stays in
             // the stream and PEL for reclaim. markAsFailed() alone has not, and
@@ -1984,73 +2319,320 @@ LUA;
             return;
         }
 
-        $streamConfig = $streams[$queueName] ?? [];
-        $maxRetries = (int) ($streamConfig['max_retries'] ?? 3);
+        $backoffSeconds = $this->retryBackoff($job, $streamConfig);
+        $job->release($backoffSeconds);
+
+        // After the release, as in the stock worker: one that throws fires nothing.
+        $this->dispatchSafely($events, new JobReleasedAfterException($connectionName, $job, $backoffSeconds, $exception));
+    }
+
+    /**
+     * Fail a job for good. The one way a job leaves the worker as failed.
+     *
+     * @param  array{stream: string, id: string, payload: string}  $message
+     */
+    private function failPermanently(
+        StreamJob $job,
+        array $message,
+        \Throwable $exception,
+        Dispatcher $events,
+        DeadLetterHandler $deadLetterHandler,
+        ?CircuitBreaker $circuitBreaker,
+    ): void {
+        $queueName = $job->getQueue();
+
+        // Write to dead-letter stream FIRST: $job->fail() may throw (e.g. job's
+        // failed() callback, DB write for failed_jobs table, or event listener),
+        // and we must not lose the failed job.
+        $deadLetterHandler->handle(
+            queue: $queueName,
+            payload: $message['payload'],
+            messageId: $message['id'],
+            exception: $exception,
+        );
+
+        // Only permanent failures feed the breaker; a release/retry is
+        // neutral, since a job that is going to be retried says nothing
+        // yet about the health of the stream's dependencies.
+        $circuitBreaker?->recordFailure($queueName);
+
+        // Mark as failed via Laravel's base Job: this ACKs/DELs the
+        // stream message and calls the job's failed() callback.
+        try {
+            $job->fail($exception);
+        } catch (\Throwable $failError) {
+            // fail() already deleted the message from the stream.
+            // If it throws after that (e.g. failed() callback or DB),
+            // the job is already in dead-letter: safe to swallow, but
+            // never silently: a broken failed_jobs write would otherwise
+            // hide every failure from queue:failed and retry tooling.
+            fwrite(STDERR, "[torque:worker] job->fail() threw: {$failError->getMessage()} in {$failError->getFile()}:{$failError->getLine()}\n");
+
+            if (Worker::$reportJobExceptions) {
+                $this->reportSafely($failError);
+            }
+        }
+
+        // No manual JobFailed dispatch here: Job::fail() already dispatches it
+        // in its finally block, and a second event would double-write the
+        // failed-jobs row now that the worker registers the logging listener.
+
+        // Fire a domain event so users can hook in custom notification logic.
+        try {
+            $decoded = StreamQueue::decodePayload($message['payload'], (string) ($this->config['serializer'] ?? 'json'));
+        } catch (\Throwable) {
+            $decoded = [];
+        }
+        $failedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c');
+
+        $this->dispatchSafely($events, new JobPermanentlyFailed(
+            jobName: $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
+            queue: $queueName,
+            payload: $message['payload'],
+            exceptionClass: $exception::class,
+            exceptionMessage: $exception->getMessage(),
+            failedAt: $failedAt,
+        ));
+    }
+
+    private static function settledItself(StreamJob $job): bool
+    {
+        return $job->isDeleted() || $job->isReleased() || $job->hasFailed();
+    }
+
+    /**
+     * Whether this exception ends the job, in the stock worker's order: attempts,
+     * then maxExceptions, then the exception handler's verdict. As in stock the
+     * exception counts against maxExceptions even when attempts already ended it.
+     *
+     * @param  array<string, mixed>  $streamConfig
+     */
+    private function shouldFailAfter(\Throwable $exception, StreamJob $job, array $streamConfig): bool
+    {
+        // The crash guard and the strict attempts check throw this to end the job,
+        // and neither is one more exception to count. TimeoutExceededException
+        // extends it: a job that only timed out goes through the checks below.
+        if ($exception instanceof MaxAttemptsExceededException && ! $exception instanceof TimeoutExceededException) {
+            return true;
+        }
+
+        $attemptsEnded = $this->attemptsEndedAfterFailure($job, $streamConfig);
+        $exceptionsEnded = $this->honoursJobLimits() && $this->countAgainstMaxExceptions($job);
 
         // A dontRetry()/dontRetryWhen() verdict from the application's exception
         // handler (Laravel v13.17.0+) forces immediate failure, no matter how
-        // many attempts remain — matching Illuminate\Queue\Worker.
-        // So does a job whose crashes already used up its maxExceptions.
-        $forceFail = $exception instanceof MaxAttemptsExceededException
-            || $this->shouldStopRetries($exception);
+        // many attempts remain, matching Illuminate\Queue\Worker.
+        return $attemptsEnded || $exceptionsEnded || $this->shouldStopRetries($exception);
+    }
 
-        if (! $forceFail && $job->attempts() < $maxRetries) {
-            // Exponential backoff: 2^attempts seconds (2, 4, 8, 16, ...).
-            $backoffSeconds = (int) (2 ** $job->attempts());
-            $job->release($backoffSeconds);
+    /**
+     * Count a thrown exception against the job's maxExceptions, in the app cache
+     * as the stock worker does, so the count survives a release and a new worker.
+     * Shares its key with the crash guard, also as in stock. A cache outage must
+     * not fail a job: it retries, uncounted, on its other limits.
+     */
+    private function countAgainstMaxExceptions(StreamJob $job): bool
+    {
+        if (($uuid = $job->uuid()) === null
+            || ($maxExceptions = $job->maxExceptions()) === null
+            || ($cache = $this->crashCache()) === null) {
+            return false;
+        }
+
+        $counter = 'job-exceptions:'.$uuid;
+
+        try {
+            if (! $cache->get($counter)) {
+                $cache->put($counter, 0, now()->addDay());
+            }
+
+            if ($maxExceptions > (int) $cache->increment($counter)) {
+                return false;
+            }
+
+            $cache->forget($counter);
+
+            return true;
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[torque:worker] Exception count failed for {$uuid}: {$e->getMessage()}\n");
+
+            return false;
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $streamConfig
+     */
+    private function attemptsEndedAfterFailure(StreamJob $job, array $streamConfig): bool
+    {
+        if (($deadline = $this->retryDeadline($job)) !== null) {
+            return $deadline <= time();
+        }
+
+        $limit = $this->attemptLimit($job, $streamConfig);
+
+        return $limit !== null && $job->attempts() >= $limit;
+    }
+
+    /**
+     * The stock worker's check of a job about to run, which is what limits a job
+     * that keeps calling release(): that copy fails here instead of running again.
+     * It would also fail RateLimited and WithoutOverlapping release loops, which
+     * is why it waits for strict_attempts.
+     *
+     * Counts releases only: a delivery after a worker died does not raise attempts,
+     * with or without strict_attempts. Only the crash guard's maxExceptions sees those.
+     *
+     * @param  array<string, mixed>  $streamConfig
+     *
+     * @throws MaxAttemptsExceededException
+     */
+    private function guardAgainstExceededAttempts(StreamJob $job, array $streamConfig): void
+    {
+        if (! $this->enforcesStrictAttempts()) {
+            return;
+        }
+
+        if (($deadline = $this->retryDeadline($job)) !== null) {
+            $exceeded = time() > $deadline;
         } else {
-            // Write to dead-letter stream FIRST — $job->fail() may throw
-            // (e.g. job's failed() callback, DB write for failed_jobs table,
-            // or event listener), and we must not lose the failed job.
-            $deadLetterHandler->handle(
-                queue: $queueName,
-                payload: $message['payload'],
-                messageId: $message['id'],
-                exception: $exception,
-            );
+            $limit = $this->attemptLimit($job, $streamConfig);
+            $exceeded = $limit !== null && $job->attempts() > $limit;
+        }
 
-            // Only permanent failures feed the breaker; a release/retry is
-            // neutral, since a job that is going to be retried says nothing
-            // yet about the health of the stream's dependencies.
-            $circuitBreaker?->recordFailure($queueName);
+        if ($exceeded) {
+            throw MaxAttemptsExceededException::forJob($job);
+        }
+    }
 
-            // Mark as failed via Laravel's base Job — this ACKs/DELs the
-            // stream message and calls the job's failed() callback.
-            try {
-                $job->fail($exception);
-            } catch (\Throwable $failError) {
-                // fail() already deleted the message from the stream.
-                // If it throws after that (e.g. failed() callback or DB),
-                // the job is already in dead-letter — safe to swallow, but
-                // never silently: a broken failed_jobs write would otherwise
-                // hide every failure from queue:failed and retry tooling.
-                fwrite(STDERR, "[torque:worker] job->fail() threw: {$failError->getMessage()} in {$failError->getFile()}:{$failError->getLine()}\n");
+    /**
+     * The job's own deadline, which replaces its attempt limit when it has one.
+     */
+    private function retryDeadline(StreamJob $job): ?int
+    {
+        return $this->honoursJobLimits() ? ($job->retryUntil() ?: null) : null;
+    }
 
-                if (Worker::$reportJobExceptions) {
-                    $this->reportSafely($failError);
-                }
+    /**
+     * The number of runs a job gets; null has no limit. A job's own limit of 0
+     * means none, as in stock. A stream's means one run and no retries, which is
+     * what it has always meant here.
+     *
+     * @param  array<string, mixed>  $streamConfig
+     */
+    private function attemptLimit(StreamJob $job, array $streamConfig): ?int
+    {
+        $declared = $this->honoursJobLimits() ? $job->maxTries() : null;
+
+        if ($declared !== null) {
+            return $declared > 0 ? $declared : null;
+        }
+
+        return max(1, (int) ($streamConfig['max_retries'] ?? 3));
+    }
+
+    /**
+     * Seconds until the retry: the job's backoff, then the stream's.
+     *
+     * @param  array<string, mixed>  $streamConfig
+     */
+    private function retryBackoff(StreamJob $job, array $streamConfig): int
+    {
+        $attempts = $job->attempts();
+
+        if ($this->honoursJobLimits()) {
+            // As stock's calculateBackoff(). The payload holds "1,5,10" for [1, 5, 10].
+            $declared = $job->backoff();
+
+            if ($declared !== null) {
+                return self::backoffStep(explode(',', is_array($declared) ? implode(',', $declared) : (string) $declared), $attempts);
             }
 
-            // No manual JobFailed dispatch here: Job::fail() already dispatches it
-            // in its finally block, and a second event would double-write the
-            // failed-jobs row now that the worker registers the logging listener.
+            $steps = self::streamBackoffSteps($streamConfig['backoff'] ?? null);
 
-            // Fire a domain event so users can hook in custom notification logic.
-            try {
-                $decoded = StreamQueue::decodePayload($message['payload'], (string) ($this->config['serializer'] ?? 'json'));
-            } catch (\Throwable) {
-                $decoded = [];
+            if ($steps !== null) {
+                return self::backoffStep($steps, $attempts);
             }
-            $failedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c');
+        }
 
-            $this->dispatchSafely($events, new JobPermanentlyFailed(
-                jobName: $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
-                queue: $queueName,
-                payload: $message['payload'],
-                exceptionClass: $exception::class,
-                exceptionMessage: $exception->getMessage(),
-                failedAt: $failedAt,
-            ));
+        // 2, 4, 8, 16, ... up to the cap, and short of the job's deadline so it
+        // still runs before that. A declared backoff is the job's own choice.
+        $delay = min(2 ** min($attempts, 30), self::MAX_EXPONENTIAL_BACKOFF);
+        $deadline = $this->retryDeadline($job);
+
+        return $deadline === null ? $delay : min($delay, max(0, $deadline - time() - self::RETRY_DEADLINE_MARGIN));
+    }
+
+    /**
+     * @param  non-empty-list<mixed>  $steps
+     */
+    private static function backoffStep(array $steps, int $attempts): int
+    {
+        return max(0, (int) ($steps[$attempts - 1] ?? $steps[array_key_last($steps)]));
+    }
+
+    /**
+     * Read a stream's `backoff`: seconds, as a number, a list or "1,5,10". Null
+     * for `exponential` and for anything else, which the worker warns about at boot.
+     *
+     * @return non-empty-list<mixed>|null
+     */
+    private static function streamBackoffSteps(mixed $backoff): ?array
+    {
+        $steps = match (true) {
+            is_array($backoff) => array_values($backoff),
+            is_string($backoff) => explode(',', $backoff),
+            is_int($backoff), is_float($backoff) => [$backoff],
+            default => [],
+        };
+
+        if ($steps === [] || ! array_all($steps, static fn (mixed $step): bool => is_numeric($step))) {
+            return null;
+        }
+
+        return $steps;
+    }
+
+    /**
+     * `job_limits: stream` is the kill switch: only `max_retries` and the capped
+     * 2**attempts, as before jobs could declare limits, whatever else is configured.
+     */
+    private function honoursJobLimits(): bool
+    {
+        return ($this->config['job_limits'] ?? 'job') !== 'stream';
+    }
+
+    private function enforcesStrictAttempts(): bool
+    {
+        return $this->honoursJobLimits() && (bool) ($this->config['strict_attempts'] ?? false);
+    }
+
+    /**
+     * Say at boot what the limit settings leave out. Which jobs a worker will see
+     * is unknown here, so this cannot name the jobs that would behave differently.
+     *
+     * @param  array<string, array<string, mixed>>  $streams
+     */
+    private function announceLimitSettings(array $streams): void
+    {
+        if (! $this->honoursJobLimits()) {
+            if ((bool) ($this->config['strict_attempts'] ?? false)) {
+                fwrite(STDERR, "[torque:worker] WARN strict_attempts is ignored while job_limits is stream\n");
+            }
+
+            return;
+        }
+
+        foreach ($streams as $name => $stream) {
+            $backoff = $stream['backoff'] ?? 'exponential';
+
+            if ($backoff !== 'exponential' && self::streamBackoffSteps($backoff) === null) {
+                fwrite(STDERR, "[torque:worker] WARN stream {$name}: backoff ".json_encode($backoff)." is not a number, a list of numbers or exponential, using exponential\n");
+            }
+        }
+
+        if (! $this->enforcesStrictAttempts()) {
+            fwrite(STDERR, "[torque:worker] NOTE strict_attempts is off: attempts and retryUntil are only checked after a thrown exception, so a job that keeps calling release() is not limited. A delivery after a worker died never counts as an attempt in either mode, so only maxExceptions limits a job whose worker keeps dying\n");
         }
     }
 

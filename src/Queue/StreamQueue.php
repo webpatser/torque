@@ -67,6 +67,41 @@ redis.call('XDEL', KEYS[1], ARGV[2])
 return 1
 LUA;
 
+    /**
+     * Lua script reading the depths of one queue in a single round trip.
+     *
+     * KEYS[1] = stream key, KEYS[2] = delayed sorted set key
+     * ARGV[1] = consumer group, ARGV[2] = '1' to also return the oldest waiting id
+     *
+     * Returns {stream length, group pending count, delayed count, oldest waiting id}.
+     * A missing stream or group yields zeros, never an error.
+     */
+    private const LUA_DEPTHS = <<<'LUA'
+local pending = 0
+local last = '0-0'
+local groups = redis.pcall('XINFO', 'GROUPS', KEYS[1])
+if type(groups) == 'table' and groups.err == nil then
+    for _, g in ipairs(groups) do
+        local f = {}
+        for i = 1, #g, 2 do
+            f[g[i]] = g[i + 1]
+        end
+        if f['name'] == ARGV[1] then
+            pending = tonumber(f['pending']) or 0
+            last = f['last-delivered-id'] or '0-0'
+        end
+    end
+end
+local oldest = ''
+if ARGV[2] == '1' then
+    local first = redis.call('XRANGE', KEYS[1], '(' .. last, '+', 'COUNT', 1)
+    if first[1] then
+        oldest = first[1][1]
+    end
+end
+return {redis.call('XLEN', KEYS[1]), pending, redis.call('ZCARD', KEYS[2]), oldest}
+LUA;
+
     public function __construct(
         private readonly string $redisUri,
         private readonly string $default = 'default',
@@ -449,14 +484,95 @@ LUA;
     // -------------------------------------------------------------------------
 
     /**
-     * Get the size of the queue (total messages in the stream).
+     * Get the size of the queue: waiting plus delayed plus reserved jobs.
+     *
+     * Same meaning as the stock Redis queue, where size() adds the ready list,
+     * the delayed set and the reserved set.
      *
      * @param  \UnitEnum|string|null  $queue
      */
     #[\Override]
     public function size($queue = null): int
     {
-        return (int) $this->redis->execute('XLEN', $this->getStreamKey($queue));
+        $depths = $this->depths($queue);
+
+        return $depths['waiting'] + $depths['delayed'] + $depths['reserved'];
+    }
+
+    /**
+     * Waiting, delayed and reserved counts of one queue in a single round trip.
+     *
+     * Waiting is XLEN minus the group's pending count, clamped at 0: acked
+     * entries are deleted, so every entry left in the stream is either waiting
+     * or in flight, but clear() can trim in-flight entries whose PEL records
+     * stay, which would push the difference below zero. A missing stream or
+     * group counts as 0 instead of raising NOGROUP. With `$withOldest` the id
+     * of the first entry after the group's last-delivered id comes back too:
+     * the oldest waiting job, never an in-flight one.
+     *
+     * @param  \UnitEnum|string|null  $queue
+     * @return array{waiting: int, delayed: int, reserved: int, oldest: string|null}
+     */
+    public function depths($queue = null, bool $withOldest = false): array
+    {
+        $streamKey = $this->getStreamKey($queue);
+
+        /** @var array{0: int|string, 1: int|string, 2: int|string, 3?: string|null} $result */
+        $result = $this->redis->execute(
+            'EVAL',
+            self::LUA_DEPTHS,
+            '2',
+            $streamKey,
+            $streamKey.':delayed',
+            $this->consumerGroup,
+            $withOldest ? '1' : '0',
+        );
+
+        $reserved = (int) $result[1];
+        $oldest = (string) ($result[3] ?? '');
+
+        return [
+            'waiting' => max(0, (int) $result[0] - $reserved),
+            'delayed' => (int) $result[2],
+            'reserved' => $reserved,
+            'oldest' => $oldest === '' ? null : $oldest,
+        ];
+    }
+
+    /**
+     * The consumers of this queue's group, with their pending count and idle time.
+     *
+     * A queue without a stream or group has no consumers.
+     *
+     * @param  \UnitEnum|string|null  $queue
+     * @return list<array{name: string, pending: int, idle: int}> Idle time in milliseconds.
+     */
+    public function consumers($queue = null): array
+    {
+        try {
+            /** @var list<list<mixed>>|null $rows */
+            $rows = $this->redis->execute('XINFO', 'CONSUMERS', $this->getStreamKey($queue), $this->consumerGroup);
+        } catch (RedisException $e) {
+            if (str_contains($e->getMessage(), 'NOGROUP') || str_contains($e->getMessage(), 'no such key')) {
+                return [];
+            }
+
+            throw $e;
+        }
+
+        return array_map(function (array $row): array {
+            $fields = [];
+
+            for ($i = 0, $count = count($row); $i + 1 < $count; $i += 2) {
+                $fields[(string) $row[$i]] = $row[$i + 1];
+            }
+
+            return [
+                'name' => (string) ($fields['name'] ?? ''),
+                'pending' => (int) ($fields['pending'] ?? 0),
+                'idle' => (int) ($fields['idle'] ?? 0),
+            ];
+        }, $rows ?? []);
     }
 
     /**
@@ -483,18 +599,13 @@ LUA;
     }
 
     /**
-     * Get the number of pending (claimed but unacknowledged) messages.
+     * Get the number of waiting jobs: ready to be read, not delayed, not in flight.
+     *
+     * Stock semantics. The group's pending entries list is {@see reservedSize()}.
      */
     public function pendingSize($queue = null): int
     {
-        $result = $this->redis->execute(
-            'XPENDING',
-            $this->getStreamKey($queue),
-            $this->consumerGroup,
-        );
-
-        // XPENDING summary: [totalPending, smallestId, largestId, [[consumer, count], ...]]
-        return (int) ($result[0] ?? 0);
+        return $this->depths($queue)['waiting'];
     }
 
     /**
@@ -517,36 +628,25 @@ LUA;
      */
     public function reservedSize($queue = null): int
     {
-        return $this->pendingSize($queue);
+        return $this->depths($queue)['reserved'];
     }
 
     /**
-     * Get the creation timestamp (in seconds) of the oldest pending message.
+     * Get the creation timestamp (in seconds) of the oldest waiting job.
      *
-     * Returns null when the PEL is empty.
+     * Read from the first entry after the group's last-delivered id, so a job
+     * in flight never counts. Returns null when nothing waits.
      */
     public function creationTimeOfOldestPendingJob($queue = null): ?float
     {
-        $result = $this->redis->execute(
-            'XPENDING',
-            $this->getStreamKey($queue),
-            $this->consumerGroup,
-            '-',
-            '+',
-            '1',
-        );
+        $messageId = $this->depths($queue, true)['oldest'];
 
-        // Result: [ [messageId, consumer, idleTime, deliveryCount] ]
-        if ($result === null || $result === []) {
+        if ($messageId === null) {
             return null;
         }
 
-        $messageId = (string) $result[0][0];
-
         // Redis stream message IDs are formatted as {millisecondsTimestamp}-{sequence}.
-        $timestampMs = (int) Str::before($messageId, '-');
-
-        return $timestampMs / 1000;
+        return (int) Str::before($messageId, '-') / 1000;
     }
 
     /**
@@ -573,7 +673,7 @@ LUA;
      * delivery count is exposed as the inspected job's `attempts`.
      *
      * Capped at 1000 entries per queue to bound memory; the per-queue
-     * {@see pendingSize()} is still authoritative for totals.
+     * {@see reservedSize()} is still authoritative for totals.
      *
      * @return Collection<int, InspectedJob>
      */

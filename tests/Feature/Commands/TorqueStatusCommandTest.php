@@ -66,7 +66,7 @@ it('renders the worker pid and latency from the published hash', function () {
             ->and($output)->not->toContain('| ?')
             // Live queue depth and dead-letter counts render as numbers, not
             // placeholders, even without a master-published aggregate.
-            ->and($output)->toContain('Pending');
+            ->and($output)->toContain('Waiting');
 
         $publisher->removeWorkerMetrics('web-01-5123-a1b2c3d4');
     } catch (RedisException $e) {

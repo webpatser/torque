@@ -2,6 +2,59 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so. `torque:status` shows the recorded data version next to the installed one.
 
+## 1.1.x to 1.2.0
+
+No data step. Read the behaviour changes before deploying, in particular the first two.
+
+### New config keys (all optional, defaults apply when absent)
+
+| Key | Default | What it does |
+|---|---|---|
+| `job_limits` | `job` | `job`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `stream`: kill switch, only `max_retries` and `2**attempts` count |
+| `strict_attempts` | `false` | Check attempts and `retryUntil` before a job runs, as `queue:work` does. Off, a job that calls `release()` is never stopped, which keeps `RateLimited` and `WithoutOverlapping` working. Workers log a boot line saying so |
+| `memory_limit` | `0` | Megabytes of real memory at which a worker drains and exits with status 12. The drain waits for running jobs with no grace force exit, so a hung job holds the worker until a signal, `queue:restart` or the lifetime ends it (timeouts arrive in 1.3.0). `0` is off |
+| `force` | `false` | Keep processing during `artisan down` |
+| `redis.read_timeout` | `30` | Seconds before a slot gives up on a Redis reply and reconnects (added in 1.1.2) |
+
+### Behaviour changes
+
+- **Honouring `artisan down`.** While the app is down, slots stop polling and claiming. In-flight jobs finish and jobs wait in the stream rather than get lost; polling resumes after `artisan up`. Set `force` to `true` (`TORQUE_FORCE`) to keep the old behaviour of processing during maintenance.
+- **Per-job limits now apply.** A job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` take over from the stream's `max_retries` and `backoff`; `$tries = 0` means unlimited. Jobs that declare nothing behave as before. Set `job_limits` to `stream` to turn this off. A non-default stream `backoff` now takes effect, and exponential retries (`2**attempts`) are capped at 1 hour, also under `job_limits: stream`, and stop 2 seconds short of `retryUntil`. A declared `$backoff` or stream `backoff` stays as set.
+- **Queue sizes changed meaning.** `size()` is now waiting plus delayed plus reserved, and `pendingSize()` is waiting only, as in the stock Redis queue. `pendingSize()` used to return the pending entries list, which is `reservedSize()`. In a case with 3 waiting, 2 delayed and 4 reserved, `size()` and `pendingSize()` went from 7 and 4 to 9 and 3. Autoscalers and alerts built on these numbers see new values; the dashboard gauges and Overview now show waiting jobs. The `torque:monitor` and `torque:status` columns follow the same meaning. `size()` after `queue:clear` still counts a running job.
+- **`JobExceptionOccurred` fires after `JobFailed` on the fail path**, as in stock.
+- **New events.** `WorkerStarting`, `WorkerStopping`, `WorkerIdle`, `WorkerQueuePaused`, `WorkerQueueResumed`, `JobPopping`, `JobPopped`, `JobReleased` and `JobReleasedAfterException` are dispatched. `JobPopping` fires on every poll (about 25 per second at 50 slots), so keep its listeners cheap. A throwing listener on the four job events does not change the job's outcome, unlike stock. A `Looping` listener returning false is honoured. `WorkerStopping` fires after the drain, or at the force exit; `memoryUsage` is in MB, and a hung listener blocks exit until the process is killed. `WorkerOptions` carries real values: `memory` is 0 when the limit is off and `maxTries` defaults to 3.
+- **Per-attempt isolation grew.** `Log` context on every channel, `Auth` guards and `Cache::memo()` are now kept per attempt; see the Concurrency contract in the README for what stays shared.
+- **Laravel Cloud.** Its listeners hold process-wide job state, so exception attribution is unreliable at more than one slot.
+
+### Coming in 2.0
+
+2.0 will flip these defaults: `strict_attempts` on, `timeouts.enabled` on and a default `memory_limit`. Set them explicitly now if you want the current behaviour to stay. Job timeouts (`$timeout` enforcement, `JobTimedOut`) arrive in 1.3.0, opt-in.
+
+## Coming from Horizon
+
+Concepts and commands, from Laravel's Horizon documentation:
+
+| Horizon | Torque |
+|---|---|
+| `horizon` | `torque:start` |
+| `horizon:status` | `torque:status`, `torque:monitor` for a live view |
+| `horizon:pause` / `horizon:continue` | `torque:pause` / `torque:pause continue` |
+| `horizon:terminate` | `torque:stop` (graceful), `torque:reload` (zero-downtime takeover) |
+| `horizon:forget {id} --all` | `torque:forget {id?} {--all} {--queue=} {--force}` |
+| `horizon:clear` | `queue:clear` |
+| `horizon:supervisor` | None; one master runs the whole fleet. `torque:supervisor` generates a Supervisor config for the master |
+| `horizon:snapshot` | None; the master publishes metrics itself |
+| Supervisors, `maxProcesses` | `workers` processes, each with `coroutines_per_worker` Fiber slots |
+| `balance` / autoscaling | Slot-pressure autoscaling, per-stream `max_concurrency` |
+| `tries`, `backoff` | A job's own properties, then `streams.<q>.max_retries` and `backoff` |
+| `timeout` | Job `$timeout` is not enforced before 1.3.0 |
+| `memory` | `memory_limit` |
+| `trim` / failed job retention | `dead_letter.ttl` and `max_entries`, `metrics.retention` |
+| Tags, `silenced`, long-wait `waits` | Not available yet |
+| Environments | `env()` in `config/torque.php` and `prefix`; see "Not planned" in the README |
+
+Jobs need no change. Torque is a queue connection (`QUEUE_CONNECTION=torque`), so dispatching, batches and chains work as before. Blocking calls in a handler stall every job on that worker: see the README's section on databases.
+
 ## 0.18.x to 1.0.0
 
 1.0.0 is the first stable release: from here on, breaking changes wait for a major version. It removes the remaining migration code for data written by 0.15.x and earlier.

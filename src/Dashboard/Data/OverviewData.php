@@ -113,8 +113,9 @@ final class OverviewData
         $queue = StreamQueueResolver::make();
 
         foreach (array_keys((array) config('torque.streams', [])) as $name) {
-            $pending += $queue->pendingSize((string) $name);
-            $delayed += $queue->delayedSize((string) $name);
+            $depths = $queue->depths((string) $name);
+            $pending += $depths['waiting'];
+            $delayed += $depths['delayed'];
         }
 
         $live = array_map(

@@ -3,7 +3,7 @@
 
     // Stream, pending, delayed, reserved, depth and the chevron are always
     // rendered; the rest come and go with the data.
-    $columns = 6 + (int) $hasThroughput + (int) $hasWait + (int) $hasFailed;
+    $columns = 7 + (int) $hasThroughput + (int) $hasWait + (int) $hasFailed;
 @endphp
 <x-torque::shell title="Queues &amp; Streams" crumb="Redis Streams · consumer groups" active="queues"
     :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
@@ -35,6 +35,7 @@
                         <th class="r">Pending</th>
                         <th class="r">Delayed</th>
                         <th class="r">Reserved</th>
+                        <th class="r">Consumers</th>
                         @if ($hasThroughput)<th class="r">Throughput</th>@endif
                         @if ($hasFailed)<th class="r">Failed</th>@endif
                         @if ($hasWait)<th class="r">Wait</th>@endif
@@ -70,6 +71,7 @@
                             <td class="r mono"><span style="font-weight: 600; color: {{ $q['pending'] > 300 ? 'var(--warn)' : 'var(--text)' }};">{{ Format::int($q['pending']) }}</span></td>
                             <td class="r mono muted">{{ $q['delayed'] ?: '–' }}</td>
                             <td class="r mono muted">{{ $q['reserved'] ?: '–' }}</td>
+                            <td class="r mono muted" @if (($q['idle'] ?? null) !== null) title="last active {{ Format::dur((int) round($q['idle'] / 1000)) }} ago" @endif>{{ ($q['consumers'] ?? 0) ?: '–' }}</td>
                             @if ($hasThroughput)<td class="r mono" style="color: var(--accent);">{{ $q['throughput'] !== null ? Format::num($q['throughput'], 1).'/min' : '–' }}</td>@endif
                             @if ($hasFailed)
                                 <td class="r mono">

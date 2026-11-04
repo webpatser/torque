@@ -87,9 +87,33 @@ it('monitors the stream workers use', function (bool $cluster, string $configure
     $this->redis->execute('XREADGROUP', 'GROUP', $group, 'consumer', 'COUNT', '1', 'STREAMS', $streamKey, '>');
     $this->redis->execute('ZADD', $streamKey.':delayed', '1', 'job');
 
-    expect(torque_monitor_queue_lines())->toContain(sprintf('  │ %-18s │ %6s │ %7s │ %7s │', $configured, '2', '1', '1'));
+    // Waiting, delayed, reserved: one each, the same split the dashboard shows.
+    expect(torque_monitor_queue_lines())->toContain(sprintf('  │ %-18s │ %7s │ %7s │ %8s │', $configured, '1', '1', '1'));
 })->with([
     'cluster, plain name' => [true, 'capped', '{capped}'],
     'cluster, tagged name' => [true, '{capped}', '{capped}'],
     'no cluster' => [false, 'capped', 'capped'],
 ]);
+
+it('shows the same waiting, delayed and reserved split in torque:status', function () {
+    config(['torque.redis.cluster' => false, 'torque.streams' => ['capped' => []]]);
+
+    $streamKey = $this->prefix.'capped';
+    $group = config('torque.consumer_group');
+
+    $this->redis->execute('XGROUP', 'CREATE', $streamKey, $group, '$', 'MKSTREAM');
+    $this->redis->execute('XADD', $streamKey, '*', 'payload', 'claimed');
+    $this->redis->execute('XADD', $streamKey, '*', 'payload', 'waiting');
+    $this->redis->execute('XADD', $streamKey, '*', 'payload', 'waiting');
+    $this->redis->execute('XREADGROUP', 'GROUP', $group, 'consumer', 'COUNT', '1', 'STREAMS', $streamKey, '>');
+    $this->redis->execute('ZADD', $streamKey.':delayed', '1', 'job');
+    $this->redis->execute('ZADD', $streamKey.':delayed', '2', 'job2');
+    $this->redis->execute('ZADD', $streamKey.':delayed', '3', 'job3');
+
+    Artisan::call('torque:status');
+    $output = Artisan::output();
+
+    expect($output)->toMatch('/Waiting\s*\.*\s*2\b/')
+        ->and($output)->toMatch('/Delayed\s*\.*\s*3\b/')
+        ->and($output)->toMatch('/Reserved\s*\.*\s*1\b/');
+});

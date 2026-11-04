@@ -1322,7 +1322,7 @@ LUA;
      * Gauge samples for this tick: the fleet numbers plus the queue depth.
      *
      * Depth is the one figure the aggregate cannot supply, so it is probed here
-     * with an XPENDING and a ZCARD per stream. A stream whose consumer group
+     * with one script call per stream. A stream whose consumer group
      * does not exist yet must not cost us the rest of the samples, hence the
      * per-stream rescue.
      *
@@ -1337,8 +1337,10 @@ LUA;
 
         if ($probe !== null) {
             foreach (array_keys((array) ($this->config['streams'] ?? [])) as $stream) {
-                $pending += (int) rescue(fn (): int => $probe->pendingSize((string) $stream), 0, false);
-                $delayed += (int) rescue(fn (): int => $probe->delayedSize((string) $stream), 0, false);
+                // One round trip per stream; pending is the waiting count.
+                $depths = rescue(fn (): array => $probe->depths((string) $stream), null, false);
+                $pending += (int) ($depths['waiting'] ?? 0);
+                $delayed += (int) ($depths['delayed'] ?? 0);
             }
         }
 

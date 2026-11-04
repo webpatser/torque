@@ -274,44 +274,33 @@ final class TorqueMonitorCommand extends Command
         $this->bufferLine();
         $this->bufferLine("  \033[1mQueues\033[0m");
 
-        $this->bufferLine('  ┌'.str_repeat('─', 20).'┬'.str_repeat('─', 8).'┬'.str_repeat('─', 9).'┬'.str_repeat('─', 9).'┐');
+        $this->bufferLine('  ┌'.str_repeat('─', 20).'┬'.str_repeat('─', 9).'┬'.str_repeat('─', 9).'┬'.str_repeat('─', 10).'┐');
         $this->bufferLine(sprintf(
-            '  │ %-18s │ %6s │ %7s │ %7s │',
-            'Queue', 'Size', 'Pending', 'Delayed',
+            '  │ %-18s │ %7s │ %7s │ %8s │',
+            'Queue', 'Waiting', 'Delayed', 'Reserved',
         ));
-        $this->bufferLine('  ├'.str_repeat('─', 20).'┼'.str_repeat('─', 8).'┼'.str_repeat('─', 9).'┼'.str_repeat('─', 9).'┤');
+        $this->bufferLine('  ├'.str_repeat('─', 20).'┼'.str_repeat('─', 9).'┼'.str_repeat('─', 9).'┼'.str_repeat('─', 10).'┤');
 
         try {
-            $redis = createRedisClient($redisUri);
             $streamQueue = StreamQueueResolver::make();
 
             foreach (array_keys($streams) as $queue) {
-                $streamKey = $streamQueue->getStreamKey((string) $queue);
-                $consumerGroup = $config['consumer_group'] ?? 'torque';
-
-                $size = (int) $redis->execute('XLEN', $streamKey);
-                $delayed = (int) $redis->execute('ZCARD', $streamKey.':delayed');
-
-                $pending = 0;
-                try {
-                    $result = $redis->execute('XPENDING', $streamKey, $consumerGroup);
-                    $pending = (int) ($result[0] ?? 0);
-                } catch (\Throwable) {
-                }
+                // The same split as the dashboard: waiting, delayed, reserved.
+                $depths = $streamQueue->depths((string) $queue);
 
                 $this->bufferLine(sprintf(
-                    '  │ %-18s │ %6s │ %7s │ %7s │',
+                    '  │ %-18s │ %7s │ %7s │ %8s │',
                     $queue,
-                    number_format($size),
-                    number_format($pending),
-                    number_format($delayed),
+                    number_format($depths['waiting']),
+                    number_format($depths['delayed']),
+                    number_format($depths['reserved']),
                 ));
             }
         } catch (\Throwable) {
-            $this->bufferLine("  │ \033[2mRedis unavailable\033[0m".str_repeat(' ', 27).'│');
+            $this->bufferLine("  │ \033[2mRedis unavailable\033[0m".str_repeat(' ', 30).'│');
         }
 
-        $this->bufferLine('  └'.str_repeat('─', 20).'┴'.str_repeat('─', 8).'┴'.str_repeat('─', 9).'┴'.str_repeat('─', 9).'┘');
+        $this->bufferLine('  └'.str_repeat('─', 20).'┴'.str_repeat('─', 9).'┴'.str_repeat('─', 9).'┴'.str_repeat('─', 10).'┘');
     }
 
     /**

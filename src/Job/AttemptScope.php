@@ -11,8 +11,9 @@ use Illuminate\Support\Defer\DeferredCallbackCollection;
 /**
  * Everything that belongs to one job attempt in a worker running concurrent jobs
  * in one process. Routed services ({@see AttemptContextRepository},
- * {@see AttemptDeferredCallbacks}) keep their state here instead of on the shared
- * instance the container hands to every slot.
+ * {@see AttemptDeferredCallbacks}, {@see AttemptLogManager},
+ * {@see AttemptAuthManager}, {@see AttemptMemoizedCache}) keep their state here
+ * instead of on the shared instance the container hands to every slot.
  *
  * The scope of the current Fiber lives in {@see CoroutineContext}. A job's own
  * child Fibers have no link to the slot's Fiber, so one {@see FiberContext} hook
@@ -45,6 +46,37 @@ final class AttemptScope
     public array $context = ['data' => [], 'hidden' => []];
 
     public DeferredCallbackCollection $deferredCallbacks;
+
+    /**
+     * The context of each {@see AttemptLogger}, keyed by channel name.
+     *
+     * @var array<string, array<string, mixed>>
+     */
+    public array $logContext = [];
+
+    /**
+     * The shared context of {@see AttemptLogManager}, null until first used.
+     *
+     * @var array<string, mixed>|null
+     */
+    public ?array $logSharedContext = null;
+
+    /**
+     * The guards of {@see AttemptAuthManager}, keyed by guard name.
+     *
+     * @var array<string, mixed>
+     */
+    public array $authGuards = [];
+
+    /** The user resolver of {@see AttemptAuthManager}, null until first used. */
+    public ?Closure $authUserResolver = null;
+
+    /**
+     * The repositories of {@see AttemptMemoizedCache}, keyed by store name.
+     *
+     * @var array<string, mixed>
+     */
+    public array $memoizedCaches = [];
 
     public function __construct()
     {
@@ -137,9 +169,19 @@ final class AttemptScope
     /**
      * Drop what was written outside any attempt. Without this, it would stay
      * until the worker rotates, since no job's hydrate reaches the ambient scope.
+     *
+     * The guards stay: a stock worker does not reset them either, and attempts
+     * clone theirs from these.
      */
     public static function flushAmbient(): void
     {
+        $previous = self::$ambient;
+
         self::$ambient = null;
+
+        if ($previous !== null) {
+            self::ambient()->authGuards = $previous->authGuards;
+            self::ambient()->authUserResolver = $previous->authUserResolver;
+        }
     }
 }
