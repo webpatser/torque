@@ -17,6 +17,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Stream\JobStreamRecorder;
+use Webpatser\Torque\Stream\JobTagExtractor;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -378,6 +379,35 @@ LUA;
     // -------------------------------------------------------------------------
 
     /**
+     * Add the job's tags to its payload, the one place the real object is at hand.
+     *
+     * An encrypted job gets none: plaintext model ids would defeat the encryption.
+     * After the parent, so a tags() that changes the job cannot reach the serialized
+     * command. A job with no tags gets no field.
+     *
+     * @param  object  $job
+     * @param  string  $queue
+     * @return array<string, mixed>
+     */
+    #[\Override]
+    protected function createObjectPayload($job, $queue)
+    {
+        $payload = parent::createObjectPayload($job, $queue);
+
+        if ($this->jobShouldBeEncrypted($job)) {
+            return $payload;
+        }
+
+        $tags = JobTagExtractor::fromJob($job);
+
+        if ($tags !== []) {
+            $payload[JobTagExtractor::PAYLOAD_KEY] = $tags;
+        }
+
+        return $payload;
+    }
+
+    /**
      * Push a new job onto the queue.
      *
      * @param  object|string  $job
@@ -445,6 +475,7 @@ LUA;
                     $decoded['uuid'],
                     $this->getQueue($queue),
                     $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
+                    JobTagExtractor::fromPayload($decoded),
                 );
             }
         } catch (\Throwable) {

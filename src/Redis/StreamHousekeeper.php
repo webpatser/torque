@@ -291,8 +291,9 @@ final class StreamHousekeeper
      *
      *  - `job_streams`: per-job event streams with no expiry whose last event
      *    is older than `job_streams.ttl` plus {@see ORPHAN_MARGIN_SECONDS}.
-     *    Only terminal events set an EXPIRE, so every job killed mid-flight by
-     *    an OOM restart or a deploy leaked its stream forever.
+     *    Only streams with no TTL are swept. The `started` event sets a 7-day
+     *    safety TTL, so a job killed mid-flight by an OOM restart or a deploy
+     *    keeps its stream for up to 7 days instead of being swept here.
      *  - `index_members`: entries in the `jobs:active` / `jobs:recent` sorted
      *    sets whose job stream no longer exists.
      *  - `dead_letter`: entries dropped by the normal TTL and cap policy.
@@ -371,8 +372,9 @@ final class StreamHousekeeper
 
         foreach ($this->scan($this->prefix.'job:*') as $key) {
             try {
-                // -1 is "no expiry": exactly the leak. Streams that reached a
-                // terminal event carry a TTL and expire on their own.
+                // -1 is "no expiry": only streams from older versions. Streams
+                // with a TTL (the 7-day safety TTL set on `started`, or a
+                // terminal event's EXPIRE) expire on their own.
                 if ((int) $this->redis()->execute('TTL', $key) !== -1) {
                     continue;
                 }

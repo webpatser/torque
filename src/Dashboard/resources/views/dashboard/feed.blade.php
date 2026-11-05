@@ -16,6 +16,7 @@
                      retention holds rather than a guaranteed window. --}}
                 <span class="sub">{{ $window->short }} · newest first</span>
                 <div class="grow"></div>
+                <input type="text" class="mono" wire:model.live.debounce.400ms="tag" placeholder="tag, in latest 100 jobs" title="Exact tag match, searching the latest 100 jobs" aria-label="Filter by exact tag, searching the latest 100 jobs" style="width: 170px; font-size: 11px; margin-right: 8px;">
                 <div class="seg">
                     @foreach ($segments as [$key, $label])
                         <button type="button" wire:click="setFilter('{{ $key }}')" @class(['on' => $filter === $key])>
@@ -45,6 +46,9 @@
                                     <div class="mono faint" style="font-size: 10px; margin-top: 2px;">
                                         {{ \Illuminate\Support\Str::substr($j['id'], 0, 8) }}@if ($j['attempt'] > 1)<span style="color: var(--warn);"> · attempt {{ $j['attempt'] }}/{{ $j['maxTries'] }}</span>@endif
                                     </div>
+                                    @if ($j['tags'] !== [])
+                                        <div class="mono faint" style="font-size: 10px; margin-top: 2px;">{{ implode(' · ', array_slice($j['tags'], 0, 5)) }}@if (count($j['tags']) > 5) · +{{ count($j['tags']) - 5 }}@endif</div>
+                                    @endif
                                 </td>
                                 <td class="mono muted" style="font-size: 11.5px;">{{ $j['queue'] }}</td>
                                 <td class="mono faint" style="font-size: 11px;">{{ $j['worker'] ?: '–' }}</td>

@@ -112,12 +112,12 @@ it('sets TTL on terminal events', function () {
         ttl: 60,
     );
 
-    // Non-terminal event — no TTL.
+    // Started: the long safety TTL, in case no terminal event ever comes.
     $recorder->record($uuid, 'started', ['worker' => 'test']);
     $ttl = (int) $redis->execute('TTL', $key);
-    expect($ttl)->toBe(-1); // No expiry.
+    expect($ttl)->toBeGreaterThan(60)->toBeLessThanOrEqual(604800);
 
-    // Terminal event — TTL set.
+    // Terminal event: the short TTL.
     $recorder->record($uuid, 'completed', ['duration_ms' => '100'], terminal: true);
     $ttl = (int) $redis->execute('TTL', $key);
     expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(60);

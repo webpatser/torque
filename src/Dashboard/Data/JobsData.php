@@ -21,7 +21,7 @@ final class JobsData
      * @param  int|null  $since  Unix timestamp; null lists the whole tail.
      * @return list<array<string, mixed>>
      */
-    public function list(string $filter = 'all', ?int $since = null): array
+    public function list(string $filter = 'all', ?int $since = null, ?string $tag = null): array
     {
         $jobs = match ($filter) {
             'active', 'queued' => $this->jobStream->recentJobs('active', 100, $since),
@@ -30,8 +30,15 @@ final class JobsData
             default => $this->jobStream->recentJobs(null, 100, $since),
         };
 
+        if ($tag !== null && $tag !== '') {
+            $jobs = array_values(array_filter(
+                $jobs,
+                static fn (array $job): bool => in_array($tag, self::tagsOf($job), true),
+            ));
+        }
+
         $summaries = array_map(
-            static fn (array $job): array => JobPresenter::fromRecent($job),
+            static fn (array $job): array => JobPresenter::fromRecent($job) + ['tags' => self::tagsOf($job)],
             $jobs,
         );
 
@@ -43,6 +50,26 @@ final class JobsData
         }
 
         return $summaries;
+    }
+
+    /**
+     * Tags of a listed job: every event of an attempt carries them, so its last
+     * event has them, or its first when something else wrote the last.
+     *
+     * @param  array<string, mixed>  $job
+     * @return list<string>
+     */
+    private static function tagsOf(array $job): array
+    {
+        foreach (['last_event', 'first_event'] as $which) {
+            $raw = $job[$which]['data']['tags'] ?? null;
+
+            if (is_string($raw) && is_array($tags = json_decode($raw, true))) {
+                return array_values(array_filter($tags, 'is_string'));
+            }
+        }
+
+        return [];
     }
 
     /**

@@ -71,6 +71,7 @@ final class TorqueDashboardController
                     Route::get('jobs', Jobs::class)->name('torque.jobs');
                     Route::get('jobs/{uuid}', Inspector::class)->name('torque.inspector.job');
                     Route::get('dead', Dead::class)->name('torque.dead');
+                    Route::get('batches', Livewire\Batches::class)->name('torque.batches');
                 });
             });
     }

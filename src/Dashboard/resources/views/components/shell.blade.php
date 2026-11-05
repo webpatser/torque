@@ -14,6 +14,7 @@
         ['id' => 'queues', 'route' => 'torque.queues', 'icon' => 'queues', 'label' => 'Queues'],
         ['id' => 'feed', 'route' => 'torque.feed', 'icon' => 'feed', 'label' => 'Live feed', 'live' => true],
         ['id' => 'dead', 'route' => 'torque.dead', 'icon' => 'dead', 'label' => 'Dead-letter', 'badge' => $deadCount > 0 ? (string) $deadCount : null, 'alert' => $deadCount > 0],
+        ['id' => 'batches', 'route' => 'torque.batches', 'icon' => 'queues', 'label' => 'Batches'],
     ];
 
     $pollOpts = [

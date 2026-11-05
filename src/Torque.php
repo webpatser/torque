@@ -30,6 +30,38 @@ final class Torque
      */
     private static ?string $cspNonce = null;
 
+    private static ?string $mailRoute = null;
+
+    private static ?string $slackRoute = null;
+
+    /**
+     * Send long-wait alerts (the `waits` config) to this address. Null clears it.
+     */
+    public static function routeMailNotificationsTo(?string $email): void
+    {
+        self::$mailRoute = $email;
+    }
+
+    /**
+     * Send long-wait alerts to this Slack route. Null clears it. Needs
+     * laravel/slack-notification-channel; without it the alert is skipped
+     * with a log line.
+     */
+    public static function routeSlackNotificationsTo(?string $url): void
+    {
+        self::$slackRoute = $url;
+    }
+
+    public static function mailNotificationRoute(): ?string
+    {
+        return self::$mailRoute;
+    }
+
+    public static function slackNotificationRoute(): ?string
+    {
+        return self::$slackRoute;
+    }
+
     /**
      * Inline the compiled dashboard stylesheet.
      *

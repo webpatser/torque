@@ -5,6 +5,35 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-05
+
+Security fix for the dashboard, plus long-wait alerts, a Batches page, job tags and silenced jobs. Read Security first; `UPGRADE.md` has the new config keys and the job stream changes.
+
+### Security
+- **The dashboard's `viewTorque` gate was checked on page load but not on Livewire update requests.** A signed-in user holding a valid page snapshot, such as an admin whose access was revoked, could keep calling dashboard actions on the affected versions, including `Dead` retry and purge. Confirmed in git: the Livewire dashboard components first shipped in v0.12.0, and no release from v0.12.0 through v1.3.0 checks the gate on updates. Upgrade to 1.4.0.
+- **Fixed:** the check now runs on every mount and every update, before any property update or action, and fails closed. A host page that embeds a `torque.*` component gets a 403 on mount when the user fails the gate.
+
+### Added
+- **Long-wait alerts.** Set `waits` per queue in seconds (off by default, `['emails' => 60]`). The master checks every 30 seconds, only the listed queues, and compares the age of the oldest waiting job. A queue over its threshold dispatches `LongWaitDetected` and sends notifications once per episode. It alerts again after 15 minutes while still over, after 5 minutes if the alert failed, or after it recovered. Route notifications from a service provider with `Torque::routeMailNotificationsTo()` and `Torque::routeSlackNotificationsTo()`.
+- **Slack alerts** need `laravel/slack-notification-channel` (listed under `suggest`). A webhook URL route gets the legacy Slack message, any other route gets Block Kit. Without the package the Slack step is skipped with a log line.
+- **Batches page** in the dashboard (`torque.batches`): read-only list with a detail panel. It needs `php artisan make:queue-batches-table`. The detail panel shows at most 100 failed job ids.
+- **Job tags.** Tags are computed at dispatch on the real job object and stored in the payload. A `tags()` method wins and runs in the dispatching process, so it can run queries there. Without it, public properties holding an Eloquent model or a collection of models become `Model:key` tags; protected properties, arrays and nested objects do not. At most 50 tags of 191 characters. `ShouldBeEncrypted` jobs have no tags. Jobs queued before the upgrade have none until they drain. The live feed has an exact-match tag filter over its latest 100 jobs.
+- **`Silenced`** contract, plus `silenced` (job classes) and `silenced_tags` config. A silenced job's success is omitted from the job records: it shows as queued or running until it finishes, then vanishes from the feed. Failures are always recorded. Metrics and `JobProcessed` are unaffected, and `silenced_tags` cannot match encrypted jobs.
+
+### Changed
+- **Long-wait alerts run in a short-lived child process** that boots the app fresh, so the master never waits on a listener or a mail server. Register `LongWaitDetected` listeners and notification routes in a service provider. One alert can take up to 60 seconds, shared across its steps (event, mail, Slack); a step that hangs is killed. A throwing listener can run again for the same episode. Failures appear in the master's output and the app log. Each host's master alerts on its own, and a master restart may re-fire once for an ongoing episode.
+
+### Behaviour changes
+- **Job stream history is stricter.** A self-release no longer records `completed`. A job failed with `fail()` no longer records `completed` after `failed`. A permanently failed job's status is `failed` rather than `exception`, and a second exception thrown after `fail()` is not written to the stream.
+- **A job waiting longer than `job_streams.ttl` loses its `queued` event**, since the queued event now carries the stream's TTL until a worker starts the job.
+- **`job_streams.enabled = false` also skips the tag inspection.**
+- **A query error in `tags()` inside a database transaction now propagates to the dispatcher**, because on Postgres it has aborted the transaction and swallowing it would turn the `COMMIT` into a silent `ROLLBACK`. Any other `tags()` failure still warns and dispatches without tags.
+- **A silenced job that succeeds drops its whole record**, including events of earlier failed attempts.
+
+### Parity
+- Horizon feature gaps recorded in the 1.2.0 review (long-wait alerts, batches list, tags, silenced jobs) are now covered, each built from documented behaviour.
+- No new Horizon release was reviewed for this entry.
+
 ## [1.3.0] - 2026-11-04
 
 Job timeouts, redelivery counting and a blocked-loop watchdog, all opt-in. Two changes apply without opting in: entries a stopping worker never started return to the stream, and `Queue::popUsing()` works. `UPGRADE.md` has the new keys and what 2.0 will flip.
@@ -717,7 +746,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/webpatser/torque/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/webpatser/torque/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/webpatser/torque/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/webpatser/torque/compare/v1.1.1...v1.1.2

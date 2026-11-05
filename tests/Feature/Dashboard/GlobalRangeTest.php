@@ -35,19 +35,19 @@ beforeEach(function () {
 });
 
 it('defaults to the configured range and remembers a change for the session', function () {
-    Livewire::test(Overview::class)
+    Livewire::actingAs(torqueTestUser())->test(Overview::class)
         ->assertSet('range', '1h')
         ->call('setRange', '90d')
         ->assertSet('range', '90d');
 
     // A different screen, mounted fresh, opens on the same window.
-    Livewire::test(Queues::class)->assertSet('range', '90d');
-    Livewire::test(Jobs::class)->assertSet('range', '90d');
-    Livewire::test(Workers::class)->assertSet('range', '90d');
+    Livewire::actingAs(torqueTestUser())->test(Queues::class)->assertSet('range', '90d');
+    Livewire::actingAs(torqueTestUser())->test(Jobs::class)->assertSet('range', '90d');
+    Livewire::actingAs(torqueTestUser())->test(Workers::class)->assertSet('range', '90d');
 });
 
 it('ignores a range it does not know rather than trusting it into the read model', function () {
-    Livewire::test(Overview::class)
+    Livewire::actingAs(torqueTestUser())->test(Overview::class)
         ->call('setRange', '24h')
         ->call('setRange', 'forever')
         ->assertSet('range', '24h');
@@ -55,13 +55,13 @@ it('ignores a range it does not know rather than trusting it into the read model
     // A stale or hand-crafted session value degrades to the default too.
     session(['torque.range' => 'forever']);
 
-    Livewire::test(Queues::class)->assertSet('range', Range::DEFAULT);
+    Livewire::actingAs(torqueTestUser())->test(Queues::class)->assertSet('range', Range::DEFAULT);
 });
 
 it('honours a configured default range on a fresh session', function () {
     config()->set('torque.dashboard.default_range', '7d');
 
-    Livewire::test(Overview::class)->assertSet('range', '7d');
+    Livewire::actingAs(torqueTestUser())->test(Overview::class)->assertSet('range', '7d');
 });
 
 it('renders the picker on every screen that has a time dimension', function () {
@@ -74,7 +74,7 @@ it('renders the picker on every screen that has a time dimension', function () {
 it('leaves the picker out of the job inspector', function () {
     // One job's own event stream is bounded by that job's life, not by a
     // fleet-wide clock, so a picker there would describe nothing.
-    $html = Livewire::test(Inspector::class)->html();
+    $html = Livewire::actingAs(torqueTestUser())->test(Inspector::class)->html();
 
     expect($html)->not->toContain('data-torque-method="setRange"');
 });

@@ -337,6 +337,36 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Long-wait alerts
+    |--------------------------------------------------------------------------
+    | Per-queue threshold in seconds for the oldest job still waiting to be
+    | picked up, e.g. ['emails' => 60]. The master checks every 30 seconds,
+    | and only the queues listed here. A queue over its threshold dispatches
+    | Webpatser\Torque\Events\LongWaitDetected and sends notifications once;
+    | it alerts again after it recovered, or after 15 minutes still over.
+    | 0 or absent turns a queue off, and the default is off for all.
+    |
+    | Route the notifications in a service provider with
+    | Torque::routeMailNotificationsTo('ops@example.com') and
+    | Torque::routeSlackNotificationsTo($url) (Slack needs
+    | laravel/slack-notification-channel).
+    */
+    'waits' => [
+        // 'default' => 60,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Long-wait alert limit (seconds)
+    |--------------------------------------------------------------------------
+    | How long one alert may take, booting the app included, shared across the
+    | event and the notifications. Each runs in a process of its own and is killed
+    | at its share, so a hanging listener or mail server costs the next one nothing.
+    */
+    'long_wait_alert_seconds' => (int) env('TORQUE_LONG_WAIT_ALERT_SECONDS', 60),
+
+    /*
+    |--------------------------------------------------------------------------
     | Circuit breaker
     |--------------------------------------------------------------------------
     | Stops a stream from being polled when its jobs are failing permanently
@@ -375,6 +405,25 @@ return [
         'ttl' => 300,
         'max_events' => 1000,
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Silenced jobs
+    |--------------------------------------------------------------------------
+    | Successful runs of silenced jobs are left out of the dashboard's job
+    | records (queued and running states show until they finish). Failures are
+    | always recorded. A job is silenced when it implements
+    | Webpatser\Torque\Contracts\Silenced, is listed in `silenced`, or carries
+    | a tag listed in `silenced_tags`.
+    |
+    | silenced:      list of job class names, e.g. [App\Jobs\Heartbeat::class].
+    | silenced_tags: list of tags (explicit tags() or auto-tags such as
+    |                'App\Models\User:42'); any match silences the job. Tags are
+    |                worked out at dispatch and kept in the payload; encrypted
+    |                jobs have none.
+    */
+    'silenced' => [],
+    'silenced_tags' => [],
 
     /*
     |--------------------------------------------------------------------------

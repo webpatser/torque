@@ -12,6 +12,7 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Redis\UpgradeRunner;
+use Webpatser\Torque\Support\LongWaitGate;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
@@ -83,6 +84,10 @@ LUA;
      * replacement acquires it lazily from the monitor loop once the old
      * master exits.
      *
+     * A flock belongs to the open file, which a fork shares, so the handle is
+     * close-on-exec: a worker or alert child outliving the master must not
+     * keep the lock from the next one.
+     *
      * @var resource|null
      */
     private $lockHandle = null;
@@ -97,6 +102,33 @@ LUA;
      * without waiting out a full interval).
      */
     private ?int $housekeepingDueAt = null;
+
+    /** Seconds between long-wait checks. */
+    private const int LONG_WAIT_CHECK_INTERVAL = 30;
+
+    /** Clock time of the next long-wait check, null before the first. */
+    private ?float $longWaitDueAt = null;
+
+    private ?LongWaitGate $longWaitGate = null;
+
+    /** Seconds an alert child may take, unless `long_wait_alert_seconds` says otherwise. */
+    private const int LONG_WAIT_ALERT_SECONDS = 60;
+
+    /** Seconds past that limit before the master kills a child that did not end itself. */
+    private const int LONG_WAIT_ALERT_KILL_SLACK = 5;
+
+    /** Alert children at once; a queue over the cap gets its turn at a later check. */
+    private const int LONG_WAIT_ALERT_MAX_CHILDREN = 4;
+
+    /** Seconds after a failed alert before the next one, instead of the cooldown. */
+    private const int LONG_WAIT_ALERT_RETRY_SECONDS = 300;
+
+    /**
+     * Running alert children, which are no workers: never counted, never respawned.
+     *
+     * @var array<int, array{queue: string, killAt: int, killed: bool}>
+     */
+    public private(set) array $longWaitAlerts = [];
 
     /** @var array<string, string> Where the housekeeper's capped sweep continues at the next run. */
     private array $redeliveryCursors = [];
@@ -407,6 +439,12 @@ LUA;
             // Reap every exited child (SIGCHLD coalesces — one delivery may
             // cover multiple exits).
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
+                if (isset($this->longWaitAlerts[$pid])) {
+                    $this->forgetLongWaitAlert($pid, $status);
+
+                    continue;
+                }
+
                 $this->forgetWorker($pid);
 
                 if (pcntl_wifexited($status)) {
@@ -433,6 +471,8 @@ LUA;
                 }
             }
 
+            $this->superviseLongWaitAlerts();
+
             // Promote a SIGUSR2 drain request into an active drain timer
             // and fire its watchdog if the grace period has elapsed.
             $this->handleDrainTick();
@@ -449,6 +489,7 @@ LUA;
                 $this->maintainLease();
                 $this->publishAggregateMetrics();
                 $this->handleHousekeepingTick();
+                $this->handleLongWaitTick();
 
                 if ($this->autoScaler !== null) {
                     $this->evaluateAutoscale();
@@ -1111,6 +1152,190 @@ LUA;
     }
 
     /**
+     * Alert when a configured queue's oldest waiting job passes its `waits`
+     * threshold. Only queues with a threshold are read, one call each, at most
+     * every {@see LONG_WAIT_CHECK_INTERVAL} seconds. Best-effort like
+     * {@see handleHousekeepingTick()}: a Redis error logs one line and the
+     * timer is re-armed.
+     *
+     * Public, with an injectable clock, so it runs without the monitor loop.
+     */
+    public function handleLongWaitTick(?float $now = null): void
+    {
+        $thresholds = LongWaitGate::thresholds((array) ($this->config['waits'] ?? []));
+
+        if ($thresholds === []) {
+            return;
+        }
+
+        $now ??= microtime(true);
+
+        $this->superviseLongWaitAlerts();
+
+        // A drain pauses pickup, so age keeps rising without anything being wrong.
+        if ($this->shouldStop || $this->draining || $this->drainRequested) {
+            return;
+        }
+
+        if ($this->longWaitDueAt !== null && $now < $this->longWaitDueAt) {
+            return;
+        }
+
+        $this->longWaitDueAt = $now + self::LONG_WAIT_CHECK_INTERVAL;
+        $gate = $this->longWaitGate ??= new LongWaitGate;
+
+        try {
+            $queue = new StreamQueue(
+                redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+                default: 'default',
+                prefix: $this->config['redis']['prefix'] ?? 'torque:',
+                consumerGroup: $this->config['consumer_group'] ?? 'torque',
+                cluster: (bool) ($this->config['redis']['cluster'] ?? false),
+                serializer: (string) ($this->config['serializer'] ?? 'json'),
+            );
+
+            foreach ($thresholds as $name => $threshold) {
+                $createdAt = $queue->creationTimeOfOldestPendingJob($name);
+                $age = $createdAt === null ? null : max(0.0, $now - $createdAt);
+
+                if ($gate->shouldAlert($name, $age, $threshold, $now)
+                    && ! $this->alertLongWait($name, (int) floor($age ?? 0), $threshold)) {
+                    $gate->rearm($name);
+                }
+            }
+        } catch (\Throwable $e) {
+            ($this->logger)("Long-wait check failed ({$e->getMessage()}); retrying in ".self::LONG_WAIT_CHECK_INTERVAL.'s.');
+        }
+    }
+
+    /**
+     * Log the alert and leave the event and the notifications to a child process.
+     *
+     * A listener or a mail server can take as long as it likes, and in this loop
+     * that would stop reaping, respawning, drain and the watchdog. The child is
+     * fork + exec like a worker, not proc_open: its handle would block in waitpid
+     * when destroyed, so a master exiting would wait for a hanging alert.
+     *
+     * The child gets its own session, so that a kill reaches whatever it started,
+     * and an empty signal mask, since exec keeps the mask {@see monitor()} blocks
+     * SIGTERM with. If the master dies first, the child's own limit still applies,
+     * and an alarm set here covers a boot that hangs before the command can start
+     * counting: it survives exec, and SIGALRM's default action ends the process, so
+     * nothing has to handle it. Set to default first, as an ignored signal stays
+     * ignored through exec. PHP on Apple Silicon runs its own time limit on SIGALRM:
+     * there it is a fatal error at PHP's next instruction, so a hang inside a C call
+     * lasts until the master's kill.
+     *
+     * @return bool False if no child was started, so the gate can be re-armed.
+     */
+    private function alertLongWait(string $queue, int $seconds, int $threshold): bool
+    {
+        ($this->logger)("WARN Long wait on queue {$queue}: oldest job has waited {$seconds}s (threshold {$threshold}s).");
+
+        if (count($this->longWaitAlerts) >= self::LONG_WAIT_ALERT_MAX_CHILDREN) {
+            ($this->logger)("Long-wait alert for queue {$queue} not started: ".self::LONG_WAIT_ALERT_MAX_CHILDREN.' alerts are still running; trying again at the next check.');
+
+            return false;
+        }
+
+        $limit = max(1, (int) ($this->config['long_wait_alert_seconds'] ?? self::LONG_WAIT_ALERT_SECONDS));
+        $pid = pcntl_fork();
+
+        if ($pid === -1) {
+            ($this->logger)("Long-wait alert for queue {$queue} not started: fork failed; trying again at the next check.");
+
+            return false;
+        }
+
+        if ($pid === 0) {
+            @posix_setsid();
+            pcntl_sigprocmask(SIG_SETMASK, []);
+            pcntl_signal(SIGALRM, SIG_DFL);
+            pcntl_alarm($limit + self::LONG_WAIT_ALERT_KILL_SLACK);
+
+            pcntl_exec(PHP_BINARY, [
+                $this->artisanPath,
+                'torque:long-wait-alert',
+                $queue,
+                (string) $seconds,
+                (string) $threshold,
+                "--limit={$limit}",
+            ]);
+
+            // Not exit(): that would run the shutdown work of a copy of the master.
+            // The master reads a SIGKILL it did not send as a child that never ran.
+            posix_kill((int) getmypid(), SIGKILL);
+        }
+
+        $this->longWaitAlerts[$pid] = [
+            'queue' => $queue,
+            'killAt' => (int) hrtime(true) + ($limit + self::LONG_WAIT_ALERT_KILL_SLACK) * 1_000_000_000,
+            'killed' => false,
+        ];
+
+        return true;
+    }
+
+    /**
+     * Reap alert children that exited and kill those past their deadline.
+     *
+     * Each is waited for by its own PID, so a worker's exit is never taken here.
+     * A killed child stays listed until it is reaped, which keeps its PID its own.
+     */
+    public function superviseLongWaitAlerts(): void
+    {
+        foreach ($this->longWaitAlerts as $pid => $alert) {
+            $reaped = pcntl_waitpid($pid, $status, WNOHANG);
+
+            if ($reaped === $pid) {
+                $this->forgetLongWaitAlert($pid, $status);
+            } elseif ($reaped === -1) {
+                unset($this->longWaitAlerts[$pid]);
+            } elseif (! $alert['killed'] && hrtime(true) >= $alert['killAt']) {
+                ($this->logger)("Long-wait alert for queue {$alert['queue']} ran past its limit, killing alert child PID {$pid}.");
+                $this->longWaitAlerts[$pid]['killed'] = true;
+                posix_kill(-$pid, SIGKILL);
+                posix_kill($pid, SIGKILL);
+            }
+        }
+    }
+
+    /**
+     * Act on a reaped alert child's exit status, the one result the master sees.
+     *
+     * A failure brings the next alert forward rather than waiting out the cooldown.
+     * Not to the next check: a channel that delivered would then send again every 30s.
+     * A SIGKILL the master did not send means exec failed or the system killed the
+     * child, so most likely nothing ran, and the gate is re-armed outright.
+     */
+    private function forgetLongWaitAlert(int $pid, int $status): void
+    {
+        $alert = $this->longWaitAlerts[$pid];
+
+        unset($this->longWaitAlerts[$pid]);
+
+        $reason = match (true) {
+            pcntl_wifexited($status) => pcntl_wexitstatus($status) === 0 ? null : 'exit code '.pcntl_wexitstatus($status),
+            pcntl_wifsignaled($status) => 'killed by signal '.pcntl_wtermsig($status),
+            default => 'unknown status',
+        };
+
+        if ($reason === null) {
+            return;
+        }
+
+        if (pcntl_wifsignaled($status) && pcntl_wtermsig($status) === SIGKILL && ! $alert['killed']) {
+            $this->longWaitGate?->rearm($alert['queue']);
+            ($this->logger)("Long-wait alert for queue {$alert['queue']} failed ({$reason}); trying again at the next check.");
+
+            return;
+        }
+
+        $this->longWaitGate?->retryAfter($alert['queue'], self::LONG_WAIT_ALERT_RETRY_SECONDS);
+        ($this->logger)("Long-wait alert for queue {$alert['queue']} failed ({$reason}); the next one may come after ".self::LONG_WAIT_ALERT_RETRY_SECONDS.'s.');
+    }
+
+    /**
      * Surface a pre-existing pause at boot: a master starting into a paused
      * queue (deliberate `torque:pause`, or a not-yet-expired drain flag)
      * spawns workers that pick up nothing, which otherwise looks like a
@@ -1301,6 +1526,9 @@ LUA;
      * The lock is held for the process lifetime; the kernel releases it on
      * any exit (including SIGKILL), which makes it the reliable mutual
      * exclusion between masters where pgrep sweeps and PID files are racy.
+     * That holds because of the `e` mode: every child of this process execs,
+     * which closes its copy of the handle, and nothing relies on a child
+     * holding the lock.
      */
     private function tryAcquireMasterLock(): bool
     {
@@ -1313,7 +1541,7 @@ LUA;
         }
 
         $existed = file_exists($path);
-        $handle = @fopen($path, 'c');
+        $handle = @fopen($path, 'ce');
 
         if ($handle === false) {
             // Not "lock held": the file cannot even be opened. Seen in the

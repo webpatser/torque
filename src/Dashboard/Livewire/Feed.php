@@ -22,6 +22,14 @@ final class Feed extends Component
 
     public string $filter = 'all';
 
+    /** Exact-match tag filter; empty shows every job. */
+    public string $tag = '';
+
+    public function updatedTag(): void
+    {
+        $this->tag = trim($this->tag);
+    }
+
     public function setFilter(string $filter): void
     {
         $this->filter = $filter;
@@ -33,7 +41,7 @@ final class Feed extends Component
 
         // The index behind this is a rolling tail, so the window narrows what
         // is shown but a long range still shows only what the tail holds.
-        $live = rescue(fn (): array => app(JobsData::class)->list('all', $window->sinceEpoch()), [], false);
+        $live = rescue(fn (): array => app(JobsData::class)->list('all', $window->sinceEpoch(), $this->tag), [], false);
 
         $counts = [
             'all' => count($live),

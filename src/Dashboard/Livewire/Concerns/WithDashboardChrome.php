@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Livewire\Concerns;
 
+use Illuminate\Support\Facades\Gate;
+use Webpatser\Torque\Dashboard\Http\Middleware\Authorize;
 use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -11,9 +13,10 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 /**
  * Shared dashboard chrome state for the full-page Livewire screens.
  *
- * Owns the live-refresh interval (driven by the topbar poll selector and
- * consumed by `wire:poll` in the shell), the global time range every screen
- * reads, and the sidebar badge counts.
+ * Owns the `viewTorque` check on every Livewire request, the live-refresh
+ * interval (driven by the topbar poll selector and consumed by `wire:poll` in
+ * the shell), the global time range every screen reads, and the sidebar badge
+ * counts.
  */
 trait WithDashboardChrome
 {
@@ -45,11 +48,21 @@ trait WithDashboardChrome
     private const string RANGE_SESSION_KEY = 'torque.range';
 
     /**
-     * Seed the poll interval on first load: the interval chosen earlier in this
-     * session wins, then the configured default.
+     * Enforce the `viewTorque` gate, then seed the poll interval on first load:
+     * the interval chosen earlier in this session wins, then the configured
+     * default.
+     *
+     * The gate lives here because boot runs on mount and on every
+     * `/livewire/update`, before any property update or action. The route's
+     * {@see Authorize} middleware is not enough: Livewire does not re-run it on
+     * updates, and persistent middleware only applies when the snapshot's path
+     * still matches a route that has it, so it would fail open for a component
+     * embedded on a host page or a dashboard path that changed.
      */
     public function bootWithDashboardChrome(): void
     {
+        Gate::authorize('viewTorque');
+
         if ($this->pollInterval === null) {
             $remembered = session(self::POLL_SESSION_KEY);
 

@@ -14,6 +14,7 @@
         "webpatser/fledge-fiber": "^13.38"
     },
     "suggest": {
+        "laravel/slack-notification-channel": "Required for Slack long-wait alerts (Torque::routeSlackNotificationsTo()).",
         "ext-igbinary": "Enables ~2x faster job payload encoding when TORQUE_SERIALIZER=igbinary is set, and globally speeds up PHP serialize() (sessions, cache) when igbinary.compact_strings is on."
     },
     "require-dev": {

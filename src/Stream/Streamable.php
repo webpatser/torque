@@ -40,7 +40,7 @@ trait Streamable
         }
 
         try {
-            app(JobStreamRecorder::class)->emitCustom($uuid, $message, $progress, $data);
+            app(JobStreamRecorder::class)->emitCustom($uuid, $message, $progress, $data, $this->job ?? null);
         } catch (\Throwable) {
             // Never break job execution for stream events.
         }

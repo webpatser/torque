@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
+use Illuminate\Support\Facades\Gate;
 use Livewire\Livewire;
 use Webpatser\Torque\Dashboard\Data\DeadLetterData;
 use Webpatser\Torque\Dashboard\Data\JobsData;
@@ -34,6 +35,10 @@ function torqueTestRedis(): RedisClient
 {
     return \Fledge\Async\Redis\createRedisClient(torqueTestRedisUri());
 }
+
+beforeEach(function () {
+    Gate::define('viewTorque', fn ($user): bool => true);
+});
 
 it('builds the overview shape with correct types', function () {
     $publisher = new MetricsPublisher(redisUri: torqueTestRedisUri(), prefix: 'torque-test:');
@@ -301,7 +306,7 @@ it('redacts credentials from dead-letter messages and job events before renderin
         expect($dead['message'])->toContain('***')->not->toContain($credentials)
             ->and($events[0]['data']['exception_message'])->toBe('upstream rejected Basic ***');
 
-        $html = Livewire::test(Inspector::class, ['uuid' => $uuid])->set('tab', 'exception')->html();
+        $html = Livewire::actingAs(torqueTestUser())->test(Inspector::class, ['uuid' => $uuid])->set('tab', 'exception')->html();
 
         expect($html)->not->toContain($credentials);
     } catch (RedisException $e) {
@@ -325,7 +330,7 @@ it('retries a dead-letter entry from the Dead component', function () {
 
         $id = $handler->list(1)[0]['id'];
 
-        Livewire::test(Dead::class)
+        Livewire::actingAs(torqueTestUser())->test(Dead::class)
             ->call('retryOne', $id)
             ->assertOk();
 
@@ -348,7 +353,7 @@ it('purges a dead-letter entry from the Dead component', function () {
 
         $id = $handler->list(1)[0]['id'];
 
-        Livewire::test(Dead::class)
+        Livewire::actingAs(torqueTestUser())->test(Dead::class)
             ->call('purgeOne', $id)
             ->assertOk();
 
@@ -362,14 +367,14 @@ it('purges a dead-letter entry from the Dead component', function () {
 });
 
 it('toggles the live-feed status filter', function () {
-    Livewire::test(Feed::class)
+    Livewire::actingAs(torqueTestUser())->test(Feed::class)
         ->assertSet('filter', 'all')
         ->call('setFilter', 'failed')
         ->assertSet('filter', 'failed');
 });
 
 it('updates the poll interval from the chrome', function () {
-    Livewire::test(Feed::class)
+    Livewire::actingAs(torqueTestUser())->test(Feed::class)
         ->call('setPollInterval', 5000)
         ->assertSet('pollInterval', 5000)
         ->call('setPollInterval', 0)

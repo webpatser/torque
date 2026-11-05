@@ -17,6 +17,8 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 $classes = ['App\Jobs\Slow', 'App\Jobs\Busy', 'App\Jobs\Broken'];
 
 beforeEach(function () use ($classes) {
+    Gate::define('viewTorque', fn ($user): bool => true);
+
     try {
         $redis = torqueRedis();
     } catch (RedisException $e) {
@@ -78,7 +80,7 @@ it('renders a row per job class with runtime and failure figures', function () {
 });
 
 it('sorts server-side and flips direction on a repeated column', function () {
-    $component = Livewire::test(Jobs::class)
+    $component = Livewire::actingAs(torqueTestUser())->test(Jobs::class)
         ->assertSet('sort', 'throughput')
         ->assertSet('direction', 'desc');
 
@@ -113,7 +115,7 @@ it('sorts server-side and flips direction on a repeated column', function () {
 });
 
 it('switches the metric range without touching client state', function () {
-    $component = Livewire::test(Jobs::class)
+    $component = Livewire::actingAs(torqueTestUser())->test(Jobs::class)
         ->assertSet('range', '1h')
         ->assertSee('jobs / minute · last 60 min', escape: false);
 

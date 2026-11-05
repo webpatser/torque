@@ -167,6 +167,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorqueMonitorCommand::class,
                 Console\TorqueFlushCommand::class,
                 Console\TorqueForgetCommand::class,
+                Console\TorqueLongWaitAlertCommand::class,
                 Console\TorquePruneCommand::class,
                 TorqueWorkerCommand::class,
                 Console\TorqueTailCommand::class,

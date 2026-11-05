@@ -2,6 +2,28 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so. `torque:status` shows the recorded data version next to the installed one.
 
+## 1.3.x to 1.4.0
+
+No data step. **Upgrade promptly: the dashboard's `viewTorque` gate was not checked on Livewire update requests in v0.12.0 through v1.3.0**, so a user holding a valid page snapshot, such as an admin whose access was revoked, could keep calling dashboard actions, including `Dead` retry and purge. 1.4.0 checks the gate on every mount and update and fails closed. A host page embedding a `torque.*` component now gets a 403 on mount without the gate.
+
+### New config keys (all optional, defaults apply when absent)
+
+| Key | Default | What it does |
+|---|---|---|
+| `waits` | `[]` | Per-queue long-wait threshold in seconds, e.g. `['emails' => 60]`. Off for queues not listed. Route notifications with `Torque::routeMailNotificationsTo()` and `Torque::routeSlackNotificationsTo()` in a service provider; Slack needs `laravel/slack-notification-channel` |
+| `silenced` | `[]` | Job classes whose successful runs are left out of the job records |
+| `silenced_tags` | `[]` | Tags that silence a job; encrypted jobs have no tags, so they never match |
+
+The Batches page needs `php artisan make:queue-batches-table` and a migration if you have not run batching yet.
+
+### Behaviour changes
+
+- **Job stream history.** A self-release no longer records `completed`. A job failed with `fail()` no longer records `completed` after `failed`. A permanently failed job's status is `failed` rather than `exception`, and a second exception after `fail()` is not written.
+- **A job waiting longer than `job_streams.ttl` loses its `queued` event.**
+- **`job_streams.enabled = false` also skips tag inspection.**
+- **Tags exist only on jobs dispatched after the upgrade.** Jobs already queued have none until they drain.
+- **Long-wait alerts run in a child process.** Register `LongWaitDetected` listeners in a service provider, not in code that only the web request boots.
+
 ## 1.2.x to 1.3.0
 
 No data step. Timeouts, the watchdog and strict attempts stay off until you opt in; the two behaviour changes below apply to every install.

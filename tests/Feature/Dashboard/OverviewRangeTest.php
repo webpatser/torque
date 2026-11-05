@@ -3,12 +3,15 @@
 declare(strict_types=1);
 
 use Fledge\Async\Redis\RedisException;
+use Illuminate\Support\Facades\Gate;
 use Livewire\Livewire;
 use Webpatser\Torque\Dashboard\Data\OverviewData;
 use Webpatser\Torque\Dashboard\Livewire\Overview;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 
 beforeEach(function () {
+    Gate::define('viewTorque', fn ($user): bool => true);
+
     try {
         $redis = torqueRedis();
     } catch (RedisException $e) {
@@ -44,7 +47,7 @@ afterEach(function () {
  * whatever the browser was holding.
  */
 it('defaults to the last hour and switches range through a server round trip', function () {
-    Livewire::test(Overview::class)
+    Livewire::actingAs(torqueTestUser())->test(Overview::class)
         ->assertSet('range', '1h')
         ->assertSee('jobs / minute · last 60 min')
         ->call('setRange', '24h')

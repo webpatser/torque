@@ -463,6 +463,8 @@ Features:
 - Failed jobs list with retry and delete actions (cursor-paginated)
 - Per-job inspector with a timeline of lifecycle events and exception details
 - Live feed with a rolling stream tail and status filters
+- Batches page: read-only list of bus batches with a detail panel (needs `php artisan make:queue-batches-table`; at most 100 failed job ids per view)
+- Tag filter on the live feed (exact match over the latest 100 jobs)
 - Kibana-style configurable poll interval (1s to 30s, or paused)
 
 ### Assets
@@ -486,7 +488,7 @@ The dashboard chrome uses no Alpine expressions on purpose: Alpine compiles ever
 
 ### Authorization
 
-The gate `viewTorque` is checked on every dashboard route (overview, workers, queues, feed, inspector, dead-letter), so no screen or Livewire action is reachable by users who would fail the gate. Define it in your `AuthServiceProvider`:
+The gate `viewTorque` is checked on every dashboard route (overview, workers, queues, feed, inspector, dead-letter, batches) and again on every Livewire mount and update, so no screen or Livewire action is reachable by users who fail the gate, including a user whose access was revoked after the page loaded. A host page embedding a `torque.*` component gets a 403 on mount without the gate. Define it in your `AuthServiceProvider`:
 
 ```php
 Gate::define('viewTorque', fn (User $user) => $user->isAdmin());
@@ -600,6 +602,10 @@ Redis Streams (not LISTs like Horizon) provide:
 | Eloquent in jobs         | Full support            | Works, but blocks Fibers; use `MysqlPool` for fan-out |
 | Laravel Queue contract   | Full                    | Full                                  |
 | Job batches              | Yes                     | Yes                                   |
+| Batches page             | Yes                     | Read-only list and detail; needs `make:queue-batches-table` |
+| Long-wait alerts         | Yes                     | `waits` per queue, `LongWaitDetected`, mail and Slack routes |
+| Job tags                 | Yes                     | `tags()` or model auto-tags, stored at dispatch; feed filter |
+| Silenced jobs            | Yes                     | `Silenced` contract, `silenced`, `silenced_tags` |
 | Delayed jobs             | Redis sorted set        | Redis sorted set                      |
 | Redis Cluster            | Yes                     | Yes                                   |
 | Dashboard                | Blade + polling         | Livewire 4 + Blade, `wire:poll` live  |
@@ -617,6 +623,34 @@ Redis Streams (not LISTs like Horizon) provide:
 | Job interrupt event | `JobInterrupted` per `Interruptible` job on SIGTERM/SIGINT (13.31) | Same event per in-flight slot, carrying the `StreamJob` and signal |
 | Job run time | `JobProcessed::$duration` in milliseconds (13.34) | Same, timed around `fire()` per slot |
 | Crash counting | `#[CountCrashesAsExceptions]` counts a worker death mid-job against `maxExceptions` (13.34) | Crashes are counted per slot against `maxExceptions`, and so are thrown exceptions; `max_retries` is only the limit for a job that declares no `$tries` or `retryUntil`. A forced drain exit is not counted as a crash. Known limitation: a job still running past `retry_after` that another worker steals (XAUTOCLAIM) reuses its attempt number and is counted as a crash, so set `retry_after` longer than the longest job |
+
+### Long-wait alerts
+
+Get told when a queue stops draining. Set a threshold in seconds per queue in `config/torque.php`; queues you do not list are not checked, and the default is off for all:
+
+```php
+'waits' => ['emails' => 60],
+```
+
+The master checks every 30 seconds. When the oldest waiting job on a queue is older than its threshold, Torque dispatches `Webpatser\Torque\Events\LongWaitDetected` and sends the notifications once per episode. It repeats after 15 minutes while the queue is still over, or after 5 minutes if the alert failed. Route notifications from a service provider:
+
+```php
+Torque::routeMailNotificationsTo('ops@example.com');
+Torque::routeSlackNotificationsTo($webhookUrl);
+```
+
+Slack needs `laravel/slack-notification-channel`. A webhook URL route gets the legacy Slack message; any other route gets Block Kit.
+
+- The event and the notifications run in a short-lived child process that boots the app fresh, so register listeners and routes in a service provider.
+- One alert can take up to 60 seconds (`long_wait_alert_seconds`), shared across its steps. A throwing listener can run again for the same episode.
+- Failures appear in the master's output and the app log.
+- Each host's master alerts separately, and a master restart may re-fire once for an ongoing episode.
+
+### Tags and silenced jobs
+
+Tags are computed at dispatch on the real job object and stored in the payload. A `tags()` method wins, and it runs in the dispatching process, so it can run queries there. Without one, public properties holding an Eloquent model or a collection of models become `Model:key` tags (`App\Models\User:42`). Protected properties, arrays and nested objects are not inspected. A job gets at most 50 tags of 191 characters. `ShouldBeEncrypted` jobs have no tags. Jobs queued before the 1.4.0 upgrade have none until they drain. The live feed filters by tag over its latest 100 jobs.
+
+Silence jobs whose successes are noise: implement `Webpatser\Torque\Contracts\Silenced`, list the class under `silenced`, or list a tag under `silenced_tags` (encrypted jobs have no tags, so tags cannot match them). A silenced job's success is omitted: it shows as queued or running until it finishes, then vanishes from the feed. Failures are always recorded. Metrics and `JobProcessed` are unaffected.
 
 ### Not planned
 
