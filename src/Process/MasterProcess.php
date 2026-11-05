@@ -1082,9 +1082,20 @@ LUA;
      * `torque:reload`, `torque:stop` and the generated `stopwaitsecs` all
      * derive their default from this instead of carrying their own number.
      */
-    public static function drainWorstCaseSeconds(int $graceSeconds): int
+    public static function drainWorstCaseSeconds(int $graceSeconds, int $slackSeconds = self::DRAIN_DEADLINE_SLACK): int
     {
-        return 2 * max(0, $graceSeconds) + self::DRAIN_DEADLINE_SLACK;
+        return 2 * max(0, $graceSeconds) + $slackSeconds;
+    }
+
+    /**
+     * The slack for {@see drainWorstCaseSeconds()} from the internal `intervals`
+     * config. At least 1, so the window never comes to nothing at a grace of 0.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    public static function drainSlackSeconds(array $config): int
+    {
+        return max(1, (int) ($config['intervals']['drain_slack_seconds'] ?? self::DRAIN_DEADLINE_SLACK));
     }
 
     /**

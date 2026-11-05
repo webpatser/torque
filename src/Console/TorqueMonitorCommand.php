@@ -98,7 +98,7 @@ final class TorqueMonitorCommand extends Command
         $this->renderHeader($metrics, $masterPid, $paused);
         $this->renderMetrics($metrics);
         $this->renderWorkers($workers);
-        $this->renderQueues($config, $redisUri);
+        $this->renderQueues($config);
         $this->renderFooter($metrics, $paused, (int) $this->option('refresh'));
 
         // Build frame: cursor home, each line clears to EOL, then wipe leftover lines.
@@ -264,7 +264,7 @@ final class TorqueMonitorCommand extends Command
     /**
      * @param  array<string, mixed>  $config
      */
-    private function renderQueues(array $config, string $redisUri): void
+    private function renderQueues(array $config): void
     {
         $streams = $config['streams'] ?? [];
         if ($streams === []) {

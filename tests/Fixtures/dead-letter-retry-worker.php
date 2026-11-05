@@ -80,4 +80,5 @@ Event::listen(JobReleasedAfterException::class, static function () use ($log, $r
     'max_worker_lifetime' => $settings['lifetime'] ?? 6,
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 1,
+    'intervals' => require __DIR__.'/fast-intervals.php',
 ], array_intersect_key($settings, ['job_limits' => true, 'strict_attempts' => true]))))->run();

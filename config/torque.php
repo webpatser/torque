@@ -512,4 +512,35 @@ return [
     */
     'block_for' => (int) env('TORQUE_BLOCK_FOR', 2000),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Internal timer periods
+    |--------------------------------------------------------------------------
+    | Internal: leave these alone in production. They exist so the test suite can
+    | run real workers without waiting out real timers. Workers read them once at
+    | start. The `_check_` and `_poll_` values are floored at 0.05 seconds, so a
+    | bad value cannot spin the loop, but a low one still means more cache and
+    | Redis reads per worker, and `drain_grace_seconds` counts whole seconds, so a
+    | stop check well under a second can end a drain almost a second early.
+    |
+    | stop_check_seconds          : stop, job and lifetime limits, memory limit, drain end.
+    | down_check_seconds          : reads `artisan down`.
+    | paused_poll_seconds         : how soon a slot polls again after a pause or `artisan down`.
+    | pause_check_seconds         : queue:pause, circuit breaker and Torque's own pause key.
+    | watchdog_check_seconds      : master gone, and queue:restart.
+    | delayed_check_seconds       : moves ripe delayed jobs to their stream.
+    | drain_slack_seconds         : added to twice the grace by torque:stop and torque:reload (at least 1).
+    | reload_signal_slack_seconds : added to torque:reload's explicit --timeout (at least 0).
+    */
+    'intervals' => [
+        'stop_check_seconds' => 1.0,
+        'down_check_seconds' => 1.0,
+        'paused_poll_seconds' => 1.0,
+        'pause_check_seconds' => 2.0,
+        'watchdog_check_seconds' => 2.0,
+        'delayed_check_seconds' => 1.0,
+        'drain_slack_seconds' => 15,
+        'reload_signal_slack_seconds' => 5,
+    ],
+
 ];

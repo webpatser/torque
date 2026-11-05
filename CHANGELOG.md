@@ -5,6 +5,17 @@ All notable changes to Torque will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`intervals` config (internal, leave it alone in production).** The worker's stop, maintenance, pause, watchdog and delayed-job timer periods, the slots' wait while paused, and the drain and `torque:reload` slack can now be lowered so the test suite does not wait out real timers. The defaults are today's values, so nothing changes without the key. Worker periods are floored at 0.05 seconds.
+
+### Fixed
+- **A long-wait alert step that threw an exception with the message `ok` counted as success.** The fork now reports its outcome in a frame the message cannot imitate.
+
+### Removed
+- **`AttemptDeferredCallbacks::beginAttempt()` and `endAttempt()`.** Delegates to `AttemptScope` that only a test still called. The class is internal and undocumented, not public API; the methods were public in earlier releases, so code calling them directly should move to `AttemptScope::begin()` and `end()`.
+
 ## [1.4.0] - 2026-11-05
 
 Security fix for the dashboard, plus long-wait alerts, a Batches page, job tags and silenced jobs. Read Security first; `UPGRADE.md` has the new config keys and the job stream changes.

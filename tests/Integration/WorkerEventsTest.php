@@ -247,9 +247,9 @@ it('stops with the max time reason after the lifetime', function () {
 });
 
 it('announces stopping once when two stop reasons race', function () {
-    // The job holds the drain open past the next restart check (every 2s) and
+    // The job holds the drain open past the next restart check (every 0.2s here) and
     // several drain ticks: none of them may repeat the event or change its reason.
-    torque_with_events_worker([new RestartProbeJob(3.0)], [], function (array $run): void {
+    torque_with_events_worker([new RestartProbeJob(0.6)], [], function (array $run): void {
         torque_events_wait_until(static fn (): bool => in_array('start', torque_event_names($run['log']), true), 15, 'the job to start', $run['output']);
 
         posix_kill(proc_get_status($run['process'])['pid'], SIGTERM);
@@ -266,7 +266,7 @@ it('announces stopping once when two stop reasons race', function () {
 });
 
 it('announces stopping after the drain, never while a job runs', function () {
-    torque_with_events_worker([new RestartProbeJob(2.5)], [], function (array $run): void {
+    torque_with_events_worker([new RestartProbeJob(0.6)], [], function (array $run): void {
         torque_events_wait_until(static fn (): bool => in_array('start', torque_event_names($run['log']), true), 15, 'the job to start', $run['output']);
 
         posix_kill(proc_get_status($run['process'])['pid'], SIGTERM);
@@ -299,7 +299,7 @@ it('announces stopping at the forced exit when a job outlasts the grace', functi
 
 it('lets a suspending WorkerStopping listener finish, and runs it once', function () {
     // The listener outlasts several drain ticks, each of which could exit or announce again.
-    torque_with_events_worker([], ['stopping_delay' => 2.5], function (array $run): void {
+    torque_with_events_worker([], ['stopping_delay' => 0.5], function (array $run): void {
         posix_kill(proc_get_status($run['process'])['pid'], SIGTERM);
 
         expect(torque_events_exit_code($run['process']))->toBe(0);
@@ -336,13 +336,13 @@ it('dispatches one event for a paused queue and one when it resumes', function (
         $run['cache']->forever($key, true);
         torque_events_wait_until(static fn (): bool => in_array('WorkerQueuePaused', torque_event_names($run['log']), true), 15, 'the pause event', $run['output']);
 
-        // Two more timer ticks, which must not repeat the event.
-        sleep(5);
+        // Three more timer ticks, which must not repeat the event.
+        usleep(600_000);
 
         $run['cache']->forget($key);
         torque_events_wait_until(static fn (): bool => in_array('WorkerQueueResumed', torque_event_names($run['log']), true), 15, 'the resume event', $run['output']);
 
-        sleep(5);
+        usleep(600_000);
 
         $counts = array_count_values(torque_event_names($run['log']));
         $rows = array_values(array_filter(torque_event_rows($run['log']), static fn (array $row): bool => str_starts_with($row['event'], 'WorkerQueue')));
@@ -354,11 +354,37 @@ it('dispatches one event for a paused queue and one when it resumes', function (
     });
 });
 
+it('runs at the production stop check when the config sets no intervals', function () {
+    torque_with_events_worker([], ['production_intervals' => true], function (array $run): void {
+        posix_kill(proc_get_status($run['process'])['pid'], SIGTERM);
+
+        expect(torque_events_exit_code($run['process']))->toBe(0)
+            ->and(torque_stopping_row($run['log']))->toMatchArray(['status' => 0, 'reason' => 'interrupted']);
+    });
+});
+
+it('announces a pause and a resume at the production pause check', function () {
+    torque_with_events_worker([], ['production_intervals' => true], function (array $run): void {
+        $key = 'illuminate:queue:paused:torque:events';
+
+        $run['cache']->forever($key, true);
+        torque_events_wait_until(static fn (): bool => in_array('WorkerQueuePaused', torque_event_names($run['log']), true), 15, 'the pause event', $run['output']);
+
+        $run['cache']->forget($key);
+        torque_events_wait_until(static fn (): bool => in_array('WorkerQueueResumed', torque_event_names($run['log']), true), 15, 'the resume event', $run['output']);
+
+        $counts = array_count_values(torque_event_names($run['log']));
+
+        expect($counts['WorkerQueuePaused'])->toBe(1)
+            ->and($counts['WorkerQueueResumed'])->toBe(1);
+    });
+});
+
 it('dispatches no pause event for a circuit breaker pause', function () {
     torque_with_events_worker([], ['circuit_breaker' => ['enabled' => true]], function (array $run): void {
         $run['redis']->execute('SET', $run['prefix'].'cb:events:state', 'open', 'EX', '60');
 
-        sleep(5);
+        usleep(600_000);
 
         expect(array_intersect(torque_event_names($run['log']), ['WorkerQueuePaused', 'WorkerQueueResumed']))->toBe([]);
 
@@ -366,7 +392,7 @@ it('dispatches no pause event for a circuit breaker pause', function () {
         $run['cache']->forever('illuminate:queue:paused:torque:events', true);
         torque_events_wait_until(static fn (): bool => in_array('WorkerQueuePaused', torque_event_names($run['log']), true), 15, 'the pause event', $run['output']);
 
-        sleep(3);
+        usleep(400_000);
 
         expect(array_count_values(torque_event_names($run['log']))['WorkerQueuePaused'])->toBe(1);
     });

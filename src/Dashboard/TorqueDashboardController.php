@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Route;
 use Webpatser\Torque\Dashboard\Http\Middleware\Authorize;
 use Webpatser\Torque\Dashboard\Http\Middleware\DetectCspMismatch;
+use Webpatser\Torque\Dashboard\Livewire\Batches;
 use Webpatser\Torque\Dashboard\Livewire\Dead;
 use Webpatser\Torque\Dashboard\Livewire\Feed;
 use Webpatser\Torque\Dashboard\Livewire\Inspector;
@@ -39,10 +40,12 @@ final class TorqueDashboardController
     }
 
     /**
-     * Define the `viewTorque` authorization gate.
+     * Define the `viewTorque` authorization gate, if nothing has yet.
      *
-     * Defaults to DENYING all access. Applications MUST override this gate
-     * in their AuthServiceProvider to grant dashboard access:
+     * {@see TorqueServiceProvider::registerDefaultGate()} runs first and allows
+     * the `local` environment only, so this deny-all is the fallback for a call
+     * without it. Applications override the gate in their AuthServiceProvider
+     * to grant dashboard access elsewhere:
      *
      *     Gate::define('viewTorque', fn (User $user) => $user->isAdmin());
      */
@@ -71,7 +74,7 @@ final class TorqueDashboardController
                     Route::get('jobs', Jobs::class)->name('torque.jobs');
                     Route::get('jobs/{uuid}', Inspector::class)->name('torque.inspector.job');
                     Route::get('dead', Dead::class)->name('torque.dead');
-                    Route::get('batches', Livewire\Batches::class)->name('torque.batches');
+                    Route::get('batches', Batches::class)->name('torque.batches');
                 });
             });
     }

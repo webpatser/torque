@@ -133,6 +133,17 @@ it('scales stopwaitsecs with drain_grace_seconds', function () {
         ->toContain('stopwaitsecs=615');
 });
 
+it('follows a raised drain_slack_seconds in stopwaitsecs', function () {
+    config()->set('torque.drain_grace_seconds', 300);
+    config()->set('torque.intervals.drain_slack_seconds', 100);
+
+    $this->artisan('torque:supervisor')
+        ->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('stopwaitsecs=700');
+});
+
 it('keeps 60 as the stopwaitsecs floor at the default grace', function () {
     config()->set('torque.drain_grace_seconds', 10);
 

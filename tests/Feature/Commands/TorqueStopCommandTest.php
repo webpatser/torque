@@ -82,7 +82,9 @@ it('cleans up PID file with non-numeric content', function () {
  */
 
 it('derives the graceful window from drain_grace_seconds', function () {
-    config()->set('torque.drain_grace_seconds', 0);
+    // Twice the grace plus the slack. MasterProcessDrainDeadlineTest pins the default slack.
+    config()->set('torque.drain_grace_seconds', 1);
+    config()->set('torque.intervals.drain_slack_seconds', 1);
 
     $pid = spawnDeafTorqueMaster(60, [SIGTERM]);
     file_put_contents(storage_path('torque.pid'), (string) $pid);
@@ -90,7 +92,7 @@ it('derives the graceful window from drain_grace_seconds', function () {
     try {
         $this->artisan('torque:stop')
             ->assertSuccessful()
-            ->expectsOutputToContain('timed out after 15 seconds');
+            ->expectsOutputToContain('timed out after 3 seconds');
     } finally {
         posix_kill($pid, SIGKILL);
         pcntl_waitpid($pid, $status);

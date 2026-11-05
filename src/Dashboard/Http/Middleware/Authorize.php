@@ -10,10 +10,11 @@ use Illuminate\Support\Facades\Gate;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
- * Gates every dashboard request (shell + API) through the `viewTorque` ability.
+ * Gates every dashboard route through the `viewTorque` ability.
  *
- * Applied to the whole dashboard route group so the JSON endpoints are not
- * reachable by users who would fail the gate on the shell route.
+ * Applied to the whole dashboard route group. Livewire does not run it again on
+ * update requests, so the components check the gate themselves, in
+ * `WithDashboardChrome`.
  */
 final class Authorize
 {

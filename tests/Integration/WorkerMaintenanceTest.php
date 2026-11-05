@@ -253,8 +253,8 @@ it('does not poll or claim while the application is down, then resumes after it 
     torque_with_maintenance_worker([], function (array $run): void {
         (void) $run['queue']->push(new MaintenanceProbeJob, '', 'maint');
 
-        // Several check intervals: a worker that ignores maintenance mode has run the job well within 3s.
-        sleep(3);
+        // Six check intervals at the fixture's 0.1s: a worker that ignores maintenance mode has run the job well within that.
+        usleep(600_000);
 
         $pending = $run['redis']->execute('XPENDING', $run['streamKey'], $run['group']);
 
@@ -281,7 +281,7 @@ it('runs jobs while down when force is set', function () {
 
 it('lets an in-flight job finish when the application goes down, and holds back the next one', function () {
     torque_with_maintenance_worker([], function (array $run): void {
-        (void) $run['queue']->push(new MaintenanceProbeJob(seconds: 2.5), '', 'maint');
+        (void) $run['queue']->push(new MaintenanceProbeJob(seconds: 1.0), '', 'maint');
 
         torque_maint_wait_until(static fn (): bool => torque_maint_events($run['log']) === ['start'], 20, 'the job to start', $run['output']);
 
@@ -290,8 +290,8 @@ it('lets an in-flight job finish when the application goes down, and holds back 
 
         torque_maint_wait_until(static fn (): bool => torque_maint_events($run['log']) === ['start', 'done'], 20, 'the in-flight job to finish', $run['output']);
 
-        // Several check intervals: the second job must not start while down.
-        sleep(3);
+        // Six check intervals at the fixture's 0.1s: the second job must not start while down.
+        usleep(600_000);
 
         expect(torque_maint_events($run['log']))->toBe(['start', 'done'])
             ->and(proc_get_status($run['process'])['running'])->toBeTrue();

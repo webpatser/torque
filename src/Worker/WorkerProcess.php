@@ -258,6 +258,9 @@ LUA;
     /** Unix time the last job finished, for WorkerStopping. */
     private ?int $lastJobProcessedAt = null;
 
+    /** The lowest period the `intervals` config can give a timer. */
+    private const float MIN_INTERVAL_SECONDS = 0.05;
+
     /** hrtime seconds of the last WorkerIdle, so idle slots do not flood listeners. */
     private ?float $lastIdleAt = null;
 
@@ -502,9 +505,11 @@ LUA;
         // Maintenance mode is read once a second for the whole worker, not per
         // slot per poll: the file driver would hit the disk 50 times a poll.
         // Read once now too, so no slot claims a job in the first second.
+        $timerPeriod = fn (string $key, float $default): float => self::intervalSeconds($this->config, $key, $default);
+        $pausedPollSeconds = $timerPeriod('paused_poll_seconds', 1.0);
         $force = (bool) ($this->config['force'] ?? false);
         $this->refreshDownState($force);
-        EventLoop::repeat(1.0, fn () => $this->refreshDownState($force));
+        EventLoop::repeat($timerPeriod('down_check_seconds', 1.0), fn () => $this->refreshDownState($force));
         $startTime = $this->startTime;
 
         // Built once for the event payloads. `timeout` carries the stock default:
@@ -566,7 +571,7 @@ LUA;
 
         $masterPidForPause = posix_getppid();
         $pauseFetchFailed = false;
-        EventLoop::repeat(2.0, function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, &$pauseFetchFailed) {
+        EventLoop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, &$pauseFetchFailed) {
             // Framework pause state (queue:pause / queue:pause --all) lives in
             // the cache store, read synchronously outside the pool callback so
             // pool-connection hold time is unchanged. On a failed read we keep
@@ -628,7 +633,7 @@ LUA;
         // OOM), we get reparented and would otherwise keep consuming as an orphan
         // forever. Detect the reparenting and drain out through the normal stop path.
         $masterPid = posix_getppid();
-        EventLoop::repeat(2.0, function () use ($masterPid, &$restartBaseline, &$restartBaselineKnown, &$restartReadFailed) {
+        EventLoop::repeat($timerPeriod('watchdog_check_seconds', 2.0), function () use ($masterPid, &$restartBaseline, &$restartBaselineKnown, &$restartReadFailed) {
             if (! $this->stopHasGrace && posix_getppid() !== $masterPid) {
                 fwrite(STDERR, "[torque:worker] Master (PID {$masterPid}) is gone, shutting down orphaned worker\n");
                 $this->requestStop(WorkerStopReason::Interrupted);
@@ -691,6 +696,7 @@ LUA;
             $fiberIndex = $i;
             (void) async(function () use (
                 $fiberIndex,
+                $pausedPollSeconds,
                 $redisUri,
                 $queues,
                 $prefix,
@@ -728,7 +734,7 @@ LUA;
 
                     // Like a paused worker: no Looping, no polling, no claiming.
                     if ($this->down || $pauseState->paused) {
-                        \Fledge\Async\delay(1.0);
+                        \Fledge\Async\delay($pausedPollSeconds);
 
                         continue;
                     }
@@ -1214,7 +1220,7 @@ LUA;
         // Delayed job migration timer: checks every second for matured delayed jobs.
         // Keeps running during the drain window so delayed jobs don't pile up while
         // a hung Fiber prevents the worker from exiting cleanly.
-        EventLoop::repeat(1.0, function () use ($redisPool, $queues, $buildStreamKey) {
+        EventLoop::repeat($timerPeriod('delayed_check_seconds', 1.0), function () use ($redisPool, $queues, $buildStreamKey) {
             $this->migrateDelayedJobs($redisPool, $queues, $buildStreamKey);
         });
 
@@ -1258,7 +1264,7 @@ LUA;
         // the same memory growth would abandon them again, forever.
         $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
         $drainStartedAt = null;
-        EventLoop::repeat(1.0, function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey, $events, $workerOptions, $connectionName, $primaryQueue, $streamQueue) {
+        EventLoop::repeat($timerPeriod('stop_check_seconds', 1.0), function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey, $events, $workerOptions, $connectionName, $primaryQueue, $streamQueue) {
             // Revolt re-enables a repeat timer before invoking it, so a tick that
             // suspends in a listener or in the cleanup would be overtaken by the
             // next one, which could exit underneath it.
@@ -1788,7 +1794,7 @@ LUA;
     {
         $count = 0;
 
-        foreach ($this->neverStarted as $key => $owed) {
+        foreach (array_keys($this->neverStarted) as $key) {
             if (str_starts_with($key, $streamKey.'|')) {
                 $count++;
             }
@@ -2033,6 +2039,19 @@ LUA;
                 fwrite(STDERR, "[torque:worker] Maintenance mode check failed ({$e->getMessage()}), treating as up\n");
             }
         }
+    }
+
+    /**
+     * A timer period from the internal `intervals` config, floored so a bad value
+     * cannot spin the loop. A missing or non-numeric value means the default.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    public static function intervalSeconds(array $config, string $key, float $default): float
+    {
+        $value = $config['intervals'][$key] ?? null;
+
+        return is_numeric($value) ? max(self::MIN_INTERVAL_SECONDS, (float) $value) : $default;
     }
 
     /**

@@ -106,4 +106,5 @@ if ($slowReset === '1') {
     'max_worker_lifetime' => 60,
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 10,
+    'intervals' => require __DIR__.'/fast-intervals.php',
 ])))->run();

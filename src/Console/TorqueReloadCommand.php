@@ -212,9 +212,11 @@ final class TorqueReloadCommand extends Command
 
         $worstCase = MasterProcess::drainWorstCaseSeconds(
             (int) config('torque.drain_grace_seconds', 10),
+            MasterProcess::drainSlackSeconds((array) config('torque')),
         );
 
-        $window = $timeout === null ? $worstCase : $timeout + self::SIGNAL_SLACK_SECONDS;
+        $signalSlack = max(0, (int) config('torque.intervals.reload_signal_slack_seconds', self::SIGNAL_SLACK_SECONDS));
+        $window = $timeout === null ? $worstCase : $timeout + $signalSlack;
         $deadline = microtime(true) + $window;
 
         while (microtime(true) < $deadline) {

@@ -23,7 +23,7 @@ use Illuminate\Contracts\Container\Container;
  */
 final class AttemptMemoizedCache
 {
-    private const string BINDING_PREFIX = 'cache.__memoized:';
+    public const string BINDING_PREFIX = 'cache.__memoized:';
 
     public static function install(Container $container): void
     {

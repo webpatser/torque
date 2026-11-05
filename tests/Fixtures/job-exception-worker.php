@@ -108,4 +108,5 @@ if ($brokenListener === 'reset') {
     'max_worker_lifetime' => (int) $lifetime,
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 1,
+    'intervals' => require __DIR__.'/fast-intervals.php',
 ])))->run();

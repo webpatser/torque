@@ -50,5 +50,6 @@ $settings = json_decode($settings, true, flags: JSON_THROW_ON_ERROR);
 $config = array_replace_recursive(config('torque'), $settings);
 $config['queues'] = $settings['queues'];
 $config['streams'] = $settings['streams'];
+$config['intervals'] = require __DIR__.'/fast-intervals.php';
 
 (new WorkerProcess($config))->run();

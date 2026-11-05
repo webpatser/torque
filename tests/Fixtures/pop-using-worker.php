@@ -88,5 +88,6 @@ foreach ($queues as $queue) {
     'max_worker_lifetime' => 120,
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 5,
+    'intervals' => require __DIR__.'/fast-intervals.php',
     'strict_attempts' => (bool) ($options['strict_attempts'] ?? false),
 ])))->run();

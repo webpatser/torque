@@ -609,6 +609,15 @@ it('still sends the mail when a listener throws', function () {
         ->and(($this->sent)())->toBe(['mail ops@example.com emails']);
 });
 
+it('counts a step as failed when its exception message reads like success', function (string $message) {
+    Event::listen(LongWaitDetected::class, static function () use ($message): void {
+        throw new RuntimeException($message);
+    });
+
+    expect(torque_lw_alert_command())->toBe(1)
+        ->and(Artisan::output())->toContain("event failed ({$message})");
+})->with(['ok', 'failed:ok']);
+
 it('still sends to Slack when the mail throws', function () {
     ($this->recordChannel)('slack');
 

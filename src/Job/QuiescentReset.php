@@ -38,8 +38,6 @@ final class QuiescentReset
     /** Framework bindings outside the `Illuminate\` namespace. */
     private const array FRAMEWORK_BINDINGS = ['image'];
 
-    private const string FRAMEWORK_MEMO_PREFIX = 'cache.__memoized:';
-
     private int $attemptsSinceReset = 0;
 
     /** @var DeferredFuture<null>|null */
@@ -170,7 +168,7 @@ final class QuiescentReset
     private static function isFrameworkBinding(string $name): bool
     {
         return str_starts_with($name, 'Illuminate\\')
-            || str_starts_with($name, self::FRAMEWORK_MEMO_PREFIX)
+            || str_starts_with($name, AttemptMemoizedCache::BINDING_PREFIX)
             || in_array($name, self::FRAMEWORK_BINDINGS, true);
     }
 

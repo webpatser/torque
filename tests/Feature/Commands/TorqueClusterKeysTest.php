@@ -70,7 +70,7 @@ function torque_monitor_queue_lines(): array
 {
     $command = new TorqueMonitorCommand;
 
-    (new ReflectionMethod($command, 'renderQueues'))->invoke($command, config('torque'), config('torque.redis.uri'));
+    (new ReflectionMethod($command, 'renderQueues'))->invoke($command, config('torque'));
 
     return (new ReflectionProperty($command, 'lines'))->getValue($command);
 }

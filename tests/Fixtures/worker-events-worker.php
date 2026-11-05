@@ -10,7 +10,7 @@ declare(strict_types=1);
  * Arguments: redis uri, key prefix, consumer group, queue, log file, cache
  * directory, options (JSON: lifetime, max_jobs, circuit_breaker, concurrency,
  * max_retries (null leaves it out of the stream config), job_events, grace,
- * memory_limit, force, stopping_delay).
+ * memory_limit, force, stopping_delay, production_intervals).
  *
  * With `stopping_delay` the WorkerStopping listener suspends that many seconds
  * after logging, then logs WorkerStoppingDone.
@@ -149,6 +149,7 @@ $events->listen(Looping::class, function () use ($cacheDir) {
     'max_worker_lifetime' => (int) ($options['lifetime'] ?? 120),
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => (int) ($options['grace'] ?? 10),
+    'intervals' => ($options['production_intervals'] ?? false) ? [] : require __DIR__.'/fast-intervals.php',
     'memory_limit' => (int) ($options['memory_limit'] ?? 0),
     'force' => (bool) ($options['force'] ?? false),
 ])))->run();

@@ -40,6 +40,7 @@ final class Batches extends Component
         $selected = $this->selected !== null && $this->selected !== '' ? $this->selected : null;
 
         $page = $data->list($before, self::PER_PAGE);
+        $chrome = $this->chrome();
 
         return view('torque::dashboard.batches', [
             'page' => $page,
@@ -47,8 +48,8 @@ final class Batches extends Component
             'detail' => $selected !== null && $page['available'] ? $data->find($selected) : null,
             'selectedId' => $selected,
             'before' => $before,
-            'deadCount' => $this->chrome()['deadCount'],
-            'workerCount' => $this->chrome()['workerCount'],
+            'deadCount' => $chrome['deadCount'],
+            'workerCount' => $chrome['workerCount'],
         ]);
     }
 }

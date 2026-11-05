@@ -1,8 +1,8 @@
 @php
     use Webpatser\Torque\Dashboard\Support\Format;
 
-    // Stream, pending, delayed, reserved, depth and the chevron are always
-    // rendered; the rest come and go with the data.
+    // Stream, pending, delayed, reserved, consumers, depth and the chevron are
+    // always rendered; the rest come and go with the data.
     $columns = 7 + (int) $hasThroughput + (int) $hasWait + (int) $hasFailed;
 @endphp
 <x-torque::shell title="Queues &amp; Streams" crumb="Redis Streams · consumer groups" active="queues"

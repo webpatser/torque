@@ -54,22 +54,6 @@ final class AttemptDeferredCallbacks extends DeferredCallbackCollection
         return $collection;
     }
 
-    /**
-     * Give the current Fiber's attempt its own, empty scope.
-     */
-    public function beginAttempt(): void
-    {
-        AttemptScope::begin();
-    }
-
-    /**
-     * Release the current Fiber's attempt. Callbacks that did not run go with it.
-     */
-    public function endAttempt(): void
-    {
-        AttemptScope::end();
-    }
-
     public function first()
     {
         return $this->current()->first();

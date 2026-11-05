@@ -65,6 +65,7 @@ $memoryLimit = isset($options['memory_headroom_mb'])
     'max_worker_lifetime' => (int) ($options['lifetime'] ?? 120),
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => (int) ($options['grace'] ?? 10),
+    'intervals' => require __DIR__.'/fast-intervals.php',
     'memory_limit' => $memoryLimit,
     'force' => (bool) ($options['force'] ?? false),
 ])))->run();

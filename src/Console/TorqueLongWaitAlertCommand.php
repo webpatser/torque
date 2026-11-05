@@ -35,6 +35,9 @@ final class TorqueLongWaitAlertCommand extends Command
     /** What a step's fork reports when it finished without an exception. */
     private const string STEP_OK = 'ok';
 
+    /** Goes before the exception message, so no message can read as {@see STEP_OK}. */
+    private const string STEP_FAILED = 'failed:';
+
     /** @var string */
     protected $signature = 'torque:long-wait-alert
         {queue : The queue over its threshold}
@@ -166,7 +169,7 @@ final class TorqueLongWaitAlertCommand extends Command
                 $step();
                 $result = self::STEP_OK;
             } catch (Throwable $e) {
-                $result = $e->getMessage();
+                $result = self::STEP_FAILED.($e->getMessage() ?: $e::class);
             }
 
             fwrite($writer, $result);
@@ -192,7 +195,7 @@ final class TorqueLongWaitAlertCommand extends Command
             self::STEP_OK => null,
             null => "timed out after {$seconds}s",
             '' => 'ended without reporting a result',
-            default => $result,
+            default => str_starts_with($result, self::STEP_FAILED) ? substr($result, strlen(self::STEP_FAILED)) : 'reported an unreadable result',
         };
     }
 

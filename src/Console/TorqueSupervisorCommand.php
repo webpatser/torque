@@ -58,6 +58,7 @@ final class TorqueSupervisorCommand extends Command
         // the floor for the default grace.
         $stopWaitSecs = max(60, MasterProcess::drainWorstCaseSeconds(
             (int) config('torque.drain_grace_seconds', 10),
+            MasterProcess::drainSlackSeconds((array) config('torque')),
         ));
 
         // --replace makes the supervised start converge: a live master that

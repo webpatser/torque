@@ -149,6 +149,7 @@ final class TorqueStopCommand extends Command
 
         return MasterProcess::drainWorstCaseSeconds(
             (int) config('torque.drain_grace_seconds', 10),
+            MasterProcess::drainSlackSeconds((array) config('torque')),
         );
     }
 

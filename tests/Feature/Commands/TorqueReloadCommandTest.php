@@ -32,6 +32,9 @@ beforeEach(function () {
 
     TorqueReloadCommand::$spawner = null;
     TorqueReloadCommand::$readinessChecker = null;
+
+    // An explicit --timeout waits this much longer; the 5s default adds nothing to what is tested.
+    config()->set('torque.intervals.reload_signal_slack_seconds', 1);
 });
 
 afterEach(function () {
@@ -125,7 +128,7 @@ it('signals SIGUSR2 to the running PID in drain-only mode', function () {
     try {
         $exit = Artisan::call('torque:reload', [
             '--drain' => true,
-            '--timeout' => 3,
+            '--timeout' => 0,
         ]);
 
         expect($exit)->toBe(0)
@@ -164,10 +167,11 @@ it('leaves a master that is still draining alone when the timeout is shorter tha
 });
 
 it('escalates to SIGTERM once the master is past its own drain ceiling', function () {
-    // With the grace at 0 the worst case is the slack alone (15s), so a
-    // master still alive after it is a wedged one. This branch had no
-    // coverage while the deadline was a fixed 35s.
+    // With the grace at 0 the worst case is the slack alone, so a master
+    // still alive after it is a wedged one. This branch had no coverage
+    // while the deadline was a fixed 35s.
     config()->set('torque.drain_grace_seconds', 0);
+    config()->set('torque.intervals.drain_slack_seconds', 1);
 
     $childPid = spawnDeafTorqueMaster(60, [SIGUSR2]);
     writeMasterPidFile($childPid);
@@ -251,7 +255,7 @@ it('completes the full reload when readiness reports OK and the old PID drains',
         $exit = Artisan::call('torque:reload', [
             '--force' => true,
             '--health-timeout' => 5,
-            '--timeout' => 3,
+            '--timeout' => 0,
         ]);
 
         expect($exit)->toBe(0)

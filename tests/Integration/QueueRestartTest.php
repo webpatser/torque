@@ -172,7 +172,7 @@ it('exits an idle worker after the queue:restart key changes', function () {
 });
 
 it('lets an in-flight job finish and acknowledge before the worker exits', function () {
-    torque_with_restart_worker([new RestartProbeJob(3.0)], restartable: true, scenario: function (array $run): void {
+    torque_with_restart_worker([new RestartProbeJob(1.0)], restartable: true, scenario: function (array $run): void {
         torque_wait_until(static fn (): bool => torque_restart_events($run['log']) === ['start'], 20, 'the job to start', $run['output']);
 
         $run['cache']->forever('illuminate:queue:restart', time());
@@ -193,7 +193,7 @@ it('keeps running when the worker is not restartable', function () {
     torque_with_restart_worker([], restartable: false, scenario: function (array $run): void {
         $run['cache']->forever('illuminate:queue:restart', time());
 
-        // Several check intervals: a restartable worker is gone well within 6s.
-        expect(torque_exit_of($run['process'], 6)['exited'])->toBeFalse();
+        // Five check intervals at the fixture's 0.2s: a restartable worker is gone well within that.
+        expect(torque_exit_of($run['process'], 1)['exited'])->toBeFalse();
     });
 });

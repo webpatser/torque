@@ -7,6 +7,7 @@ use Illuminate\Container\Container;
 use Illuminate\Support\Defer\DeferredCallback;
 use Illuminate\Support\Defer\DeferredCallbackCollection;
 use Webpatser\Torque\Job\AttemptDeferredCallbacks;
+use Webpatser\Torque\Job\AttemptScope;
 
 use function Fledge\Async\async;
 use function Fledge\Async\delay;
@@ -18,7 +19,7 @@ beforeEach(function () {
 });
 
 afterEach(function () {
-    FiberContext::forget('torque.deferred_callbacks');
+    FiberContext::forget('torque.attempt_scope');
 });
 
 it('keeps each attempt\'s callbacks to itself', function () {
@@ -26,7 +27,7 @@ it('keeps each attempt\'s callbacks to itself', function () {
     $collection = $this->collection;
 
     $attempt = static function (string $name, float $finishAfter) use ($collection, &$ran): int {
-        $collection->beginAttempt();
+        AttemptScope::begin();
         $collection[] = new DeferredCallback(static function () use ($name, &$ran): void {
             $ran[] = $name;
         });
@@ -35,7 +36,7 @@ it('keeps each attempt\'s callbacks to itself', function () {
 
         $count = count($collection);
         $collection->invokeWhen();
-        $collection->endAttempt();
+        AttemptScope::end();
 
         return $count;
     };
@@ -54,7 +55,7 @@ it('applies the caller\'s truth test to that attempt\'s callbacks only', functio
     $collection = $this->collection;
 
     $attempt = static function (string $name, bool $successful, float $finishAfter) use ($collection, &$ran): void {
-        $collection->beginAttempt();
+        AttemptScope::begin();
 
         foreach ([false, true] as $always) {
             $collection[] = new DeferredCallback(static function () use ($name, $always, &$ran): void {
@@ -65,7 +66,7 @@ it('applies the caller\'s truth test to that attempt\'s callbacks only', functio
         delay($finishAfter);
 
         $collection->invokeWhen(static fn (DeferredCallback $callback): bool => $successful || $callback->always);
-        $collection->endAttempt();
+        AttemptScope::end();
     };
 
     // The failed attempt ends while the passing one has its callbacks registered.
@@ -89,14 +90,14 @@ it('credits a child Fiber\'s callback to the attempt that spawned it, at any dep
     };
 
     $counts = async(static function () use ($collection, $add): array {
-        $collection->beginAttempt();
+        AttemptScope::begin();
 
         $add('own');
         async(static fn () => $add('child'))->await();
         async(static fn () => async(static fn () => $add('grandchild'))->await())->await();
 
         $counts = [count($collection)];
-        $collection->endAttempt();
+        AttemptScope::end();
         $counts[] = count($collection);
 
         return $counts;
@@ -109,10 +110,10 @@ it('credits a child Fiber\'s callback to the attempt that spawned it, at any dep
 it('does not leak an owner to the next closure on a reused Fiber', function () {
     $collection = $this->collection;
 
-    async(static function () use ($collection): void {
-        $collection->beginAttempt();
+    async(static function (): void {
+        AttemptScope::begin();
         async(static fn () => null)->await();
-        $collection->endAttempt();
+        AttemptScope::end();
     })->await();
 
     // Child closures finished without suspending, so Revolt reuses their Fiber.
@@ -132,9 +133,9 @@ it('keeps code outside any attempt on the ambient collection', function () {
     });
 
     $inAttempt = async(static function () use ($collection): int {
-        $collection->beginAttempt();
+        AttemptScope::begin();
         $count = count($collection);
-        $collection->endAttempt();
+        AttemptScope::end();
 
         return $count;
     })->await();
@@ -152,7 +153,7 @@ it('routes every collection operation to the current attempt', function () {
     $collection = $this->collection;
 
     async(static function () use ($collection): void {
-        $collection->beginAttempt();
+        AttemptScope::begin();
 
         $callback = new DeferredCallback(static fn () => null, 'named');
         $collection[] = $callback;
@@ -170,7 +171,7 @@ it('routes every collection operation to the current attempt', function () {
 
         expect(count($collection))->toBe(0);
 
-        $collection->endAttempt();
+        AttemptScope::end();
     })->await();
 
     expect(count($collection))->toBe(0);
@@ -181,7 +182,7 @@ it('survives forgetScopedInstances with an attempt in flight', function () {
     $collection = $this->collection;
 
     $count = async(static function () use ($container, $collection): int {
-        $collection->beginAttempt();
+        AttemptScope::begin();
         $collection[] = new DeferredCallback(static fn () => null);
 
         $container->forgetScopedInstances();
@@ -189,7 +190,7 @@ it('survives forgetScopedInstances with an attempt in flight', function () {
         expect($container->make(DeferredCallbackCollection::class))->toBe($collection);
 
         $count = count($container->make(DeferredCallbackCollection::class));
-        $collection->endAttempt();
+        AttemptScope::end();
 
         return $count;
     })->await();
