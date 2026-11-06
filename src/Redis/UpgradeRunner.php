@@ -5,7 +5,11 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Redis;
 
 use Composer\InstalledVersions;
+use Fledge\Async\Redis\Connection\SocketRedisConnector;
 use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisConfig;
+use Fledge\Async\Stream\ConnectContext;
+use Fledge\Async\Stream\DnsSocketConnector;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -111,9 +115,7 @@ final class UpgradeRunner
     #[\NoDiscard]
     public function storedVersion(): ?string
     {
-        $value = $this->redis()->execute('GET', $this->prefix.self::VERSION_KEY_SUFFIX);
-
-        return $value === null ? null : (string) $value;
+        return $this->readVersion($this->redis());
     }
 
     /**
@@ -123,14 +125,14 @@ final class UpgradeRunner
      * release number to compare, and when Redis cannot be reached: an outage
      * must not stop a start, and without a stored version there is nothing to
      * refuse. An installed dev checkout gets no exemption, it owes the removed
-     * steps just the same.
+     * steps just the same. It connects once, see {@see self::gateClient()}.
      *
      * @throws \DomainException With the operator-facing message, only on a refusal.
      */
     public function assertUpgradePath(): void
     {
         try {
-            $stored = $this->storedVersion();
+            $stored = $this->readVersion($this->client ?? $this->gateClient());
         } catch (\Throwable $e) {
             ($this->logger)("Upgrade path check skipped ({$e->getMessage()}).");
 
@@ -158,7 +160,9 @@ final class UpgradeRunner
         $skipped = ['ran' => false, 'from' => $stored, 'to' => $current, 'counts' => []];
 
         if (self::isBelowMinimum($stored)) {
-            ($this->logger)($this->refusalMessage((string) $stored));
+            $minimum = self::MINIMUM_STORED_VERSION;
+
+            ($this->logger)("Torque data in Redis was last upgraded by {$stored}, below {$minimum}: not recording this version, and the next start refuses. ".$this->upgradeAdvice());
 
             return $skipped;
         }
@@ -253,11 +257,51 @@ final class UpgradeRunner
         $minimum = self::MINIMUM_STORED_VERSION;
 
         return "Refusing to start: Torque data in Redis was last upgraded by {$stored}, below {$minimum}, the oldest release this version upgrades from. "
-            ."Upgrade through 1.4.x first and start a master on it once, or skip the removed upgrade steps with: SET {$this->prefix}version {$minimum}";
+            .$this->upgradeAdvice();
+    }
+
+    private function upgradeAdvice(): string
+    {
+        $minimum = self::MINIMUM_STORED_VERSION;
+
+        return "Upgrade through 1.4.x first and start a master on it once, or skip the removed upgrade steps with: SET {$this->prefix}version {$minimum}";
+    }
+
+    private function readVersion(RedisClient $redis): ?string
+    {
+        $value = $redis->execute('GET', $this->prefix.self::VERSION_KEY_SUFFIX);
+
+        return $value === null ? null : (string) $value;
     }
 
     private function redis(): RedisClient
     {
         return $this->redis ??= $this->client ?? createRedisClient($this->redisUri);
+    }
+
+    /**
+     * A client for the gate that tries to connect once.
+     *
+     * The default socket connector makes three attempts with 2s and 4s between
+     * them, and the gate runs first on every start, so it would add those seconds
+     * to a start during an outage. That retry sits below the link, which is why
+     * the socket connector is the part replaced here: `maxReconnectAttempts` on
+     * the link would only repeat the whole sequence.
+     */
+    private function gateClient(): RedisClient
+    {
+        $config = RedisConfig::fromUri($this->redisUri);
+        $context = (new ConnectContext)->withConnectTimeout($config->getTimeout());
+
+        if (($tlsContext = $config->getTlsContext()) !== null) {
+            $context = $context->withTlsContext($tlsContext);
+        }
+
+        return createRedisClient($config, new SocketRedisConnector(
+            $config->getConnectUri(),
+            $context,
+            new DnsSocketConnector,
+            tcpKeepalive: $config->usesTcpKeepalive(),
+        ));
     }
 }

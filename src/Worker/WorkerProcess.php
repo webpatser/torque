@@ -668,7 +668,7 @@ LUA;
                     // worker this does not drain: a clear would otherwise restart
                     // the whole fleet. The next queue:restart still differs from null.
                     $restartBaseline = null;
-                    fwrite(STDERR, "[torque:worker] queue:restart key is gone (cache:clear or eviction), keeping the worker running and watching for the next queue:restart.\n");
+                    fwrite(STDERR, "[torque:worker] queue:restart key is gone (cache:clear or eviction), keeping the worker running. A queue:restart issued just before the clear is lost: if you meant to restart, run queue:restart again.\n");
                 } elseif ($current != $restartBaseline) {
                     fwrite(STDERR, "[torque:worker] Received queue:restart signal, draining and exiting.\n");
                     $this->requestStop(WorkerStopReason::ReceivedRestartSignal);
@@ -3229,7 +3229,7 @@ LUA;
 
     /**
      * The limit on a job that keeps releasing itself, with or without strict_attempts.
-     * The deadline was written by the job's first release. An operator can still
+     * The deadline was written by the job's first release under a limit. An operator can still
      * switch the limit off for a job that already carries one, so that is read too.
      *
      * @throws MaxAttemptsExceededException
@@ -3494,7 +3494,7 @@ LUA;
         }
 
         if (! $this->enforcesStrictAttempts()) {
-            fwrite(STDERR, "[torque:worker] NOTE strict_attempts is off: attempts and retryUntil are only checked after a thrown exception, so only release_limit_seconds limits a job that keeps calling release(). A delivery after a worker died is not counted either, so only maxExceptions limits a job whose worker keeps dying\n");
+            fwrite(STDERR, "[torque:worker] NOTE strict_attempts is off: attempts and retryUntil are only checked after a thrown exception, so a job that keeps calling release() is limited by release_limit_seconds alone, and not at all if it has a retryUntil or \$tries = 0. A delivery after a worker died is not counted either, so only maxExceptions limits a job whose worker keeps dying\n");
         }
     }
 

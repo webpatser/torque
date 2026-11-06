@@ -197,6 +197,27 @@ it('refuses to start on a stored version below the minimum', function () {
         ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.3.9');
 });
 
+it('sends a refusal to the error logger, not the status logger', function () {
+    $this->redis->execute('SET', $this->versionKey, '1.3.9');
+
+    $errors = [];
+
+    $master = new MasterProcess(
+        ['redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix], 'streams' => ['default' => []]],
+        function (string $message) {
+            $this->logged[] = $message;
+        },
+        errorLogger: function (string $message) use (&$errors) {
+            $errors[] = $message;
+        },
+    );
+
+    expect($master->start())->toBe(1)
+        ->and($errors)->toHaveCount(1)
+        ->and($errors[0])->toContain('Refusing to start')
+        ->and(implode("\n", $this->logged))->not->toContain('Refusing to start');
+});
+
 it('starts a fleet on the minimum stored version and moves the version on', function () {
     $this->redis->execute('SET', $this->versionKey, '1.4.0');
 

@@ -256,6 +256,7 @@ it('does not drain on cache:clear, and still drains on a later queue:restart', f
         $output = (string) file_get_contents($run['output']);
 
         expect(substr_count($output, 'queue:restart key is gone'))->toBe(1)
+            ->and($output)->toContain('if you meant to restart, run queue:restart again')
             ->and($output)->not->toContain('draining');
 
         $run['cache']->forever('illuminate:queue:restart', time());

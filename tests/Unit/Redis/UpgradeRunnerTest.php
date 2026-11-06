@@ -261,9 +261,13 @@ it('passes when redis is unreachable', function () {
         currentVersion: '2.0.0',
     );
 
+    $startedAt = microtime(true);
+
     $runner->assertUpgradePath();
 
-    expect(implode("\n", $this->logged))->toContain('Upgrade path check skipped');
+    // One connect attempt: the default connector's retries wait at least 6s.
+    expect(microtime(true) - $startedAt)->toBeLessThan(3.0)
+        ->and(implode("\n", $this->logged))->toContain('Upgrade path check skipped');
 });
 
 it('short-circuits at the same version from the minimum up', function (string $version) {
@@ -301,5 +305,8 @@ it('never overwrites a stored version below the minimum, even when run directly'
     expect($result['ran'])->toBeFalse()
         ->and($this->ran)->toBe([])
         ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.3.9')
-        ->and($this->logged[0])->toContain('Refusing to start');
+        ->and($this->logged[0])
+        ->toContain('not recording this version, and the next start refuses')
+        ->toContain("SET {$this->prefix}version 1.4.0")
+        ->not->toContain('Refusing to start');
 });

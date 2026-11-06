@@ -1120,8 +1120,10 @@ LUA;
         $releases = $job->releases();
         $deadline = $job->releaseDeadline();
 
-        // Only the first release starts the clock, so releasing again cannot extend it.
-        if ($releases === 0) {
+        // The first release under a limit starts the clock, so a job released while
+        // the limit was off is still bounded once it is on, and releasing again
+        // cannot extend a deadline it already has.
+        if ($deadline === null) {
             $limit = $this->releaseLimitSeconds($queue);
             $deadline = $limit > 0 ? $this->availableAt(max(0, $delay)) + $limit : null;
         }
@@ -1142,8 +1144,9 @@ LUA;
     /**
      * The seconds a job may keep releasing itself on this queue, 0 for no limit.
      *
-     * Nothing here enforces it: this only decides the deadline a first release
-     * writes. The worker enforces it, so a stock `queue:work` ignores the deadline.
+     * Nothing here enforces it: this only decides the deadline a release writes on
+     * a job without one. The worker enforces it, so a stock `queue:work` ignores
+     * the deadline.
      */
     public function releaseLimitSeconds(string $queue): int
     {

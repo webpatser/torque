@@ -179,6 +179,7 @@ final class TorqueStartCommand extends Command
             config: $config,
             logger: fn (string $message) => $this->components->info($message),
             takeoverPid: $takeoverPid,
+            errorLogger: fn (string $message) => $this->components->error($message),
         );
 
         return $master->start();

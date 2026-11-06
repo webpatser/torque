@@ -196,11 +196,13 @@ LUA;
     /**
      * @param  array<string, mixed>  $config  Merged Torque config.
      * @param  Closure(string): void  $logger  Callback for outputting status messages.
+     * @param  (Closure(string): void)|null  $errorLogger  Callback for a refusal to start, `$logger` when null.
      */
     public function __construct(
         private readonly array $config,
         private readonly Closure $logger,
         private readonly ?int $takeoverPid = null,
+        private readonly ?Closure $errorLogger = null,
     ) {
         $this->artisanPath = base_path('artisan');
     }
@@ -1488,7 +1490,7 @@ LUA;
         try {
             UpgradeRunner::fromConfig($this->config, $this->logger)->assertUpgradePath();
         } catch (\DomainException $e) {
-            ($this->logger)($e->getMessage());
+            ($this->errorLogger ?? $this->logger)($e->getMessage());
 
             return false;
         }

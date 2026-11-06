@@ -31,7 +31,6 @@ final readonly class WorkerId
             if (ctype_xdigit($nonce) && strlen($nonce) === 8 && ctype_digit($pidPart)) {
                 return new self(implode('-', $parts), (int) $pidPart, $nonce);
             }
-
         }
 
         return new self($id, null, null);

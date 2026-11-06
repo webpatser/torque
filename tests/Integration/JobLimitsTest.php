@@ -477,6 +477,7 @@ describe('strict_attempts', function () {
             ->and($run['deadLetters'])->toBe(0)
             ->and(substr_count($run['output'], 'strict_attempts is off'))->toBe(1)
             ->and($run['output'])->toContain('is not counted either')
+            ->and($run['output'])->toContain('not at all if it has a retryUntil or $tries = 0')
             ->and($run['output'])->not->toContain('neither is one whose worker keeps dying');
     });
 

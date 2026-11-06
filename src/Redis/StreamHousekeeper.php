@@ -27,8 +27,8 @@ use function Fledge\Async\Redis\createRedisClient;
  * On top of that, {@see deepClean()} sweeps everything an upgrade from an
  * older Torque can leave behind: per-job event streams that never got their
  * terminal EXPIRE, index members pointing at streams that are gone, and
- * worker hashes of processes that are gone. It runs once per version through
- * {@see UpgradeRunner}, and on demand via `torque:prune --deep`.
+ * worker hashes of processes that are gone. It runs only on demand, via
+ * `torque:prune --deep`.
  *
  * The master runs the light pass on a timer (`dead_letter.prune_interval`);
  * the `torque:prune` command is the same logic on demand.

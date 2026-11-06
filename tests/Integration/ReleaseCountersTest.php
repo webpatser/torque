@@ -192,6 +192,32 @@ it('keeps the deadline of the first release on later ones', function () {
         ->and($payload['torque_releases'])->toBe(2);
 });
 
+it('starts the clock on a later release when the limit was off at the first', function () {
+    config(['torque.release_limit_seconds' => 0]);
+
+    counters_job($this->countersQueue)->release();
+
+    $second = counters_next($this->countersQueue);
+
+    expect($second->releaseDeadline())->toBeNull();
+
+    Carbon::setTestNow(Carbon::createFromTimestamp(1_800_000_500));
+    config(['torque.release_limit_seconds' => 3600]);
+
+    $second->release();
+
+    $third = counters_next($this->countersQueue);
+
+    expect($third->releaseDeadline())->toBe(1_800_000_500 + 3600)
+        ->and($third->releases())->toBe(2);
+
+    Carbon::setTestNow(Carbon::createFromTimestamp(1_800_000_900));
+
+    $third->release();
+
+    expect(counters_next($this->countersQueue)->releaseDeadline())->toBe(1_800_000_500 + 3600);
+});
+
 it('falls back to a limit of a day', function () {
     config(['torque.release_limit_seconds' => null]);
 
@@ -230,21 +256,6 @@ it('sets no deadline when the limit is off, and counts on', function (array $con
     'globally' => [['torque.release_limit_seconds' => 0]],
     'for the stream' => [['torque.release_limit_seconds' => 3600, 'torque.streams' => [TORQUE_COUNTERS_QUEUE => ['release_limit_seconds' => 0]]]],
 ]);
-
-it('does not start a deadline when the limit comes on after the first release', function () {
-    config(['torque.release_limit_seconds' => 0]);
-
-    counters_job($this->countersQueue)->release();
-
-    config(['torque.release_limit_seconds' => 3600]);
-
-    counters_next($this->countersQueue)->release();
-
-    $third = counters_next($this->countersQueue);
-
-    expect($third->releases())->toBe(2)
-        ->and($third->releaseDeadline())->toBeNull();
-});
 
 it('writes the counters in the igbinary format too', function () {
     $prefix = 'torque-counters-'.bin2hex(random_bytes(4)).':';
