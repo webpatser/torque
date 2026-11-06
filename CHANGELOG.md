@@ -31,7 +31,7 @@ Safer defaults, a time limit on `release()` loops, a derived drain window, six r
 - **Boot WARNs** for ini `memory_limit` below the setting, an effective grace below the derived one, and renamed keys in use.
 
 ### Removed
-- **The 0.16.0 and 1.0.0 upgrade steps and `LEGACY_BUCKETS_SUFFIX`.** `torque:prune --deep` still cleans old metric buckets.
+- **The 0.16.0 and 1.0.0 upgrade steps and `LEGACY_BUCKETS_SUFFIX`.** Delete an old `{prefix}metrics:buckets` by hand with `DEL`.
 - **The `{host}-{pid}` worker id form.** Only canonical ids parse with a pid.
 - **The legacy Slack message.** Slack alerts need `laravel/slack-notification-channel` 3.6 or newer, enforced by a composer conflict.
 

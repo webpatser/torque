@@ -157,7 +157,7 @@ return [
     | A worker whose real memory usage (memory_get_usage(true)) reaches this
     | many megabytes drains like at max_jobs_per_worker and exits with status
     | 12, as queue:work does; the master starts a replacement. Checked once a
-    | second. 0 or null turns it off. Keep PHP's ini `memory_limit` above this,
+    | second. Only 0 turns it off (null means 512). Keep PHP's ini `memory_limit` above this,
     | or PHP fatals before the check; a worker logs a WARN at boot when it is not.
     */
     'memory_limit' => (int) env('TORQUE_MEMORY_LIMIT', 512),
