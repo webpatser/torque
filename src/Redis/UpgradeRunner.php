@@ -12,32 +12,33 @@ use function Fledge\Async\Redis\createRedisClient;
 /**
  * Runs Torque's data upgrade steps once per installed version.
  *
- * Deploying a new Torque over an older one leaves keys behind that the new
- * code no longer writes or expires (0.15.0 leaked per-job event streams,
- * consumer names, and an uncapped dead-letter stream). Rather than asking
- * every site to remember a cleanup command, the master runs the steps for its
- * version on the first start after the deploy and records the version in
- * `{prefix}version`.
+ * Deploying a new Torque over an older one can leave keys behind that the new
+ * code no longer writes or expires. Rather than asking every site to remember
+ * a cleanup command, the master runs the steps for its version on the first
+ * start after the deploy and records the version in `{prefix}version`.
  *
  * Steps are an ordered `version => callable` map: on an upgrade every step
  * newer than the stored version runs, so a site jumping several releases gets
  * all of them. Each step returns per-category counts, which are merged into
- * one report and logged.
+ * one report and logged. This release owes no steps, so the default map is
+ * empty.
  *
- * Nothing here is allowed to be fatal. The caller wraps the run in a
- * try/catch, and a Redis outage simply means the upgrade retries on the next
- * master start.
+ * Steps are only kept for releases at or above {@see self::MINIMUM_STORED_VERSION}.
+ * Data older than that is refused by {@see self::assertUpgradePath()}, the one
+ * thing here that is fatal on purpose. Everything else is best-effort: the
+ * caller wraps the run in a try/catch, and a Redis outage simply means the
+ * upgrade retries on the next master start.
  */
 final class UpgradeRunner
 {
     /** Suffix of the key holding the last-upgraded version. */
     public const string VERSION_KEY_SUFFIX = 'version';
 
-    /** Pre-rollup hash of minute counts, last written by 0.15.x. */
-    public const string LEGACY_BUCKETS_SUFFIX = 'metrics:buckets';
-
     /** Stored for any install without a comparable release version. */
     public const string DEV_VERSION = 'dev';
+
+    /** The oldest stored release this version can upgrade from. */
+    public const string MINIMUM_STORED_VERSION = '1.4.0';
 
     private ?RedisClient $redis = null;
 
@@ -54,21 +55,13 @@ final class UpgradeRunner
     public function __construct(
         private readonly string $redisUri,
         private readonly string $prefix,
-        private readonly StreamHousekeeper $housekeeper,
         private readonly \Closure $logger,
         ?string $currentVersion = null,
         ?array $steps = null,
         private readonly ?RedisClient $client = null,
     ) {
         $this->currentVersion = $currentVersion ?? self::installedVersion();
-        $this->steps = $steps ?? [
-            // 0.16.0 is the first release with bounded keys, so it is also the
-            // release that has to clean up what earlier versions leaked.
-            '0.16.0' => fn (): array => $this->housekeeper->deepClean(),
-            // 1.0.0 dropped the on-the-fly migration of the pre-rollup
-            // buckets hash; whatever is still there is dead weight.
-            '1.0.0' => fn (): array => ['legacy_keys' => $this->deleteLegacyBuckets()],
-        ];
+        $this->steps = $steps ?? [];
     }
 
     /**
@@ -83,7 +76,6 @@ final class UpgradeRunner
         return new self(
             redisUri: (string) ($config['redis']['uri'] ?? 'redis://127.0.0.1:6379'),
             prefix: (string) ($config['redis']['prefix'] ?? 'torque:'),
-            housekeeper: StreamHousekeeper::fromConfig($config),
             logger: $logger,
             currentVersion: $currentVersion,
         );
@@ -125,7 +117,37 @@ final class UpgradeRunner
     }
 
     /**
+     * Refuse a stored release older than this version can upgrade from.
+     *
+     * Passes when nothing is recorded, when the stored value is `dev` or has no
+     * release number to compare, and when Redis cannot be reached: an outage
+     * must not stop a start, and without a stored version there is nothing to
+     * refuse. An installed dev checkout gets no exemption, it owes the removed
+     * steps just the same.
+     *
+     * @throws \DomainException With the operator-facing message, only on a refusal.
+     */
+    public function assertUpgradePath(): void
+    {
+        try {
+            $stored = $this->storedVersion();
+        } catch (\Throwable $e) {
+            ($this->logger)("Upgrade path check skipped ({$e->getMessage()}).");
+
+            return;
+        }
+
+        if (self::isBelowMinimum($stored)) {
+            throw new \DomainException($this->refusalMessage((string) $stored));
+        }
+    }
+
+    /**
      * Run every upgrade step newer than the stored version.
+     *
+     * The stored version is never overwritten while it is below the minimum,
+     * even when {@see self::assertUpgradePath()} passed during a Redis outage
+     * that has ended since: the next start still has to refuse.
      *
      * @return array{ran: bool, from: string|null, to: string, counts: array<string, int>}
      */
@@ -134,6 +156,12 @@ final class UpgradeRunner
         $current = $this->currentVersion;
         $stored = $this->storedVersion();
         $skipped = ['ran' => false, 'from' => $stored, 'to' => $current, 'counts' => []];
+
+        if (self::isBelowMinimum($stored)) {
+            ($this->logger)($this->refusalMessage((string) $stored));
+
+            return $skipped;
+        }
 
         if ($current !== self::DEV_VERSION && $stored !== null && $stored !== self::DEV_VERSION) {
             if (version_compare($stored, $current, '>')) {
@@ -190,7 +218,7 @@ final class UpgradeRunner
     /**
      * A step runs when nothing was recorded yet, when either side is a dev
      * install (no meaningful comparison), or when it is newer than what ran
-     * last. Jumping 0.15.0 to 0.18.0 therefore runs every step in between.
+     * last. Jumping 1.4.0 to 2.2.0 therefore runs every step in between.
      */
     private function stepApplies(string $stepVersion, ?string $stored, string $current): bool
     {
@@ -202,12 +230,30 @@ final class UpgradeRunner
     }
 
     /**
-     * Delete the pre-rollup `metrics:buckets` hash. Returns the number of
-     * keys removed, so a second run is a harmless zero.
+     * Compare only the leading release number, padded to three segments, so
+     * the suffix cannot decide: `1.4.0-rc.1`, `1.4.0.1` and `1.4.x-dev` have
+     * reached 1.4, while `1.3.9.9` and `1.3.x-dev` have not. A pre-release of
+     * the minimum counts as the minimum, since it carries everything the
+     * removed steps did. A value with no leading number cannot be called older
+     * and passes, like `dev`.
      */
-    private function deleteLegacyBuckets(): int
+    private static function isBelowMinimum(?string $stored): bool
     {
-        return (int) $this->redis()->execute('DEL', $this->prefix.self::LEGACY_BUCKETS_SUFFIX);
+        if ($stored === null || preg_match('/^v?(\d+(?:\.\d+)*)/', trim($stored), $matches) !== 1) {
+            return false;
+        }
+
+        $release = implode('.', array_pad(explode('.', $matches[1]), 3, '0'));
+
+        return version_compare($release, self::MINIMUM_STORED_VERSION, '<');
+    }
+
+    private function refusalMessage(string $stored): string
+    {
+        $minimum = self::MINIMUM_STORED_VERSION;
+
+        return "Refusing to start: Torque data in Redis was last upgraded by {$stored}, below {$minimum}, the oldest release this version upgrades from. "
+            ."Upgrade through 1.4.x first and start a master on it once, or skip the removed upgrade steps with: SET {$this->prefix}version {$minimum}";
     }
 
     private function redis(): RedisClient

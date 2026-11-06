@@ -211,6 +211,12 @@ LUA;
      */
     public function start(): int
     {
+        // First of all: the check only reads, so a refusal leaves no lock, PID
+        // file or worker behind, and a refused reload leaves the old master be.
+        if (! $this->upgradePathAllowed()) {
+            return 1;
+        }
+
         pcntl_async_signals(true);
 
         if ($this->takeoverPid === null) {
@@ -1456,6 +1462,26 @@ LUA;
         } catch (\Throwable $e) {
             ($this->logger)("Data upgrade skipped ({$e->getMessage()}); it runs again on the next start.");
         }
+    }
+
+    /**
+     * Whether the stored data version is one this release can upgrade from.
+     *
+     * Deliberately not part of the best-effort {@see runDataUpgrade()}: a
+     * refusal has to stop the start. A Redis outage is not a refusal, the
+     * runner passes on that itself.
+     */
+    private function upgradePathAllowed(): bool
+    {
+        try {
+            UpgradeRunner::fromConfig($this->config, $this->logger)->assertUpgradePath();
+        } catch (\DomainException $e) {
+            ($this->logger)($e->getMessage());
+
+            return false;
+        }
+
+        return true;
     }
 
     /**
