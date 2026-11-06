@@ -13,6 +13,8 @@ use Illuminate\Queue\TimeoutExceededException;
 
 /**
  * Represents a single job read from a Redis Stream via XREADGROUP.
+ *
+ * @internal Not part of the public API.
  */
 class StreamJob extends Job implements JobContract
 {

@@ -28,6 +28,8 @@ use function Illuminate\Support\enum_value;
  *
  * Every Redis command goes through {@see RedisClient::execute()} because
  * amphp/redis v2 has no typed stream helpers.
+ *
+ * @internal Not part of the public API; use the `torque` connection through `Queue::`.
  */
 class StreamQueue extends Queue implements ClearableQueue, QueueContract
 {

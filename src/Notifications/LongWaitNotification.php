@@ -6,8 +6,6 @@ namespace Webpatser\Torque\Notifications;
 
 use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Notifications\Notification;
-use Illuminate\Support\Str;
-use Psr\Http\Message\UriInterface;
 
 /**
  * Sent when a queue's oldest waiting job passes its `waits` threshold.
@@ -44,29 +42,13 @@ final class LongWaitNotification extends Notification
     }
 
     /**
-     * The message type for the route the package's router will pick.
+     * The Block Kit message, accepted by both the webhook channel and the Web API
+     * channel from laravel/slack-notification-channel 3.6 (enforced by a composer conflict).
      *
-     * A webhook URL goes to SlackWebhookChannel, which up to 3.5 only takes the legacy
-     * message and throws a TypeError on the Block Kit one; from 3.6 it takes both. Any
-     * other route goes to the Web API SlackChannel, which only takes Block Kit.
-     *
-     * Soft dependency: both classes only exist with laravel/slack-notification-channel.
+     * Soft dependency: the class only exists with laravel/slack-notification-channel.
      */
     public function toSlack(object $notifiable): mixed
     {
-        $route = method_exists($notifiable, 'routeNotificationFor')
-            ? $notifiable->routeNotificationFor('slack', $this)
-            : null;
-
-        if ($route instanceof UriInterface || (is_string($route) && Str::startsWith($route, ['http://', 'https://']))) {
-            $class = 'Illuminate\\Notifications\\Messages\\SlackMessage';
-
-            /** @var object $message */
-            $message = new $class; // @phpstan-ignore class.notFound
-
-            return $message->content($this->summary()); // @phpstan-ignore method.notFound
-        }
-
         $class = 'Illuminate\\Notifications\\Slack\\SlackMessage';
 
         /** @var object $message */

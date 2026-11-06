@@ -505,7 +505,7 @@ return [
     |--------------------------------------------------------------------------
     */
     'dashboard' => [
-        'enabled' => true,
+        'enabled' => (bool) env('TORQUE_DASHBOARD', false),
         'path' => 'torque',
         'middleware' => ['web', 'auth'],
         'poll_intervals' => [0, 1000, 2000, 5000, 10000, 30000],

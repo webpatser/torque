@@ -73,6 +73,8 @@ use function Fledge\Async\Redis\createRedisConnector;
  * dispatches them concurrently using Fibers gated by a semaphore. A dedicated
  * (non-pooled) Redis connection is used for the non-blocking XREADGROUP reads
  * so pool connections are never tied up by polling.
+ *
+ * @internal Not part of the public API.
  */
 final class WorkerProcess
 {

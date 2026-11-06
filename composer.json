@@ -13,6 +13,9 @@
         "revolt/event-loop": "^1.0",
         "webpatser/fledge-fiber": "^13.38"
     },
+    "conflict": {
+        "laravel/slack-notification-channel": "<3.6"
+    },
     "suggest": {
         "laravel/slack-notification-channel": "Required for Slack long-wait alerts (Torque::routeSlackNotificationsTo()).",
         "ext-igbinary": "Enables ~2x faster job payload encoding when TORQUE_SERIALIZER=igbinary is set, and globally speeds up PHP serialize() (sessions, cache) when igbinary.compact_strings is on."
@@ -20,7 +23,7 @@
     "require-dev": {
         "larastan/larastan": "^3.10",
         "laravel/pint": "^1.29",
-        "orchestra/testbench": "^10.0|^11.0",
+        "orchestra/testbench": "^11.0",
         "pestphp/pest": "^4.0"
     },
     "autoload": {

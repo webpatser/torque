@@ -27,6 +27,7 @@ abstract class TestCase extends BaseTestCase
         $app['config']->set('torque.redis.prefix', 'torque-test:');
         $app['config']->set('torque.redis.uri', env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'));
         $app['config']->set('torque.consumer_group', 'torque-test');
+        $app['config']->set('torque.dashboard.enabled', true);
 
         $app['config']->set('queue.connections.torque', [
             'driver' => 'torque',
