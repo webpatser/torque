@@ -15,6 +15,8 @@ use RuntimeException;
  * Declares its limits as properties, the way an application job would; a null
  * leaves the limit undeclared. Fails or releases itself until attempt $until.
  */
+use function Fledge\Async\delay;
+
 class JobLimitsProbeJob implements ShouldQueue
 {
     use InteractsWithQueue;
@@ -29,7 +31,7 @@ class JobLimitsProbeJob implements ShouldQueue
     public $retryUntil;
 
     /**
-     * @param  'throw'|'release'|'timeout'  $mode
+     * @param  'throw'|'release'|'timeout'|'hang'  $mode  Timeout throws the exception; hang runs into a real one.
      * @param  int  $until  First attempt that completes; 0 never does.
      * @param  int|list<int>|null  $backoff
      * @param  int  $throwAt  In release mode, first attempt that throws instead; 0 never does.
@@ -58,6 +60,10 @@ class JobLimitsProbeJob implements ShouldQueue
 
         if ($this->until > 0 && $this->attempts() >= $this->until) {
             return;
+        }
+
+        if ($this->mode === 'hang') {
+            delay(30);
         }
 
         if ($this->mode === 'timeout') {

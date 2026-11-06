@@ -2861,7 +2861,7 @@ LUA;
         }
 
         $backoffSeconds = $this->retryBackoff($job, $streamConfig);
-        $job->release($backoffSeconds);
+        $job->retryAfterFailure($backoffSeconds);
 
         // After the release, as in the stock worker: one that throws fires nothing.
         $this->dispatchSafely($events, new JobReleasedAfterException($connectionName, $job, $backoffSeconds, $exception));
@@ -3008,7 +3008,7 @@ LUA;
 
         $delay = max($this->retryBackoff($job, $streamConfig), (int) ($this->config['drain_grace_seconds'] ?? 10));
 
-        $job->release($delay);
+        $job->retryAfterFailure($delay);
 
         $this->dispatchSafely($events, new JobReleasedAfterException($connectionName, $job, $delay, $exception));
     }
@@ -3159,19 +3159,20 @@ LUA;
 
         $limit = $this->attemptLimit($job, $streamConfig);
 
-        return $limit !== null && $job->attempts() >= $limit;
+        return $limit !== null && $job->triesUsed() >= $limit;
     }
 
     /**
-     * The stock worker's check of a job about to run, which is what limits a job
-     * that keeps calling release(): that copy fails here instead of running again.
-     * It would also fail RateLimited and WithoutOverlapping release loops, which
-     * is why it waits for strict_attempts.
+     * The check of a job about to run: that copy fails here instead of running again.
+     * Tries are the stock worker's check under strict_attempts, except that a job's
+     * own releases do not use them up, so RateLimited and WithoutOverlapping release
+     * loops keep working. Those are limited by time instead: see
+     * guardAgainstReleaseLimit().
      *
      * A delivery after a worker went away does not raise attempts(): the crash guard
      * recognises a crash by that number staying the same. So those deliveries are
      * counted on the side, in the stream's redelivery hash, and added here. A job
-     * with a retryUntil is limited by that alone, as it is for releases.
+     * with a retryUntil is limited by that alone, for tries and releases both.
      *
      * @param  array<string, mixed>  $streamConfig
      * @param  int  $redeliveries  Deliveries of this entry after its first.
@@ -3180,36 +3181,75 @@ LUA;
      */
     private function guardAgainstExceededAttempts(StreamJob $job, array $streamConfig, int $redeliveries = 0): void
     {
-        if (! $this->enforcesStrictAttempts()) {
+        if (! $this->honoursJobLimits()) {
             return;
         }
 
-        $limit = null;
+        $strict = $this->enforcesStrictAttempts();
 
         if (($deadline = $this->retryDeadline($job)) !== null) {
-            $exceeded = time() > $deadline;
-        } else {
-            $limit = $this->attemptLimit($job, $streamConfig);
-            $exceeded = $limit !== null && $job->attempts() + $redeliveries > $limit;
-        }
+            if ($strict && time() > $deadline) {
+                throw MaxAttemptsExceededException::forJob($job);
+            }
 
-        if (! $exceeded) {
             return;
         }
 
-        if ($limit === null || $redeliveries === 0) {
-            throw MaxAttemptsExceededException::forJob($job);
+        $limit = $this->attemptLimit($job, $streamConfig);
+
+        // $tries = 0: neither its tries nor its releases are limited.
+        if ($limit === null) {
+            return;
         }
 
-        // Same exception, with what an operator needs to tell this apart from a
-        // job that used up its attempts by failing.
-        $exception = new MaxAttemptsExceededException("{$job->resolveName()} has been attempted too many times: {$job->attempts()} attempts and {$redeliveries} redeliveries after a worker went away, limit {$limit}.");
+        if ($strict && $job->triesUsed() + $redeliveries > $limit) {
+            if ($redeliveries === 0) {
+                throw MaxAttemptsExceededException::forJob($job);
+            }
+
+            // Same exception, with what an operator needs to tell this apart from a
+            // job that used up its attempts by failing.
+            throw $this->limitFailure($job, 'redelivery_limit', "{$job->triesUsed()} attempts and {$redeliveries} redeliveries after a worker went away, limit {$limit}.");
+        }
+
+        $this->guardAgainstReleaseLimit($job);
+    }
+
+    /**
+     * The limit on a job that keeps releasing itself, with or without strict_attempts.
+     * The deadline was written by the job's first release. An operator can still
+     * switch the limit off for a job that already carries one, so that is read too.
+     *
+     * @throws MaxAttemptsExceededException
+     */
+    private function guardAgainstReleaseLimit(StreamJob $job): void
+    {
+        $deadline = $job->releaseDeadline();
+
+        if ($deadline === null || time() <= $deadline) {
+            return;
+        }
+
+        $seconds = $job->streamQueue->releaseLimitSeconds($job->getQueue());
+
+        if ($seconds > 0) {
+            throw $this->limitFailure($job, 'release_limit', "{$job->releases()} releases, and its release limit of {$seconds} seconds has passed.");
+        }
+    }
+
+    /**
+     * The exception that ends a job about to run, with the reason its dead letter
+     * gets, logged since the job never gets to say why itself.
+     */
+    private function limitFailure(StreamJob $job, string $reason, string $details): MaxAttemptsExceededException
+    {
+        $exception = new MaxAttemptsExceededException("{$job->resolveName()} has been attempted too many times: {$details}");
         $exception->job = $job;
-        $this->failureReasons[$exception] = 'redelivery_limit';
+        $this->failureReasons[$exception] = $reason;
 
         fwrite(STDERR, "[torque:worker] Job {$job->getMessageId()} failed without running: {$exception->getMessage()}\n");
 
-        throw $exception;
+        return $exception;
     }
 
     /**
@@ -3245,7 +3285,7 @@ LUA;
      */
     private function retryBackoff(StreamJob $job, array $streamConfig): int
     {
-        $attempts = $job->attempts();
+        $attempts = $job->triesUsed();
 
         if ($this->honoursJobLimits()) {
             // As stock's calculateBackoff(). The payload holds "1,5,10" for [1, 5, 10].
@@ -3368,9 +3408,7 @@ LUA;
     private function announceLimitSettings(array $streams): void
     {
         if (! $this->honoursJobLimits()) {
-            if ((bool) ($this->config['strict_attempts'] ?? false)) {
-                fwrite(STDERR, "[torque:worker] WARN strict_attempts is ignored while job_limits is stream\n");
-            }
+            fwrite(STDERR, "[torque:worker] WARN strict_attempts and release_limit_seconds are ignored while job_limits is stream, so a job that keeps calling release() is not limited\n");
 
             return;
         }
@@ -3384,7 +3422,7 @@ LUA;
         }
 
         if (! $this->enforcesStrictAttempts()) {
-            fwrite(STDERR, "[torque:worker] NOTE strict_attempts is off: attempts and retryUntil are only checked after a thrown exception, so a job that keeps calling release() is not limited. A delivery after a worker died is not counted either, so only maxExceptions limits a job whose worker keeps dying\n");
+            fwrite(STDERR, "[torque:worker] NOTE strict_attempts is off: attempts and retryUntil are only checked after a thrown exception, so only release_limit_seconds limits a job that keeps calling release(). A delivery after a worker died is not counted either, so only maxExceptions limits a job whose worker keeps dying\n");
         }
     }
 

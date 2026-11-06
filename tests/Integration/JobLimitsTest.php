@@ -25,9 +25,10 @@ use Webpatser\Torque\Tests\Fixtures\JobLimitsProbeJob;
 /**
  * @param  array<string, mixed>  $stream  Config of the job's stream.
  * @param  array<string, mixed>  $options  Top-level worker options.
- * @return array{attempts: list<int>, backoffs: list<int>, delays: list<int|null>, failed: list<string>, output: string, waiting: int, pending: int, deadLetters: int}
+ * @param  array<string, mixed>  $payload  Fields to overwrite in the queued payload, for a job far along.
+ * @return array{attempts: list<int>, backoffs: list<int>, delays: list<int|null>, failed: list<string>, output: string, waiting: int, pending: int, deadLetters: int, reasons: list<string|null>, payloads: list<array<string, mixed>>}
  */
-function torque_run_limits_worker(object $job, array $stream, int $maxJobs, array $options = [], ?int $later = null): array
+function torque_run_limits_worker(object $job, array $stream, int $maxJobs, array $options = [], ?int $later = null, array $payload = []): array
 {
     $redis = torqueRedis();
     $token = bin2hex(random_bytes(4));
@@ -54,6 +55,12 @@ function torque_run_limits_worker(object $job, array $stream, int $maxJobs, arra
         (void) $queue->push($job, '', $queueName);
     } else {
         (void) $queue->later($later, $job, '', $queueName);
+    }
+
+    if ($payload !== []) {
+        [[$id, $fields]] = $redis->execute('XRANGE', $prefix.$queueName, '-', '+');
+        $redis->execute('XDEL', $prefix.$queueName, (string) $id);
+        $redis->execute('XADD', $prefix.$queueName, '*', 'payload', json_encode($payload + json_decode((string) $fields[1], true), JSON_THROW_ON_ERROR));
     }
 
     $settings = ['stream' => $stream, 'max_jobs' => $maxJobs] + $options;
@@ -93,8 +100,23 @@ function torque_run_limits_worker(object $job, array $stream, int $maxJobs, arra
         $rows = array_map(static fn (string $line): array => json_decode($line, true, flags: JSON_THROW_ON_ERROR), $lines);
         $ofType = static fn (string $type): array => array_values(array_filter($rows, static fn (array $row): bool => $row['type'] === $type));
         $stream = $prefix.$queueName;
+        $deadLetters = $redis->execute('XRANGE', $prefix.'dead-letter', '-', '+') ?? [];
+        $stored = [
+            ...array_map(static fn (array $entry): string => (string) $entry[1][1], $redis->execute('XRANGE', $stream, '-', '+') ?? []),
+            ...array_map(strval(...), $redis->execute('ZRANGE', $stream.':delayed', '0', '-1') ?? []),
+        ];
 
         return [
+            'reasons' => array_map(static function (array $entry): ?string {
+                foreach (array_chunk($entry[1], 2) as [$field, $value]) {
+                    if ((string) $field === 'reason') {
+                        return (string) $value;
+                    }
+                }
+
+                return null;
+            }, $deadLetters),
+            'payloads' => array_map(static fn (string $body): array => json_decode($body, true, flags: JSON_THROW_ON_ERROR), $stored),
             'attempts' => array_column($ofType('handled'), 'attempt'),
             'backoffs' => array_column($ofType('released'), 'backoff'),
             'delays' => array_column($ofType('released'), 'delayed_for'),
@@ -266,33 +288,40 @@ describe('backoff', function () {
             ->and($run['deadLetters'])->toBe(1);
     });
 
-    it('caps exponential backoff at an hour, for a job far along on its $tries', function (int $throwAt, int $expected) {
-        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', tries: 25, throwAt: $throwAt), ['max_retries' => 3], maxJobs: $throwAt);
+    it('caps exponential backoff at an hour, for a job far along on its $tries', function (int $priorTries, int $expected) {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 25), ['max_retries' => 3], maxJobs: 1, payload: ['attempts' => $priorTries]);
 
-        expect($run['attempts'])->toBe(range(1, $throwAt))
+        expect($run['attempts'])->toBe([$priorTries + 1])
             ->and($run['backoffs'])->toBe([$expected])
             ->and($run['deadLetters'])->toBe(0);
     })->with([
-        'below the cap' => [11, 2048],
-        'above the cap' => [17, 3600],
+        'below the cap' => [10, 2048],
+        'above the cap' => [16, 3600],
     ]);
 
-    it('caps exponential backoff after a release loop with a far retryUntil', function () {
-        $job = new JobLimitsProbeJob('release', retryUntil: time() + 86400, throwAt: 20);
+    it('does not raise exponential backoff for a job that released itself first', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', tries: 25, throwAt: 4), ['max_retries' => 3], maxJobs: 4);
 
-        $run = torque_run_limits_worker($job, ['max_retries' => 3], maxJobs: 20);
+        expect($run['attempts'])->toBe([1, 2, 3, 4])
+            ->and($run['backoffs'])->toBe([2]);
+    });
 
-        expect($run['attempts'])->toBe(range(1, 20))
+    it('caps exponential backoff for a job far along with a far retryUntil', function () {
+        $job = new JobLimitsProbeJob(retryUntil: time() + 86400);
+
+        $run = torque_run_limits_worker($job, ['max_retries' => 3], maxJobs: 1, payload: ['attempts' => 19]);
+
+        expect($run['attempts'])->toBe([20])
             ->and($run['backoffs'])->toBe([3600])
             ->and($run['delays'][0])->toBeIn([3599, 3600]);
     });
 
     it('clamps exponential backoff to retryUntil, leaving time for a run before it', function () {
-        $job = new JobLimitsProbeJob('release', until: 8, retryUntil: time() + 40, throwAt: 7);
+        $job = new JobLimitsProbeJob(until: 8, retryUntil: time() + 40);
 
-        $run = torque_run_limits_worker($job, ['max_retries' => 3], maxJobs: 8);
+        $run = torque_run_limits_worker($job, ['max_retries' => 3], maxJobs: 2, payload: ['attempts' => 6]);
 
-        expect($run['attempts'])->toBe(range(1, 8))
+        expect($run['attempts'])->toBe([7, 8])
             ->and($run['backoffs'][0])->toBeLessThanOrEqual(38)->toBeGreaterThan(20)
             ->and($run['deadLetters'])->toBe(0);
     });
@@ -344,8 +373,99 @@ describe('job_limits: stream', function () {
         $run = torque_run_limits_worker($job, ['max_retries' => 1], maxJobs: 3, options: ['job_limits' => 'stream', 'strict_attempts' => true]);
 
         expect($run['attempts'])->toBe([1, 2, 3])
+            ->and($run['deadLetters'])->toBe(0)
+            ->and($run['output'])->toContain('strict_attempts and release_limit_seconds are ignored while job_limits is stream');
+    });
+});
+
+describe('release limit', function () {
+    $past = fn (): array => ['attempts' => 2, 'torque_releases' => 2, 'torque_release_deadline' => time() - 10];
+
+    it('dead-letters a real release() loop once its limit has passed', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('release'), ['max_retries' => 3], maxJobs: 100000, options: ['release_limit_seconds' => 1, 'lifetime' => 3]);
+
+        expect(count($run['attempts']))->toBeGreaterThan(1)
+            ->and($run['failed'])->toBe([MaxAttemptsExceededException::class])
+            ->and($run['reasons'])->toBe(['release_limit'])
+            ->and($run['waiting'])->toBe(0)
+            ->and($run['pending'])->toBe(0)
+            ->and($run['output'])->toContain('failed without running');
+    });
+
+    it('fails a job past its deadline without running it, whatever strict_attempts says', function (bool $strict) use ($past) {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 5), ['max_retries' => 3], maxJobs: 1, options: ['strict_attempts' => $strict], payload: $past());
+
+        expect($run['attempts'])->toBe([])
+            ->and($run['reasons'])->toBe(['release_limit'])
+            ->and($run['waiting'])->toBe(0);
+    })->with(['strict' => [true], 'not strict' => [false]]);
+
+    it('runs a job before its deadline', function () {
+        $payload = ['attempts' => 2, 'torque_releases' => 2, 'torque_release_deadline' => time() + 600];
+
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(until: 1, tries: 1), ['max_retries' => 3], maxJobs: 1, options: ['strict_attempts' => true], payload: $payload);
+
+        expect($run['attempts'])->toBe([3])
             ->and($run['deadLetters'])->toBe(0);
     });
+
+    it('does not apply to a job past its deadline when', function (array $jobArguments, array $stream, array $options) use ($past) {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(...['until' => 1, ...$jobArguments]), $stream + ['max_retries' => 3], maxJobs: 1, options: $options, payload: $past());
+
+        expect($run['attempts'])->toBe([3])
+            ->and($run['deadLetters'])->toBe(0);
+    })->with([
+        'the limit is off' => [[], [], ['release_limit_seconds' => 0]],
+        'the limit is off for the stream' => [[], ['release_limit_seconds' => 0], []],
+        'it has a retryUntil' => [['retryUntil' => time() + 600], [], []],
+        'its $tries is 0' => [['tries' => 0], [], []],
+        'job_limits is stream' => [[], [], ['job_limits' => 'stream']],
+    ]);
+
+    it('ignores the counters of a job whose attempts were reset by queue:retry', function () use ($past) {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(until: 1), ['max_retries' => 3], maxJobs: 1, payload: ['attempts' => 0] + $past());
+
+        expect($run['attempts'])->toBe([1])
+            ->and($run['deadLetters'])->toBe(0);
+    });
+});
+
+describe('what counts as a try', function () {
+    it('counts a retry after a throw, and leaves the release counters alone', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 3), ['max_retries' => 3], maxJobs: 1);
+
+        expect($run['backoffs'])->toBe([2])
+            ->and($run['payloads'])->toHaveCount(1)
+            ->and($run['payloads'][0]['attempts'])->toBe(1)
+            ->and($run['payloads'][0])->not->toHaveKeys(['torque_releases', 'torque_release_deadline']);
+    });
+
+    it('counts a retry after a real timeout, and leaves the release counters alone', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('hang', tries: 3), ['max_retries' => 3, 'timeout' => 1], maxJobs: 1, options: ['timeouts' => ['enabled' => true]]);
+
+        expect($run['attempts'])->toBe([1])
+            ->and($run['backoffs'])->toBe([2])
+            ->and($run['payloads'])->toHaveCount(1)
+            ->and($run['payloads'][0]['attempts'])->toBe(1)
+            ->and($run['payloads'][0])->not->toHaveKeys(['torque_releases', 'torque_release_deadline']);
+    });
+
+    it('keeps a release deadline through a retry after a throw', function () {
+        $deadline = time() + 600;
+
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 3), ['max_retries' => 3], maxJobs: 1, payload: ['attempts' => 1, 'torque_releases' => 1, 'torque_release_deadline' => $deadline]);
+
+        expect($run['payloads'][0])->toMatchArray(['attempts' => 2, 'torque_releases' => 1, 'torque_release_deadline' => $deadline]);
+    });
+
+    it('spends tries on throws only, not on the releases between them', function (bool $strict) {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', tries: 2, throwAt: 2), ['max_retries' => 3], maxJobs: 3, options: ['strict_attempts' => $strict]);
+
+        expect($run['attempts'])->toBe([1, 2, 3])
+            ->and($run['backoffs'])->toBe([2])
+            ->and($run['failed'])->toBe([RuntimeException::class])
+            ->and($run['deadLetters'])->toBe(1);
+    })->with(['strict' => [true], 'not strict' => [false]]);
 });
 
 describe('strict_attempts', function () {
@@ -370,20 +490,20 @@ describe('strict_attempts', function () {
             ->and($run['pending'])->toBe(0);
     });
 
-    it('on: limits release() to $tries', function () {
-        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', until: 5, tries: 2), ['max_retries' => 3], maxJobs: 3, options: ['strict_attempts' => true]);
+    it('on: does not spend $tries on release()', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', until: 5, tries: 2), ['max_retries' => 3], maxJobs: 5, options: ['strict_attempts' => true]);
 
-        expect($run['attempts'])->toBe([1, 2])
-            ->and($run['failed'])->toBe([MaxAttemptsExceededException::class])
-            ->and($run['deadLetters'])->toBe(1)
+        expect($run['attempts'])->toBe([1, 2, 3, 4, 5])
+            ->and($run['failed'])->toBe([])
+            ->and($run['deadLetters'])->toBe(0)
             ->and($run['waiting'])->toBe(0);
     });
 
-    it('on: limits release() of a job that declares nothing to the stream limit', function () {
-        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', until: 5), ['max_retries' => 2], maxJobs: 3, options: ['strict_attempts' => true]);
+    it('on: does not spend the stream limit on release() of a job that declares nothing', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('release', until: 5), ['max_retries' => 2], maxJobs: 5, options: ['strict_attempts' => true]);
 
-        expect($run['attempts'])->toBe([1, 2])
-            ->and($run['deadLetters'])->toBe(1);
+        expect($run['attempts'])->toBe([1, 2, 3, 4, 5])
+            ->and($run['deadLetters'])->toBe(0);
     });
 
     it('on: still gives every job its one run at max_retries 0', function () {

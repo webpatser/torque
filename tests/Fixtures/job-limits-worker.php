@@ -41,6 +41,9 @@ config([
     'cache.default' => 'array',
     'queue.failed.driver' => 'null',
     'job_limits_probe' => ['log' => $logFile],
+    // StreamQueue reads the release limit from here, not from the worker's options.
+    "torque.streams.{$queue}" => $settings['stream'],
+    'torque.release_limit_seconds' => $settings['release_limit_seconds'] ?? 86400,
 ]);
 
 $log = static function (array $row) use ($logFile): void {
@@ -80,4 +83,4 @@ Event::listen(JobReleasedAfterException::class, static function (JobReleasedAfte
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 1,
     'intervals' => require __DIR__.'/fast-intervals.php',
-], array_intersect_key($settings, ['job_limits' => true, 'strict_attempts' => true]))))->run();
+], array_intersect_key($settings, ['job_limits' => true, 'strict_attempts' => true, 'timeouts' => true]))))->run();

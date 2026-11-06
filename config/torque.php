@@ -240,6 +240,18 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Release limit
+    |--------------------------------------------------------------------------
+    | Seconds a job may keep calling release(), counted from the available-at of
+    | its first release; 0 is off. Past it the job reaches the dead letter (reason
+    | `release_limit`), also with `strict_attempts` off. A stream's own
+    | `release_limit_seconds` wins over this one. A job's `retryUntil` replaces the
+    | limit, `$tries = 0` opts out, and `job_limits: stream` ignores it.
+    */
+    'release_limit_seconds' => (int) env('TORQUE_RELEASE_LIMIT', 86400),
+
+    /*
+    |--------------------------------------------------------------------------
     | Job timeouts
     |--------------------------------------------------------------------------
     | Off, `$timeout` and a stream's `timeout` mean nothing and a job runs for as
