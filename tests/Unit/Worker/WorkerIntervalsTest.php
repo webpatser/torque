@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 it('ships the production periods as the config defaults', function () {
@@ -39,8 +39,7 @@ it('floors a period so a bad value cannot spin the loop', function (mixed $value
 })->with([0, -1, 0.001, '0']);
 
 it('keeps the 15 second drain slack without the key, and floors it at 1', function () {
-    expect(MasterProcess::drainSlackSeconds([]))->toBe(15)
-        ->and(MasterProcess::drainSlackSeconds(['intervals' => ['drain_slack_seconds' => 3]]))->toBe(3)
-        ->and(MasterProcess::drainSlackSeconds(['intervals' => ['drain_slack_seconds' => 0]]))->toBe(1)
-        ->and(MasterProcess::drainWorstCaseSeconds(10, 3))->toBe(23);
+    expect(DrainSettings::slackSeconds([]))->toBe(15)
+        ->and(DrainSettings::slackSeconds(['intervals' => ['drain_slack_seconds' => 3]]))->toBe(3)
+        ->and(DrainSettings::slackSeconds(['intervals' => ['drain_slack_seconds' => 0]]))->toBe(1);
 });

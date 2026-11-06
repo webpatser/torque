@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
-use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\DrainSettings;
 
 /**
  * Generate a Supervisor configuration file for running Torque in production.
@@ -54,12 +54,9 @@ final class TorqueSupervisorCommand extends Command
         // stopwaitsecs has to clear a full drain, because killasgroup means
         // supervisord SIGKILLs the whole fleet the moment it expires. A fixed
         // 60 was shorter than the drain on any installation that raised
-        // drain_grace_seconds, so it scales with that ceiling and keeps 60 as
-        // the floor for the default grace.
-        $stopWaitSecs = max(60, MasterProcess::drainWorstCaseSeconds(
-            (int) config('torque.drain_grace_seconds', 10),
-            MasterProcess::drainSlackSeconds((array) config('torque')),
-        ));
+        // drain_grace_seconds, so it scales with the worst case and keeps 60
+        // as the floor.
+        $stopWaitSecs = max(60, DrainSettings::drainWorstCaseSeconds((array) config('torque')));
 
         // --replace makes the supervised start converge: a live master that
         // is not supervised (stray takeover master, manual start) is absorbed

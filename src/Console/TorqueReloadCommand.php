@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Illuminate\Console\Command;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -28,10 +29,10 @@ use Webpatser\Torque\Support\ProcessInspector;
  * many masters are alive at the moment.
  *
  * Two clocks are at play and they are not the same one. `--timeout` is how
- * long *this command* waits before it stops watching; `drain_grace_seconds`
- * is the ceiling the master and its workers hold themselves to. Left
- * unset, `--timeout` derives from that ceiling, so the default can no
- * longer be shorter than the drain it is waiting for.
+ * long *this command* waits before it stops watching; `reload_pause_seconds`
+ * and `drain_grace_seconds` are the ceilings the master and its workers hold
+ * themselves to. Left unset, `--timeout` derives from those, so the default
+ * can no longer be shorter than the drain it is waiting for.
  */
 #[AsCommand(name: 'torque:reload')]
 final class TorqueReloadCommand extends Command
@@ -41,7 +42,7 @@ final class TorqueReloadCommand extends Command
         {--drain : Only signal the running master to drain; do not spawn a replacement}
         {--if-running : Exit successfully when no master is running instead of failing (for deploy scripts)}
         {--force : Spawn a takeover master even when the running master is supervised}
-        {--timeout= : Seconds to wait for the old master to exit after the drain signal (default: derived from drain_grace_seconds)}
+        {--timeout= : Seconds to wait for the old master to exit after the drain signal (default: the drain worst case, reload_pause_seconds + drain_grace_seconds + slack)}
         {--health-timeout=45 : Seconds to wait for the new master to take over the PID file (covers its worker-heartbeat readiness gate)}';
 
     /** @var string */
@@ -210,10 +211,7 @@ final class TorqueReloadCommand extends Command
             return self::FAILURE;
         }
 
-        $worstCase = MasterProcess::drainWorstCaseSeconds(
-            (int) config('torque.drain_grace_seconds', 10),
-            MasterProcess::drainSlackSeconds((array) config('torque')),
-        );
+        $worstCase = DrainSettings::drainWorstCaseSeconds((array) config('torque'));
 
         $signalSlack = max(0, (int) config('torque.intervals.reload_signal_slack_seconds', self::SIGNAL_SLACK_SECONDS));
         $window = $timeout === null ? $worstCase : $timeout + $signalSlack;
@@ -232,7 +230,7 @@ final class TorqueReloadCommand extends Command
         if ($window < $worstCase) {
             $this->components->info(
                 "Old master (PID: {$pid}) is still draining after {$window}s; leaving it to its own "
-                ."drain_grace_seconds ceiling ({$worstCase}s worst case). It stops accepting work "
+                ."drain ceiling ({$worstCase}s worst case). It stops accepting work "
                 .'from the moment it was signalled and exits on its own.',
             );
 

@@ -114,7 +114,7 @@ it('generates valid supervisor config with required directives', function () {
         ->toContain('torque:start')
         ->toContain('autostart=true')
         ->toContain('autorestart=true')
-        ->toContain('stopwaitsecs=60')
+        ->toContain('stopwaitsecs=85')
         ->toContain('redirect_stderr=true')
         ->toContain('stopasgroup=true')
         ->toContain('killasgroup=true');
@@ -129,8 +129,31 @@ it('scales stopwaitsecs with drain_grace_seconds', function () {
     $this->artisan('torque:supervisor')
         ->assertSuccessful();
 
+    // pause 10 + grace 300 + slack 15
     expect(file_get_contents(storage_path('torque-supervisor.conf')))
-        ->toContain('stopwaitsecs=615');
+        ->toContain('stopwaitsecs=325');
+});
+
+it('scales stopwaitsecs with reload_pause_seconds', function () {
+    config()->set('torque.drain_grace_seconds', 300);
+    config()->set('torque.reload_pause_seconds', 100);
+
+    $this->artisan('torque:supervisor')
+        ->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('stopwaitsecs=415');
+});
+
+it('covers a grace derived from the streams in stopwaitsecs', function () {
+    config()->set('torque.drain_grace_seconds', null);
+    config()->set('torque.streams', ['long' => ['timeout' => 200, 'retry_after' => 240]]);
+
+    $this->artisan('torque:supervisor')
+        ->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('stopwaitsecs=225');
 });
 
 it('follows a raised drain_slack_seconds in stopwaitsecs', function () {
@@ -141,10 +164,10 @@ it('follows a raised drain_slack_seconds in stopwaitsecs', function () {
         ->assertSuccessful();
 
     expect(file_get_contents(storage_path('torque-supervisor.conf')))
-        ->toContain('stopwaitsecs=700');
+        ->toContain('stopwaitsecs=410');
 });
 
-it('keeps 60 as the stopwaitsecs floor at the default grace', function () {
+it('keeps 60 as the stopwaitsecs floor', function () {
     config()->set('torque.drain_grace_seconds', 10);
 
     $this->artisan('torque:supervisor')

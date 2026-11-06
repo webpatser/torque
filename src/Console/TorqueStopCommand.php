@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
-use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -22,7 +22,7 @@ final class TorqueStopCommand extends Command
     /** @var string */
     protected $signature = 'torque:stop
         {--force : Send SIGKILL instead of SIGTERM}
-        {--timeout= : Seconds to wait for a graceful shutdown before SIGKILL (default: derived from drain_grace_seconds)}';
+        {--timeout= : Seconds to wait for a graceful shutdown before SIGKILL (default: the drain worst case, reload_pause_seconds + drain_grace_seconds + slack)}';
 
     /** @var string */
     protected $description = 'Stop the Torque queue worker master process';
@@ -134,7 +134,7 @@ final class TorqueStopCommand extends Command
     /**
      * Seconds to wait for a graceful shutdown before escalating to SIGKILL.
      *
-     * Derived from `drain_grace_seconds` unless `--timeout` says otherwise,
+     * The drain worst case unless `--timeout` says otherwise,
      * so the wait can never be shorter than the drain the fleet is entitled
      * to. Idle workers exit immediately (they have since 0.16.5), so a large
      * ceiling costs nothing on a quiet fleet.
@@ -147,10 +147,7 @@ final class TorqueStopCommand extends Command
             return max(0, (int) $option);
         }
 
-        return MasterProcess::drainWorstCaseSeconds(
-            (int) config('torque.drain_grace_seconds', 10),
-            MasterProcess::drainSlackSeconds((array) config('torque')),
-        );
+        return DrainSettings::drainWorstCaseSeconds((array) config('torque'));
     }
 
     /**

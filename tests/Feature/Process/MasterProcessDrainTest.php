@@ -9,7 +9,7 @@ use Webpatser\Torque\Process\MasterProcess;
 /*
  * `MasterProcess::handleDrainTick()` is the half-step the monitor loop runs
  * each tick: if a SIGUSR2 came in, set the Redis paused key and start the
- * grace timer; if the grace has elapsed, SIGTERM workers and set
+ * pause timer; if the pause has elapsed, SIGTERM workers and set
  * $shouldStop so the loop exits.
  *
  * The drain state is private; tests reach through ReflectionProperty rather
@@ -17,8 +17,8 @@ use Webpatser\Torque\Process\MasterProcess;
  * pcntl_sigtimedwait and spawn workers). We assert the contract:
  *
  *   - First tick after SIGUSR2 promotes drainRequested → draining + start time.
- *   - A tick before the grace expires leaves $shouldStop alone.
- *   - A tick after the grace expires sets $shouldStop.
+ *   - A tick before the pause expires leaves $shouldStop alone.
+ *   - A tick after the pause expires sets $shouldStop.
  *   - A second drainRequested while already draining is a no-op.
  */
 
@@ -30,6 +30,7 @@ function makeMasterUnderTest(array $config = []): MasterProcess
                 'uri' => 'redis://127.0.0.1:6379/15',
                 'prefix' => 'torque-drain-test:',
             ],
+            'reload_pause_seconds' => 2,
             'drain_grace_seconds' => 2,
         ], $config),
         fn () => null,
@@ -57,8 +58,8 @@ it('promotes drainRequested into an active drain on the next tick', function () 
         ->and(getMasterPrivate($master, 'shouldStop'))->toBeFalse();
 });
 
-it('leaves shouldStop alone while the grace period is still running', function () {
-    $master = makeMasterUnderTest(['drain_grace_seconds' => 5]);
+it('leaves shouldStop alone while the pause is still running', function () {
+    $master = makeMasterUnderTest(['reload_pause_seconds' => 5]);
     setMasterPrivate($master, 'draining', true);
     setMasterPrivate($master, 'drainStartedAt', microtime(true));
 
@@ -68,8 +69,8 @@ it('leaves shouldStop alone while the grace period is still running', function (
         ->and(getMasterPrivate($master, 'draining'))->toBeTrue();
 });
 
-it('sets shouldStop once the drain grace has elapsed', function () {
-    $master = makeMasterUnderTest(['drain_grace_seconds' => 1]);
+it('sets shouldStop once the pause has elapsed', function () {
+    $master = makeMasterUnderTest(['reload_pause_seconds' => 1]);
     setMasterPrivate($master, 'draining', true);
     setMasterPrivate($master, 'drainStartedAt', microtime(true) - 5);
 
@@ -77,6 +78,24 @@ it('sets shouldStop once the drain grace has elapsed', function () {
 
     expect(getMasterPrivate($master, 'shouldStop'))->toBeTrue()
         ->and(getMasterPrivate($master, 'draining'))->toBeFalse();
+});
+
+it('waits on the pause and not on the grace, which belongs to the workers', function () {
+    // In 1.x this one value was both clocks, so a grace sized for long jobs also
+    // kept pickup paused that long.
+    $longGrace = makeMasterUnderTest(['reload_pause_seconds' => 1, 'drain_grace_seconds' => 7200]);
+    setMasterPrivate($longGrace, 'draining', true);
+    setMasterPrivate($longGrace, 'drainStartedAt', microtime(true) - 5);
+
+    $longPause = makeMasterUnderTest(['reload_pause_seconds' => 300, 'drain_grace_seconds' => 1]);
+    setMasterPrivate($longPause, 'draining', true);
+    setMasterPrivate($longPause, 'drainStartedAt', microtime(true) - 5);
+
+    $longGrace->handleDrainTick();
+    $longPause->handleDrainTick();
+
+    expect(getMasterPrivate($longGrace, 'shouldStop'))->toBeTrue()
+        ->and(getMasterPrivate($longPause, 'shouldStop'))->toBeFalse();
 });
 
 it('is a no-op when no drain has been requested', function () {
@@ -104,7 +123,7 @@ it('does not re-promote drainRequested while a drain is already in progress', fu
 });
 
 it('sets the paused key with an expiry so a drained-away master cannot leave the queue paused forever', function () {
-    $master = makeMasterUnderTest(['drain_grace_seconds' => 2]);
+    $master = makeMasterUnderTest(['reload_pause_seconds' => 3, 'drain_grace_seconds' => 2]);
     setMasterPrivate($master, 'drainRequested', true);
 
     $master->handleDrainTick();
@@ -113,8 +132,9 @@ it('sets the paused key with an expiry so a drained-away master cannot leave the
     $ttl = (int) $redis->execute('TTL', 'torque-drain-test:paused');
     $value = (string) $redis->execute('GET', 'torque-drain-test:paused');
 
-    // grace (2s) + 60s buffer; TTL counts down, so anything in (0, 62] is correct.
-    expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(62)
+    // pause (3s) + grace (2s) + 60s buffer; TTL counts down, so anything in (62, 65]
+    // is correct, and over 62 proves the pause is in it.
+    expect($ttl)->toBeGreaterThan(62)->toBeLessThanOrEqual(65)
         // The value scopes the pause to this master's own fleet: workers
         // compare the embedded PID against their parent and ignore a drain
         // that is not theirs (see WorkerProcess::shouldPauseFor()).
@@ -124,9 +144,9 @@ it('sets the paused key with an expiry so a drained-away master cannot leave the
 });
 
 /*
- * The grace is a ceiling, not a wait. Before this, a draining master kept
- * pickup paused for the whole drain_grace_seconds even with an idle fleet, so
- * on an installation sizing the grace for long jobs (7200s on scrpr) every
+ * The pause is a ceiling, not a wait. Before this, a draining master kept
+ * pickup paused for its whole window even with an idle fleet, so on an
+ * installation sizing the 1.x grace for long jobs (7200s on scrpr) every
  * `torque:reload` parked the queue for two hours.
  */
 
@@ -157,8 +177,8 @@ it('counts a heartbeat without a slot count as idle', function () {
     expect(MasterProcess::fleetDrainComplete(['host-1-aa' => []]))->toBeTrue();
 });
 
-it('falls back to the grace timer when there is no metrics publisher', function () {
-    $master = makeMasterUnderTest(['drain_grace_seconds' => 300]);
+it('falls back to the pause timer when there is no metrics publisher', function () {
+    $master = makeMasterUnderTest(['reload_pause_seconds' => 300]);
     setMasterPrivate($master, 'draining', true);
     setMasterPrivate($master, 'drainStartedAt', microtime(true));
 
@@ -194,7 +214,7 @@ it('sees an idle fleet through the metrics publisher', function () {
 
     $master = makeMasterUnderTest([
         'redis' => ['uri' => 'redis://127.0.0.1:6379/15', 'prefix' => $prefix],
-        'drain_grace_seconds' => 7200,
+        'reload_pause_seconds' => 7200,
     ]);
     setMasterPrivate($master, 'metricsPublisher', $publisher);
     setMasterPrivate($master, 'workerPids', [4242 => true]);

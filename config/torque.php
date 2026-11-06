@@ -81,11 +81,20 @@ return [
     | for the longest job you are willing to wait for, not for how long you
     | want a rotation or a deploy to take.
     |
-    | Also reused by `torque:reload`: when the master receives SIGUSR2, it
-    | pauses pickup, waits up to this many seconds for in-flight jobs to
-    | clear, and then signals workers to stop.
+    | Null derives it: the longest stream `timeout`, or `retry_after` for a
+    | stream without one, 300 at most. An explicit value wins.
     */
-    'drain_grace_seconds' => (int) env('TORQUE_DRAIN_GRACE', 10),
+    'drain_grace_seconds' => env('TORQUE_DRAIN_GRACE'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Reload pause (seconds)
+    |--------------------------------------------------------------------------
+    | When the master receives SIGUSR2 (`torque:reload`), it pauses pickup, waits
+    | up to this many seconds for its fleet to go idle, and then signals workers
+    | to stop. Each worker then gets `drain_grace_seconds`.
+    */
+    'reload_pause_seconds' => (int) env('TORQUE_RELOAD_PAUSE', 10),
 
     /*
     |--------------------------------------------------------------------------
@@ -260,7 +269,7 @@ return [
     |
     | A job past its limit is told through interrupted(SIGALRM), then fails if
     | `$failOnTimeout` is set or its attempts are up, and is otherwise released
-    | with a delay of at least `drain_grace_seconds`. The whole worker then
+    | with a delay of at least `release_delay_seconds`. The whole worker then
     | rotates: the other slots get `drain_grace_seconds`, and what is still
     | running after that is redelivered. A hang-prone stream is best off with a
     | low `coroutines_per_worker`.
@@ -271,11 +280,13 @@ return [
     | The timer spans the job's handle() only. The stock worker's alarm also covers
     | the JobProcessing and JobProcessed listeners; here those are not timed.
     | interrupted() and the JobInterrupted, JobTimedOut and JobExceptionOccurred
-    | listeners share half of `drain_grace_seconds`, 5 seconds at most. The job is
-    | failed or released after that, also when one of them has not returned.
+    | listeners share `settle_seconds`, at most half of `drain_grace_seconds`. The
+    | job is failed or released after that, also when one of them has not returned.
     */
     'timeouts' => [
         'enabled' => (bool) env('TORQUE_TIMEOUTS', true),
+        'release_delay_seconds' => 10,
+        'settle_seconds' => 5,
     ],
 
     /*
@@ -541,7 +552,7 @@ return [
     | pause_check_seconds         : queue:pause, circuit breaker and Torque's own pause key.
     | watchdog_check_seconds      : master gone, and queue:restart.
     | delayed_check_seconds       : moves ripe delayed jobs to their stream.
-    | drain_slack_seconds         : added to twice the grace by torque:stop and torque:reload (at least 1).
+    | drain_slack_seconds         : added to pause + grace by torque:stop and torque:reload (at least 1).
     | reload_signal_slack_seconds : added to torque:reload's explicit --timeout (at least 0).
     */
     'intervals' => [

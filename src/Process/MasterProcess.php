@@ -12,6 +12,7 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Redis\UpgradeRunner;
+use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\LongWaitGate;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
@@ -28,12 +29,6 @@ use function Fledge\Async\Redis\createRedisClient;
  */
 final class MasterProcess
 {
-    /**
-     * Slack added to a derived drain deadline: one monitor tick, one metrics
-     * publish interval, and signal latency between master and workers.
-     */
-    private const int DRAIN_DEADLINE_SLACK = 15;
-
     /** `Memcached::OPT_CONNECT_TIMEOUT`, in ms. By value: the extension is optional. */
     private const int MEMCACHED_OPT_CONNECT_TIMEOUT = 14;
 
@@ -250,7 +245,7 @@ LUA;
             $this->signalChildren(SIGTERM);
         });
 
-        // Graceful drain: stop pickup, wait drain_grace_seconds for in-flight
+        // Graceful drain: stop pickup, wait reload_pause_seconds for in-flight
         // jobs to finish, then SIGTERM workers. Used by `torque:reload`. The
         // handler stays trivial because the sync-signal path (Linux) reads
         // the flag from `pcntl_sigtimedwait` and the async path (macOS)
@@ -985,16 +980,14 @@ LUA;
      *
      * On the first tick after a SIGUSR2, write the Redis `paused` key so
      * workers stop picking up new jobs (they observe the key on their own
-     * 2s poll) and start the grace timer. Escalation to the same SIGTERM path
+     * 2s poll) and start the pause timer. Escalation to the same SIGTERM path
      * `torque:stop` uses happens as soon as the fleet reports nothing in
-     * flight, or when `drain_grace_seconds` runs out, whichever comes first;
-     * the workers' own grace then caps how long they wait for their current
-     * job before hard-exiting.
+     * flight, or when `reload_pause_seconds` runs out, whichever comes first;
+     * the workers' own `drain_grace_seconds` then caps how long they wait for
+     * their current job before hard-exiting.
      *
-     * The grace is a ceiling, not a wait. Sleeping it out unconditionally kept
-     * pickup paused across an idle fleet for the whole window, which on an
-     * installation sizing the grace for long jobs (7200 s on scrpr) meant a
-     * `torque:reload` parked the queue for two hours.
+     * The pause is a ceiling, not a wait. Sleeping it out unconditionally kept
+     * pickup paused across an idle fleet for the whole window.
      */
     public function handleDrainTick(): void
     {
@@ -1005,13 +998,12 @@ LUA;
         }
 
         if ($this->draining && ! $this->shouldStop) {
-            $grace = (int) ($this->config['drain_grace_seconds'] ?? 10);
             $idle = $this->fleetIsIdle();
 
-            if ($idle || (microtime(true) - $this->drainStartedAt) >= $grace) {
+            if ($idle || (microtime(true) - $this->drainStartedAt) >= DrainSettings::reloadPauseSeconds($this->config)) {
                 ($this->logger)($idle
                     ? 'Fleet reports no jobs in flight, signaling workers to stop.'
-                    : 'Drain grace elapsed, signaling workers to stop.');
+                    : 'Drain pause elapsed, signaling workers to stop.');
                 $this->shouldStop = true;
                 $this->signalChildren(SIGTERM);
                 $this->draining = false;
@@ -1024,7 +1016,7 @@ LUA;
      *
      * Best-effort by design: without a metrics publisher, or with Redis
      * unreachable, this reports "not idle" so the drain falls back to the
-     * grace timer. Cutting a drain short on a Redis blip would kill in-flight
+     * pause timer. Cutting a drain short on a Redis blip would kill in-flight
      * jobs; waiting one window too long only costs time.
      */
     private function fleetIsIdle(): bool
@@ -1069,33 +1061,6 @@ LUA;
         }
 
         return true;
-    }
-
-    /**
-     * Worst case for a full drain, in seconds.
-     *
-     * A drain runs on two clocks that know nothing of each other: the master
-     * waits up to `drain_grace_seconds` for its fleet to report idle and then
-     * SIGTERMs it, after which every worker gets up to `drain_grace_seconds`
-     * again for the job it still has in flight. Any deadline shorter than the
-     * sum gives up while the fleet is still draining normally, which is why
-     * `torque:reload`, `torque:stop` and the generated `stopwaitsecs` all
-     * derive their default from this instead of carrying their own number.
-     */
-    public static function drainWorstCaseSeconds(int $graceSeconds, int $slackSeconds = self::DRAIN_DEADLINE_SLACK): int
-    {
-        return 2 * max(0, $graceSeconds) + $slackSeconds;
-    }
-
-    /**
-     * The slack for {@see drainWorstCaseSeconds()} from the internal `intervals`
-     * config. At least 1, so the window never comes to nothing at a grace of 0.
-     *
-     * @param  array<string, mixed>  $config
-     */
-    public static function drainSlackSeconds(array $config): int
-    {
-        return max(1, (int) ($config['intervals']['drain_slack_seconds'] ?? self::DRAIN_DEADLINE_SLACK));
     }
 
     /**
@@ -1389,9 +1354,9 @@ LUA;
      * A drain pause belongs to exactly one master: it stops that master's own
      * fleet while in-flight jobs finish. When that master is gone (clean exit,
      * killed by the supervisor, OOM) the key still lives out its TTL of
-     * `drain_grace_seconds + 60`, and installations that raised the grace to
-     * survive long jobs (7200s on one production instance) then start into a
-     * queue that reads as PAUSED for two hours after a killed reload. The
+     * pause + grace + 60, and installations that raised the grace to survive
+     * long jobs (7200s on one production instance) then start into a queue
+     * that reads as PAUSED for two hours after a killed reload. The
      * replacement master clears it at boot instead of honouring it.
      *
      * Only drain values are touched. A deliberate `torque:pause` writes a
@@ -1494,8 +1459,6 @@ LUA;
      */
     private function beginDrain(): void
     {
-        $grace = (int) ($this->config['drain_grace_seconds'] ?? 10);
-
         try {
             $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
             $prefix = $this->config['redis']['prefix'] ?? 'torque:';
@@ -1507,12 +1470,12 @@ LUA;
             // `torque:pause` writes a TTL-less generic value that pauses
             // every fleet (see WorkerProcess::shouldPauseFor()).
             createRedisClient($redisUri)
-                ->execute('SET', $prefix.'paused', 'drain:'.getmypid(), 'EX', (string) ($grace + 60));
+                ->execute('SET', $prefix.'paused', 'drain:'.getmypid(), 'EX', (string) DrainSettings::drainPauseTtlSeconds($this->config));
         } catch (\Throwable $e) {
             ($this->logger)("Drain: failed to set Redis paused key ({$e->getMessage()}); proceeding with timed SIGTERM.");
         }
 
-        ($this->logger)("Draining: pickup paused, waiting up to {$grace}s for in-flight jobs.");
+        ($this->logger)('Draining: pickup paused, waiting up to '.DrainSettings::reloadPauseSeconds($this->config).'s for in-flight jobs.');
     }
 
     /**
@@ -1873,7 +1836,7 @@ LUA;
      * host and no two ever contend for the same field.
      *
      * Pure and static so the fold can be tested without a fleet or a Redis,
-     * the way {@see drainWorstCaseSeconds()} is.
+     * the way {@see fleetDrainComplete()} is.
      *
      * @param  array<string, array<string, mixed>>  $workers  Raw worker hashes, this tick.
      * @param  array<string, array{0: int, 1: int}>  $previous  The same map, previous tick.

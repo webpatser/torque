@@ -73,7 +73,7 @@ it('cleans up PID file with non-numeric content', function () {
 });
 
 /*
- * The graceful window before SIGKILL is derived from `drain_grace_seconds`.
+ * The graceful window before SIGKILL is the drain worst case.
  * This is the one shutdown path that ends in SIGKILL on the whole process
  * group, so a window shorter than a full drain kills in-flight jobs. The
  * fake master ignores SIGTERM so the command always reaches its deadline;
@@ -81,8 +81,9 @@ it('cleans up PID file with non-numeric content', function () {
  * helper is not a process-group leader and the group signal never reaches it.
  */
 
-it('derives the graceful window from drain_grace_seconds', function () {
-    // Twice the grace plus the slack. MasterProcessDrainDeadlineTest pins the default slack.
+it('derives the graceful window from the pause, the grace and the slack', function () {
+    // DrainSettingsTest pins the default slack.
+    config()->set('torque.reload_pause_seconds', 1);
     config()->set('torque.drain_grace_seconds', 1);
     config()->set('torque.intervals.drain_slack_seconds', 1);
 
