@@ -28,13 +28,13 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Coroutines per worker
+    | Slots per worker
     |--------------------------------------------------------------------------
     | How many jobs each worker process can handle concurrently via Fibers.
     | Higher = more concurrent I/O-bound jobs. Lower = less memory per worker.
     | Rule of thumb: 50 for I/O-heavy, 10-20 for CPU-heavy jobs.
     */
-    'coroutines_per_worker' => (int) env('TORQUE_COROUTINES', 50),
+    'slots_per_worker' => (int) env('TORQUE_SLOTS_PER_WORKER', env('TORQUE_COROUTINES', 50)),
 
     /*
     |--------------------------------------------------------------------------
@@ -106,7 +106,7 @@ return [
     | below torque:reload's --health-timeout.
     */
 
-    'takeover_ready_timeout' => (int) env('TORQUE_TAKEOVER_READY_TIMEOUT', 30),
+    'takeover_ready_timeout_seconds' => (int) env('TORQUE_TAKEOVER_READY_TIMEOUT', 30),
 
     /*
     |--------------------------------------------------------------------------
@@ -174,7 +174,7 @@ return [
         'cluster' => (bool) env('TORQUE_CLUSTER', false),
         // Seconds a worker slot's read waits for a reply before it reconnects, so
         // a half-open socket cannot hold the slot. Zero or less waits forever.
-        'read_timeout' => (float) env('TORQUE_REDIS_READ_TIMEOUT', 30),
+        'read_timeout_seconds' => (float) env('TORQUE_REDIS_READ_TIMEOUT', 30),
     ],
 
     /*
@@ -197,7 +197,7 @@ return [
     | APIs; the cap is approximate under bursts (bounded by fiber count).
     |
     | `max_retries` and `backoff` apply to jobs that declare no limit of their
-    | own (see `job_limits` below). `max_retries` counts runs: 3 is three runs,
+    | own (see `honour_job_limits` below). `max_retries` counts runs: 3 is three runs,
     | 0 or 1 is one run and no retry. `backoff` is `exponential` (2, 4, 8, ...),
     | seconds, or seconds per attempt as a list or "1,5,10", the last step
     | repeating. Anything else logs a WARN at boot and is `exponential`.
@@ -220,13 +220,13 @@ return [
     |--------------------------------------------------------------------------
     | Job limits
     |--------------------------------------------------------------------------
-    | 'job'    : what a job declares wins over its stream, as with queue:work:
-    |            `retryUntil`, then `$tries` (0 is no limit), `maxExceptions` and
-    |            `$backoff`.
-    | 'stream' : kill switch. Only `max_retries` and 2**attempts count, for every
-    |            job. Also ignores a stream's `backoff` and `strict_attempts`.
+    | true  : what a job declares wins over its stream, as with queue:work:
+    |         `retryUntil`, then `$tries` (0 is no limit), `maxExceptions` and
+    |         `$backoff`.
+    | false : kill switch. Only `max_retries` and 2**attempts count, for every
+    |         job. Also ignores a stream's `backoff` and `strict_attempts`.
     */
-    'job_limits' => env('TORQUE_JOB_LIMITS', 'job'),
+    'honour_job_limits' => (bool) env('TORQUE_HONOUR_JOB_LIMITS', env('TORQUE_JOB_LIMITS', 'job') !== 'stream'),
 
     /*
     |--------------------------------------------------------------------------
@@ -257,7 +257,7 @@ return [
     | its first release; 0 is off. Past it the job reaches the dead letter (reason
     | `release_limit`), also with `strict_attempts` off. A stream's own
     | `release_limit_seconds` wins over this one. A job's `retryUntil` replaces the
-    | limit, `$tries = 0` opts out, and `job_limits: stream` ignores it.
+    | limit, `$tries = 0` opts out, and `honour_job_limits: false` ignores it.
     */
     'release_limit_seconds' => (int) env('TORQUE_RELEASE_LIMIT', 86400),
 
@@ -267,14 +267,14 @@ return [
     |--------------------------------------------------------------------------
     | Off, `$timeout` and a stream's `timeout` mean nothing and a job runs for as
     | long as it runs. On, a job gets its `$timeout`, else its stream's `timeout`,
-    | else no limit; 0 is no limit. Independent of `job_limits`.
+    | else no limit; 0 is no limit. Independent of `honour_job_limits`.
     |
     | A job past its limit is told through interrupted(SIGALRM), then fails if
     | `$failOnTimeout` is set or its attempts are up, and is otherwise released
     | with a delay of at least `release_delay_seconds`. The whole worker then
     | rotates: the other slots get `drain_grace_seconds`, and what is still
     | running after that is redelivered. A hang-prone stream is best off with a
-    | low `coroutines_per_worker`.
+    | low `slots_per_worker`.
     |
     | The limit can only hit a job that is waiting on the event loop. Code that
     | blocks the process never lets the timer run.
@@ -425,7 +425,7 @@ return [
     |
     | Streams auto-expire after `ttl` seconds following a terminal event.
     */
-    'job_streams' => [
+    'job_events' => [
         'enabled' => true,
         'ttl' => 300,
         'max_events' => 1000,
@@ -531,11 +531,11 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Block timeout (ms)
+    | Poll interval (ms)
     |--------------------------------------------------------------------------
     | How long XREADGROUP blocks waiting for new messages.
     */
-    'block_for' => (int) env('TORQUE_BLOCK_FOR', 2000),
+    'poll_interval_ms' => (int) env('TORQUE_POLL_INTERVAL_MS', env('TORQUE_BLOCK_FOR', 2000)),
 
     /*
     |--------------------------------------------------------------------------

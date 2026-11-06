@@ -36,7 +36,7 @@ use function Fledge\Async\Redis\createRedisClient;
 final class StreamHousekeeper
 {
     /**
-     * Extra grace on top of `job_streams.ttl` before a per-job stream without
+     * Extra grace on top of `job_events.ttl` before a per-job stream without
      * an expiry is considered abandoned. A job can legitimately run for a long
      * time; only streams whose last event is older than ttl + this margin are
      * treated as leaked by a worker that died mid-flight.
@@ -67,7 +67,7 @@ final class StreamHousekeeper
     /**
      * @param  list<string>  $queues  Queue names whose consumer groups get swept.
      * @param  int  $maxEntries  Extra hard cap applied after the handler's own policy. 0 = handler only.
-     * @param  int  $jobStreamTtl  `job_streams.ttl`, the basis for the orphaned-stream cutoff.
+     * @param  int  $jobStreamTtl  `job_events.ttl`, the basis for the orphaned-stream cutoff.
      * @param  int  $dailyRetentionDays  `metrics.rollups.daily_days`; 0 keeps the day tier forever.
      */
     public function __construct(
@@ -116,7 +116,7 @@ final class StreamHousekeeper
             ),
             maxEntries: $cap,
             cluster: (bool) ($config['redis']['cluster'] ?? false),
-            jobStreamTtl: (int) ($config['job_streams']['ttl'] ?? 300),
+            jobStreamTtl: (int) ($config['job_events']['ttl'] ?? 300),
             dailyRetentionDays: (int) ($config['metrics']['rollups']['daily_days'] ?? 730),
         );
     }
@@ -290,7 +290,7 @@ final class StreamHousekeeper
      * Six categories, each counted separately and each honouring `$dryRun`:
      *
      *  - `job_streams`: per-job event streams with no expiry whose last event
-     *    is older than `job_streams.ttl` plus {@see ORPHAN_MARGIN_SECONDS}.
+     *    is older than `job_events.ttl` plus {@see ORPHAN_MARGIN_SECONDS}.
      *    Only streams with no TTL are swept. The `started` event sets a 7-day
      *    safety TTL, so a job killed mid-flight by an OOM restart or a deploy
      *    keeps its stream for up to 7 days instead of being swept here.

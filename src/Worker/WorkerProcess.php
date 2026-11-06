@@ -109,7 +109,7 @@ LUA;
     /** Seconds an exponential retry stays ahead of retryUntil: the delayed job migration runs once a second. */
     private const int RETRY_DEADLINE_MARGIN = 2;
 
-    /** Seconds a slot's read waits for a reply when `redis.read_timeout` is not set. */
+    /** Seconds a slot's read waits for a reply when `redis.read_timeout_seconds` is not set. */
     private const DEFAULT_READ_TIMEOUT = 30.0;
 
     /** Entries $neverStarted remembers; one that is forgotten is charged at its next read. */
@@ -344,8 +344,8 @@ LUA;
         $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
         $prefix = $this->config['redis']['prefix'] ?? 'torque:';
         $consumerGroup = $this->config['consumer_group'] ?? 'torque';
-        $concurrency = (int) ($this->config['coroutines_per_worker'] ?? 50);
-        $pollInterval = ((int) ($this->config['block_for'] ?? 2000)) / 1000.0;
+        $concurrency = (int) ($this->config['slots_per_worker'] ?? 50);
+        $pollInterval = ((int) ($this->config['poll_interval_ms'] ?? 2000)) / 1000.0;
         $maxJobs = (int) ($this->config['max_jobs_per_worker'] ?? 10_000);
         // Jitter here and nowhere else: $this->maxLifetime and the per-Fiber
         // capture below both read this local, so one call keeps every limit
@@ -413,7 +413,7 @@ LUA;
         });
 
         if ($concurrency > 1 && ($shared = QuiescentReset::userScopedBindings(app())) !== []) {
-            fwrite(STDERR, "[torque:worker] WARN coroutines_per_worker={$concurrency}: these scoped bindings are shared by concurrent jobs and reset only when no job is in flight, which may never happen under sustained load: ".implode(', ', $shared)."\n");
+            fwrite(STDERR, "[torque:worker] WARN slots_per_worker={$concurrency}: these scoped bindings are shared by concurrent jobs and reset only when no job is in flight, which may never happen under sustained load: ".implode(', ', $shared)."\n");
         }
 
         $this->announceLimitSettings($streams);
@@ -1681,7 +1681,7 @@ LUA;
             // socket may never end, so this wait has a limit of its own. Past it the
             // reply cannot be trusted, and finding nothing beats running one twice.
             $outstanding = $this->newReads;
-            $waitUntil = hrtime(true) + (int) (self::outstandingReadWait((float) ($this->config['redis']['read_timeout'] ?? self::DEFAULT_READ_TIMEOUT)) * 1_000_000_000);
+            $waitUntil = hrtime(true) + (int) (self::outstandingReadWait((float) ($this->config['redis']['read_timeout_seconds'] ?? self::DEFAULT_READ_TIMEOUT)) * 1_000_000_000);
 
             while (array_intersect_key($outstanding, $this->newReads) !== []) {
                 if (hrtime(true) >= $waitUntil) {
@@ -2665,7 +2665,7 @@ LUA;
 
     /**
      * The Redis client a slot reads with, which gives up on a reply after
-     * `redis.read_timeout` seconds (zero or less waits forever).
+     * `redis.read_timeout_seconds` seconds (zero or less waits forever).
      *
      * A read holds its place under `max_concurrency` until it returns, so without
      * a limit one reply lost to a half-open socket stops a stream with a cap of 1
@@ -2679,7 +2679,7 @@ LUA;
      */
     public function createReaderClient(string $redisUri): RedisClient
     {
-        $readTimeout = (float) ($this->config['redis']['read_timeout'] ?? self::DEFAULT_READ_TIMEOUT);
+        $readTimeout = (float) ($this->config['redis']['read_timeout_seconds'] ?? self::DEFAULT_READ_TIMEOUT);
 
         return new RedisClient(new ReconnectingRedisLink(
             createRedisConnector($redisUri),
@@ -3351,12 +3351,12 @@ LUA;
     }
 
     /**
-     * `job_limits: stream` is the kill switch: only `max_retries` and the capped
+     * `honour_job_limits: false` is the kill switch: only `max_retries` and the capped
      * 2**attempts, as before jobs could declare limits, whatever else is configured.
      */
     private function honoursJobLimits(): bool
     {
-        return ($this->config['job_limits'] ?? 'job') !== 'stream';
+        return (bool) ($this->config['honour_job_limits'] ?? true);
     }
 
     private function enforcesStrictAttempts(): bool
@@ -3478,7 +3478,7 @@ LUA;
     private function announceLimitSettings(array $streams): void
     {
         if (! $this->honoursJobLimits()) {
-            fwrite(STDERR, "[torque:worker] WARN strict_attempts and release_limit_seconds are ignored while job_limits is stream, so a job that keeps calling release() is not limited\n");
+            fwrite(STDERR, "[torque:worker] WARN strict_attempts and release_limit_seconds are ignored while honour_job_limits is false, so a job that keeps calling release() is not limited\n");
 
             return;
         }

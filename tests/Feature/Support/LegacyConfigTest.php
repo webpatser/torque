@@ -87,19 +87,6 @@ it('adds to what an earlier pass recorded when a later one finds another old key
     expect($result['_legacy_keys'])->toBe(['block_for' => 'poll_interval_ms', 'job_limits' => 'honour_job_limits']);
 });
 
-it('in the interim only acts on published keys and leaves the old key for the readers', function () {
-    $config = new Repository(['torque' => ['coroutines_per_worker' => 1, 'block_for' => 2000]]);
-
-    LegacyConfig::migrate($config, ['coroutines_per_worker' => 1]);
-
-    expect($config->get('torque'))->toBe([
-        'coroutines_per_worker' => 1,
-        'block_for' => 2000,
-        'slots_per_worker' => 1,
-        '_legacy_keys' => ['coroutines_per_worker' => 'slots_per_worker'],
-    ]);
-});
-
 it('records nothing for a booted app without old keys of its own', function () {
     expect(config('torque._legacy_keys'))->toBeNull();
 });
@@ -150,6 +137,12 @@ describe('through a real application and config:cache', function () use ($publis
             ->and($seen['torque']['takeover_ready_timeout_seconds'])->toBe(45)
             ->and($seen['torque']['job_events'])->toBe(['enabled' => false])
             ->and($seen['torque']['honour_job_limits'])->toBeFalse()
+            ->and($seen['torque'])->not->toHaveKey('coroutines_per_worker')
+            ->and($seen['torque'])->not->toHaveKey('block_for')
+            ->and($seen['torque'])->not->toHaveKey('job_limits')
+            ->and($seen['torque'])->not->toHaveKey('job_streams')
+            ->and($seen['torque'])->not->toHaveKey('takeover_ready_timeout')
+            ->and($seen['torque']['redis'])->not->toHaveKey('read_timeout')
             ->and($seen['torque']['_legacy_keys'])->toBe(LegacyConfig::RENAMES)
             ->and(LegacyConfig::warning($seen['torque']))->toContain('coroutines_per_worker -> slots_per_worker');
     });

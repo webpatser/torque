@@ -244,7 +244,7 @@ new class extends Component
                 @if(empty($events))
                     <div class="px-4 py-12 text-center">
                         <p class="text-sm text-zinc-400 dark:text-zinc-500">No events recorded for this job</p>
-                        <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-1">The job stream may have expired (TTL: {{ config('torque.job_streams.ttl', 300) }}s)</p>
+                        <p class="text-xs text-zinc-400 dark:text-zinc-500 mt-1">The job stream may have expired (TTL: {{ config('torque.job_events.ttl', 300) }}s)</p>
                     </div>
                 @else
                     <div class="relative px-4 py-4">

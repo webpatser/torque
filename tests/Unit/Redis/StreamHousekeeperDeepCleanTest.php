@@ -11,7 +11,7 @@ use Webpatser\Torque\Redis\StreamHousekeeper;
  * because the whole point is the SCAN / TTL / ZREM behaviour.
  *
  * The orphan rule: a per-job event stream with no expiry (only terminal events
- * set one) whose last entry is older than job_streams.ttl plus the safety
+ * set one) whose last entry is older than job_events.ttl plus the safety
  * margin. A running job's stream is younger than that and must survive.
  */
 

@@ -74,11 +74,11 @@ Event::listen(JobReleasedAfterException::class, static function () use ($log, $r
     'consumer_group' => $group,
     'queues' => [$queue],
     'streams' => [$queue => $settings['stream'] + ['retry_after' => 90]],
-    'coroutines_per_worker' => 1,
-    'block_for' => 100,
+    'slots_per_worker' => 1,
+    'poll_interval_ms' => 100,
     'max_jobs_per_worker' => $settings['max_jobs'],
     'max_worker_lifetime' => $settings['lifetime'] ?? 6,
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 1,
     'intervals' => require __DIR__.'/fast-intervals.php',
-], array_intersect_key($settings, ['job_limits' => true, 'strict_attempts' => true]))))->run();
+], array_intersect_key($settings, ['honour_job_limits' => true, 'strict_attempts' => true]))))->run();

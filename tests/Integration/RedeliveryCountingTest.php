@@ -82,8 +82,8 @@ function torque_redelivery_worker(array $ctx, array $settings = []): void
         'serializer' => 'json',
         'queues' => [TORQUE_REDELIVERY_QUEUE],
         'streams' => [TORQUE_REDELIVERY_QUEUE => ['retry_after' => 1, 'max_retries' => 3]],
-        'coroutines_per_worker' => 1,
-        'block_for' => 100,
+        'slots_per_worker' => 1,
+        'poll_interval_ms' => 100,
         'max_jobs_per_worker' => 1,
         'max_worker_lifetime' => 5,
         'max_worker_lifetime_jitter' => 0,
@@ -366,7 +366,7 @@ describe('which deliveries count', function () {
         // 2.5s against a retry_after of 1s, with a free slot scanning all along.
         $ctx['queue']->push(new RedeliveryProbeJob('slow', tries: 1), '', TORQUE_REDELIVERY_QUEUE);
 
-        torque_redelivery_worker($ctx, ['coroutines_per_worker' => 3]);
+        torque_redelivery_worker($ctx, ['slots_per_worker' => 3]);
 
         expect(torque_redelivery_runs($ctx))->toBe(1)
             ->and(torque_redelivery_dead_letters($ctx))->toBe([])
@@ -552,7 +552,7 @@ describe('a pending read beside a read of new messages', function () {
     {
         $ctx['queue']->push(new RedeliveryProbeJob(tries: 1), '', TORQUE_REDELIVERY_QUEUE);
 
-        $worker = new WorkerProcess(['redis' => ['uri' => torqueRedisUri(), 'read_timeout' => $readTimeout]]);
+        $worker = new WorkerProcess(['redis' => ['uri' => torqueRedisUri(), 'read_timeout_seconds' => $readTimeout]]);
         $reflection = new ReflectionClass($worker);
         $consumer = (string) $reflection->getProperty('consumerId')->getValue($worker);
 

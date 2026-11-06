@@ -18,10 +18,10 @@ new class extends Component
         return [
             'General' => [
                 'Workers' => $config['workers'] ?? 4,
-                'Coroutines per worker' => $config['coroutines_per_worker'] ?? 50,
+                'Slots per worker' => $config['slots_per_worker'] ?? 50,
                 'Max jobs per worker' => number_format($config['max_jobs_per_worker'] ?? 10000),
                 'Max worker lifetime' => ($config['max_worker_lifetime'] ?? 3600).'s',
-                'Block timeout' => ($config['block_for'] ?? 2000).'ms',
+                'Poll interval' => ($config['poll_interval_ms'] ?? 2000).'ms',
             ],
             'Redis' => [
                 'URI' => preg_replace('/\/\/.*@/', '//*****@', $config['redis']['uri'] ?? 'redis://127.0.0.1:6379'),
@@ -43,9 +43,9 @@ new class extends Component
                 'Cooldown' => ($config['autoscale']['cooldown'] ?? 30).'s',
             ],
             'Job Streams' => [
-                'Enabled' => ($config['job_streams']['enabled'] ?? true) ? 'Yes' : 'No',
-                'TTL' => ($config['job_streams']['ttl'] ?? 300).'s',
-                'Max events' => number_format($config['job_streams']['max_events'] ?? 1000),
+                'Enabled' => ($config['job_events']['enabled'] ?? true) ? 'Yes' : 'No',
+                'TTL' => ($config['job_events']['ttl'] ?? 300).'s',
+                'Max events' => number_format($config['job_events']['max_events'] ?? 1000),
             ],
             'Dead Letter' => [
                 'TTL' => number_format(($config['dead_letter']['ttl'] ?? 604800) / 86400, 0).' days',

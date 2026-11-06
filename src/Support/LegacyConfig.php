@@ -39,29 +39,20 @@ final class LegacyConfig
      * the application, while the new key may just be the shipped default. A key
      * that is absent changes nothing, and neither does a second pass, so this is
      * safe on a config that `config:cache` already wrote out moved.
-     *
-     * With `$published`, only keys in that array move, and the old key stays
-     * next to the new one. That is the interim while the shipped file still has
-     * the old keys and every reader still reads them; see the service provider.
-     *
-     * @param  array<string, mixed>|null  $published
      */
-    public static function migrate(Repository $config, ?array $published = null): void
+    public static function migrate(Repository $config): void
     {
         $torque = (array) $config->get('torque', []);
         $recorded = (array) ($torque['_legacy_keys'] ?? []);
 
         foreach (self::RENAMES as $old => $new) {
-            if (! Arr::has($published ?? $torque, $old)) {
+            if (! Arr::has($torque, $old)) {
                 continue;
             }
 
             Arr::set($torque, $new, self::convert($old, Arr::get($torque, $old)));
             $recorded[$old] = $new;
-
-            if ($published === null) {
-                Arr::forget($torque, $old);
-            }
+            Arr::forget($torque, $old);
         }
 
         if ($recorded !== []) {

@@ -13,7 +13,7 @@ it('constructor sets config without errors', function () {
     $worker = new WorkerProcess([
         'redis' => ['uri' => 'redis://127.0.0.1:6379'],
         'queues' => ['default'],
-        'coroutines_per_worker' => 10,
+        'slots_per_worker' => 10,
     ]);
 
     expect($worker)->toBeInstanceOf(WorkerProcess::class);

@@ -123,7 +123,7 @@ final class TorqueStartCommand extends Command
         }
 
         if ($this->option('concurrency') !== null) {
-            $config['coroutines_per_worker'] = (int) $this->option('concurrency');
+            $config['slots_per_worker'] = (int) $this->option('concurrency');
         }
 
         // Resolve queue names: CLI option > config stream keys > fallback.
@@ -144,7 +144,7 @@ final class TorqueStartCommand extends Command
         }
 
         $workers = (int) ($config['workers'] ?? 4);
-        $concurrency = (int) ($config['coroutines_per_worker'] ?? 50);
+        $concurrency = (int) ($config['slots_per_worker'] ?? 50);
         $queues = implode(', ', $config['queues']);
 
         $version = InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev';

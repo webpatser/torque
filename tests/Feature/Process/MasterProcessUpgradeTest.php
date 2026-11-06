@@ -32,7 +32,7 @@ beforeEach(function () {
         'consumer_group' => 'torque-test',
         'streams' => ['default' => []],
         'dead_letter' => ['ttl' => 60, 'max_entries' => 0],
-        'job_streams' => ['ttl' => 300],
+        'job_events' => ['ttl' => 300],
     ];
 
     $this->master = fn (): MasterProcess => new MasterProcess($this->config, function (string $message) {

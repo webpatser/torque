@@ -356,11 +356,11 @@ describe('backoff', function () {
     });
 });
 
-describe('job_limits: stream', function () {
+describe('honour_job_limits: false', function () {
     it('ignores everything a job and the stream backoff declare', function () {
         $job = new JobLimitsProbeJob(tries: 1, backoff: 0, maxExceptions: 1);
 
-        $run = torque_run_limits_worker($job, ['max_retries' => 2, 'backoff' => 0], maxJobs: 2, options: ['job_limits' => 'stream']);
+        $run = torque_run_limits_worker($job, ['max_retries' => 2, 'backoff' => 0], maxJobs: 2, options: ['honour_job_limits' => false]);
 
         expect($run['attempts'])->toBe([1, 2])
             ->and($run['backoffs'])->toBe([2])
@@ -370,11 +370,11 @@ describe('job_limits: stream', function () {
     it('also switches strict_attempts off', function () {
         $job = new JobLimitsProbeJob('release', until: 3, tries: 1);
 
-        $run = torque_run_limits_worker($job, ['max_retries' => 1], maxJobs: 3, options: ['job_limits' => 'stream', 'strict_attempts' => true]);
+        $run = torque_run_limits_worker($job, ['max_retries' => 1], maxJobs: 3, options: ['honour_job_limits' => false, 'strict_attempts' => true]);
 
         expect($run['attempts'])->toBe([1, 2, 3])
             ->and($run['deadLetters'])->toBe(0)
-            ->and($run['output'])->toContain('strict_attempts and release_limit_seconds are ignored while job_limits is stream');
+            ->and($run['output'])->toContain('strict_attempts and release_limit_seconds are ignored while honour_job_limits is false');
     });
 });
 
@@ -419,7 +419,7 @@ describe('release limit', function () {
         'the limit is off for the stream' => [[], ['release_limit_seconds' => 0], []],
         'it has a retryUntil' => [['retryUntil' => time() + 600], [], []],
         'its $tries is 0' => [['tries' => 0], [], []],
-        'job_limits is stream' => [[], [], ['job_limits' => 'stream']],
+        'honour_job_limits is false' => [[], [], ['honour_job_limits' => false]],
     ]);
 
     it('ignores the counters of a job whose attempts were reset by queue:retry', function () use ($past) {

@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque;
 
-use Illuminate\Contracts\Foundation\CachesConfiguration;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
@@ -50,16 +49,9 @@ final class TorqueServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        // Taken before the merge, because the shipped file still has the old keys
-        // and readers still read them: only what the application itself set is
-        // recorded. A cached config went through this when it was written.
-        $published = $this->app instanceof CachesConfiguration && $this->app->configurationIsCached()
-            ? []
-            : (array) $this->app['config']->get('torque', []);
-
         $this->mergeConfigFrom(__DIR__.'/../config/torque.php', 'torque');
 
-        LegacyConfig::migrate($this->app['config'], $published);
+        LegacyConfig::migrate($this->app->make('config'));
 
         $this->app->singleton(MetricsPublisher::class, function ($app) {
             $config = $app['config']['torque'];
@@ -73,7 +65,7 @@ final class TorqueServiceProvider extends ServiceProvider
 
         $this->app->singleton(JobStreamRecorder::class, function ($app) {
             $config = $app['config']['torque'];
-            $jobStreams = $config['job_streams'] ?? [];
+            $jobStreams = $config['job_events'] ?? [];
 
             return new JobStreamRecorder(
                 redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',

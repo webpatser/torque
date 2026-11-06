@@ -87,8 +87,8 @@ function torque_steal_run(array $settings, Closure $arrange, ?Closure $whileRunn
             'redis' => ['uri' => torqueRedisUri(), 'prefix' => $prefix, 'cluster' => false],
             'consumer_group' => TORQUE_STEAL_GROUP,
             'serializer' => 'json',
-            'coroutines_per_worker' => 3,
-            'block_for' => 100,
+            'slots_per_worker' => 3,
+            'poll_interval_ms' => 100,
             'max_worker_lifetime' => 40,
             'max_worker_lifetime_jitter' => 0,
             'drain_grace_seconds' => 10,
@@ -445,7 +445,7 @@ it('survives its own in-flight entry being trimmed when a free slot re-reads the
             'streams' => ['stealing' => ['retry_after' => 60]],
             'max_jobs_per_worker' => 1,
             // The pending re-read comes every 50 polls, so about every two seconds.
-            'block_for' => 40,
+            'poll_interval_ms' => 40,
         ],
         static function (StreamQueue $queue): void {
             (void) $queue->push(new StealProbeJob('in-flight', seconds: 3.5), '', 'stealing');
@@ -498,8 +498,8 @@ it('keeps max_concurrency when many slots poll at the same moment', function (in
         [
             'queues' => ['capped'],
             'streams' => ['capped' => ['max_concurrency' => $cap, 'retry_after' => 60]],
-            'coroutines_per_worker' => 16,
-            'block_for' => 5,
+            'slots_per_worker' => 16,
+            'poll_interval_ms' => 5,
             'max_jobs_per_worker' => 20,
         ],
         static function (StreamQueue $queue): void {
@@ -520,7 +520,7 @@ it('keeps max_concurrency when many slots poll at the same moment', function (in
 
 it('gives up on a read when the server accepts the connection and never answers', function () {
     $server = stream_socket_server('tcp://127.0.0.1:0');
-    $worker = new WorkerProcess(['redis' => ['uri' => torqueRedisUri(), 'read_timeout' => 0.2]]);
+    $worker = new WorkerProcess(['redis' => ['uri' => torqueRedisUri(), 'read_timeout_seconds' => 0.2]]);
     $client = $worker->createReaderClient('redis://'.stream_socket_get_name($server, false));
 
     // The outer limit turns a client that would wait forever into a failure.
@@ -578,10 +578,10 @@ it('serves a capped stream again after a read that never got an answer', functio
 
         $run = torque_steal_run(
             [
-                'redis' => ['uri' => "redis://{$address}{$database}", 'read_timeout' => 0.2],
+                'redis' => ['uri' => "redis://{$address}{$database}", 'read_timeout_seconds' => 0.2],
                 'queues' => ['capped'],
                 'streams' => ['capped' => ['max_concurrency' => 1, 'retry_after' => 60]],
-                'block_for' => 50,
+                'poll_interval_ms' => 50,
                 'max_jobs_per_worker' => 1,
                 'max_worker_lifetime' => 8,
             ],
@@ -611,7 +611,7 @@ it('serves a capped stream again after a failing read', function () {
         [
             'queues' => ['capped'],
             'streams' => ['capped' => ['max_concurrency' => 1, 'retry_after' => 60]],
-            'block_for' => 50,
+            'poll_interval_ms' => 50,
             'max_jobs_per_worker' => 2,
             'max_worker_lifetime' => 8,
         ],

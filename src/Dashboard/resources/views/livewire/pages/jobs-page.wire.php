@@ -44,7 +44,7 @@ new class extends Component
     <div class="mb-6">
         <flux:heading size="lg">Jobs</flux:heading>
         <flux:text class="text-sm mt-1">
-            Recent jobs from event streams (TTL: {{ config('torque.job_streams.ttl', 300) }}s)
+            Recent jobs from event streams (TTL: {{ config('torque.job_events.ttl', 300) }}s)
         </flux:text>
     </div>
 

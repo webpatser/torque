@@ -16,7 +16,7 @@ it('merges the torque config', function () {
     expect($config)->toBeArray()
         ->and($config)->toHaveKeys([
             'workers',
-            'coroutines_per_worker',
+            'slots_per_worker',
             'redis',
             'consumer_group',
             'streams',

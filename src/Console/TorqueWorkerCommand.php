@@ -44,7 +44,7 @@ final class TorqueWorkerCommand extends Command
         }
 
         if ($this->option('concurrency') !== null) {
-            $config['coroutines_per_worker'] = (int) $this->option('concurrency');
+            $config['slots_per_worker'] = (int) $this->option('concurrency');
         }
 
         $worker = new WorkerProcess($config);

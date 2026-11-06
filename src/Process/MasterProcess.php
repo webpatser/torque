@@ -363,7 +363,7 @@ LUA;
             // Child: immediately replace process image with a fresh PHP process.
             // This avoids inheriting any Fiber/Revolt/Redis state from the parent.
             $queues = implode(',', (array) ($this->config['queues'] ?? ['default']));
-            $concurrency = (string) (int) ($this->config['coroutines_per_worker'] ?? 50);
+            $concurrency = (string) (int) ($this->config['slots_per_worker'] ?? 50);
 
             pcntl_exec(PHP_BINARY, [
                 $this->artisanPath,
@@ -1670,7 +1670,7 @@ LUA;
      */
     private function waitForOwnFleetReady(): bool
     {
-        $timeout = (float) ($this->config['takeover_ready_timeout'] ?? 30.0);
+        $timeout = (float) ($this->config['takeover_ready_timeout_seconds'] ?? 30.0);
         $deadline = microtime(true) + $timeout;
 
         $publisher = new MetricsPublisher(
