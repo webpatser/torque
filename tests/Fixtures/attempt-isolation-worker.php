@@ -97,7 +97,7 @@ if ($slowReset === '1') {
     ));
 }
 
-(new WorkerProcess(array_replace_recursive(config('torque'), [
+(new WorkerProcess(array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', [
     'queues' => [$queue],
     'streams' => [$queue => ['max_retries' => 1, 'retry_after' => 90]],
     'coroutines_per_worker' => (int) $concurrency,

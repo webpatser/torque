@@ -68,7 +68,7 @@ Event::listen(JobReleasedAfterException::class, static function () use ($log, $r
     $log(['type' => 'released']);
 });
 
-(new WorkerProcess(array_replace_recursive(config('torque'), [
+(new WorkerProcess(array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', [
     'redis' => ['uri' => $redisUri, 'prefix' => $prefix, 'cluster' => false],
     'serializer' => $settings['serializer'] ?? 'json',
     'consumer_group' => $group,

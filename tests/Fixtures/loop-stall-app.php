@@ -42,7 +42,7 @@ config([
 // Lets a test give the app another cache store than the array store above.
 config($settings['app_config'] ?? []);
 
-$config = array_replace_recursive(config('torque'), $settings);
+$config = array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', $settings);
 
 $app->setBasePath($runDir);
 $app->useStoragePath($runDir.'/storage');

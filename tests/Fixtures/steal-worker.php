@@ -47,7 +47,7 @@ Event::listen(JobAttempted::class, static function (JobAttempted $event) use ($l
 
 // Plain assignment for these two: merging would keep the default config's entries.
 $settings = json_decode($settings, true, flags: JSON_THROW_ON_ERROR);
-$config = array_replace_recursive(config('torque'), $settings);
+$config = array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', $settings);
 $config['queues'] = $settings['queues'];
 $config['streams'] = $settings['streams'];
 $config['intervals'] = require __DIR__.'/fast-intervals.php';

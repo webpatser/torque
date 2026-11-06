@@ -95,7 +95,7 @@ Event::listen(JobExceptionOccurred::class, static function (JobExceptionOccurred
     }
 });
 
-(new WorkerProcess(array_replace_recursive(config('torque'), [
+(new WorkerProcess(array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', [
     'redis' => ['uri' => $redisUri, 'prefix' => $prefix, 'cluster' => false],
     'consumer_group' => $group,
     'serializer' => 'json',

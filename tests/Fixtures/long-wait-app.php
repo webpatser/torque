@@ -99,6 +99,6 @@ $logFile = $runDir.'/master.log';
 
 cli_set_process_title('torque:start long-wait-fixture');
 
-exit((new MasterProcess(array_replace_recursive(config('torque'), $settings), static function (string $message) use ($logFile): void {
+exit((new MasterProcess(array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', $settings), static function (string $message) use ($logFile): void {
     file_put_contents($logFile, $message."\n", FILE_APPEND);
 }))->start());

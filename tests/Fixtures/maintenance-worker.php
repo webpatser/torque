@@ -53,7 +53,7 @@ $memoryLimit = isset($options['memory_headroom_mb'])
     ? (int) ceil(memory_get_usage(true) / 1048576) + (int) $options['memory_headroom_mb']
     : 0;
 
-(new WorkerProcess(array_replace_recursive(config('torque'), [
+(new WorkerProcess(array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', [
     'redis' => ['uri' => $redisUri, 'prefix' => $prefix, 'cluster' => false],
     'consumer_group' => $group,
     'serializer' => 'json',
