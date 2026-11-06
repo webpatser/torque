@@ -28,11 +28,11 @@ it('parses a hostname with many dashes', function () {
         ->and($id->nonce)->toBe('deadbeef');
 });
 
-it('falls back to the legacy host-pid shape', function () {
+it('gives a non-canonical host-pid id no pid', function () {
     $id = WorkerId::parse('web-01-5123');
 
-    expect($id->host)->toBe('web-01')
-        ->and($id->pid)->toBe(5123)
+    expect($id->host)->toBe('web-01-5123')
+        ->and($id->pid)->toBeNull()
         ->and($id->nonce)->toBeNull();
 });
 

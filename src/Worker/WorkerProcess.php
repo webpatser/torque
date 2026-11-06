@@ -2281,9 +2281,9 @@ LUA;
      * - A TTL'd key is a drain-scoped pause written by a draining master as
      *   `drain:<masterPid>`. It only applies to that master's own workers,
      *   so a takeover's old fleet drains without pausing the replacement.
-     *   Legacy-format drain values (timestamps) also carry a TTL and are
-     *   ignored the same way: under an old-code master its drain degrades to
-     *   the plain SIGTERM-after-grace stop, which is safe.
+     *   TTL'd values that are not `drain:<pid>` (such as plain timestamps)
+     *   are ignored the same way: the drain degrades to the plain
+     *   SIGTERM-after-grace stop, which is safe.
      * - A TTL-less key is a deliberate `torque:pause` and pauses every fleet.
      *
      * Static and pure for unit testing. `$ttl` uses Redis semantics: -2 key

@@ -26,7 +26,7 @@ final class DrainPause
 
     /**
      * The master PID a drain pause belongs to, or null when the value is not
-     * a well-formed drain pause (a manual pause, a legacy timestamp value, or
+     * a well-formed drain pause (a manual pause, a timestamp value, or
      * anything unparseable).
      */
     public static function ownerPid(?string $value): ?int
@@ -44,7 +44,7 @@ final class DrainPause
      * Whether the pause key is a drain left behind by a master that is gone.
      *
      * The rule, in order:
-     *  - not a `drain:<pid>` value (manual pause, malformed, legacy) -> keep;
+     *  - not a `drain:<pid>` value (manual pause, malformed) -> keep;
      *  - the PID is our own -> stale, because a master only writes its drain
      *    key while draining, never before it has started supervising, so
      *    seeing our own PID means the number was recycled;

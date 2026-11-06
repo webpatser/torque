@@ -111,10 +111,11 @@ LUA;
 
         $this->record($uuid, 'started', $this->withTags($event->job, [
             'queue' => $event->job->getQueue() ?: 'default',
-            // The torque driver records the name on the queued event, but jobs
-            // can enter through other drivers (a classic queue:work draining a
-            // legacy redis list during a migration): their per-job stream then
-            // starts here, and without a name the dashboard shows "(unknown)".
+            // The torque driver records the name on the queued event, but a
+            // job can start without one: its stream expired by TTL, a delayed
+            // release re-enters later, or another driver ran it. The per-job
+            // stream then starts here, and without a name the dashboard shows
+            // "(unknown)".
             'displayName' => $event->job->resolveName(),
             'attempt' => (string) $event->job->attempts(),
             'worker' => gethostname().'-'.getmypid(),

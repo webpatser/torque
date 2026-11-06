@@ -32,16 +32,6 @@ final readonly class WorkerId
                 return new self(implode('-', $parts), (int) $pidPart, $nonce);
             }
 
-            // Not the canonical 3+ segment shape; restore and fall through.
-            $parts[] = $pidPart;
-            $parts[] = $nonce;
-        }
-
-        // Legacy / fabricated ids: `{host}-{pid}` with a numeric tail.
-        if (count($parts) >= 2 && ctype_digit(end($parts))) {
-            $pid = (int) array_pop($parts);
-
-            return new self(implode('-', $parts), $pid, null);
         }
 
         return new self($id, null, null);
