@@ -193,7 +193,7 @@ State is automatically cleaned up when the Fiber completes (backed by `WeakMap`)
 
 ### Concurrency contract
 
-One worker runs up to `coroutines_per_worker` jobs at once in a single PHP process and a single container. Torque isolates the framework state that jobs commonly write to; everything else is shared by all jobs on that worker. At `coroutines_per_worker = 1` nothing is shared and the stock worker semantics apply to every job.
+One worker runs up to `slots_per_worker` jobs at once in a single PHP process and a single container. Torque isolates the framework state that jobs commonly write to; everything else is shared by all jobs on that worker. At `coroutines_per_worker = 1` nothing is shared and the stock worker semantics apply to every job.
 
 **Isolated per attempt:**
 
@@ -216,7 +216,7 @@ One gap: `Auth::setUser()` from a raw Fiber, an `EventLoop::delay()` callback, o
 - Apps that bind their own log or auth manager: the boot WARN names them and Torque does not route them.
 - `Log::build()` channels are not cached, so a later `Log::shareContext()` does not reach them.
 
-If your jobs rely on any of the shared items, lower `coroutines_per_worker` for those streams or run them on a dedicated worker.
+If your jobs rely on any of the shared items, lower `slots_per_worker` for those streams or run them on a dedicated worker.
 
 > [!NOTE]
 > Laravel Cloud's queue listeners hold the current job in process-wide state. Torque dispatches the events anyway, but at more than one slot exception attribution on Cloud (which job an exception is reported against) is unreliable.
@@ -228,20 +228,20 @@ On such a timeout the worker logs a WARN when the failed-jobs connection has a t
 
 ### Timeouts
 
-Timeouts are opt-in: set `TORQUE_TIMEOUTS=true` (`timeouts.enabled`). Off, `$timeout` means nothing and a job runs as long as it runs.
+Timeouts are on by default (`timeouts.enabled`, `TORQUE_TIMEOUTS`). They only limit jobs that declare a `$timeout`, or streams with a `timeout`; no stream timeout is set by default. Audit your `$timeout` values when upgrading from 1.x, where they were ignored. Set `TORQUE_TIMEOUTS=false` and `$timeout` means nothing again.
 
 - **Limit.** `$job->timeout() ?? the stream's timeout`, in seconds; `0` or neither set means no limit. Set the stream default with `timeout` in `streams.<name>`. Keep it below `retry_after`; the worker logs a WARN at boot otherwise, because another worker can steal a job that is still running.
-- **At expiry.** The job is told through `interrupted()`, then fails if `$failOnTimeout` is set or its attempts are up, and is otherwise released with a delay of at least `drain_grace_seconds`. `JobTimedOut` and `JobExceptionOccurred` are dispatched.
-- **The worker rotates.** A timeout stops the whole worker (exit 1) and the master starts a replacement. The other slots get `drain_grace_seconds` to finish; whatever is still running after that is redelivered. At-least-once means duplicates can happen, so keep `coroutines_per_worker` low on streams with jobs that tend to hang.
-- **Budget.** `interrupted()` and the `JobInterrupted`, `JobTimedOut` and `JobExceptionOccurred` listeners share a bounded budget of `min(drain_grace_seconds / 2, 5)` seconds. The job is failed or released after that, also when one of them has not returned.
+- **At expiry.** The job is told through `interrupted()`, then fails if `$failOnTimeout` is set or its attempts are up, and is otherwise released with a delay of at least `timeouts.release_delay_seconds` (10). `JobTimedOut` and `JobExceptionOccurred` are dispatched.
+- **The worker rotates.** A timeout stops the whole worker (exit 1) and the master starts a replacement. The other slots get `drain_grace_seconds` (derived from your streams unless set) to finish; whatever is still running after that is redelivered. At-least-once means duplicates can happen, so keep `slots_per_worker` low on streams with jobs that tend to hang.
+- **Budget.** `interrupted()` and the `JobInterrupted`, `JobTimedOut` and `JobExceptionOccurred` listeners share a bounded budget of `timeouts.settle_seconds` (5, at most half of `drain_grace_seconds`). The job is failed or released after that, also when one of them has not returned.
 - **What is timed.** The timer spans `handle()` only. The stock worker's alarm also covers the `JobProcessing` and `JobProcessed` listeners; here those are not timed.
 - **What can time out.** Only a job suspended on the event loop (a Redis, HTTP or async DB call). Code that blocks the process never lets the timer run; use the watchdog below.
 - **After abandonment.** The job's fiber is not stopped, because throwing into it could return a connection to the pool mid-reply. Its code may run briefly until the worker exits.
-- **Retry delay.** The release delay is at least the grace, so it can overshoot a `retryUntil`.
+- **Retry delay.** The release delay is at least `timeouts.release_delay_seconds`, so it can overshoot a `retryUntil`.
 
 ### Strict attempts and redelivery counting
 
-With `strict_attempts` (`TORQUE_STRICT_ATTEMPTS`, off by default) a job is checked against its attempts and `retryUntil` before it runs, and a delivery after the first counts against `$tries` or the stream's `max_retries`. A job that keeps killing its worker then reaches the dead-letter stream with `reason=redelivery_limit` instead of looping.
+With `strict_attempts` (`TORQUE_STRICT_ATTEMPTS`, on by default) a job is checked against its tries and `retryUntil` before it runs, and a delivery after the first counts against `$tries` or the stream's `max_retries`. A job that keeps killing its worker then reaches the dead-letter stream with `reason=redelivery_limit` instead of looping.
 
 Counted as a redelivery:
 
@@ -264,12 +264,12 @@ Consequences:
 
 ### Blocked event loop watchdog
 
-A job that blocks the process (`sleep()`, a blocking PDO query, a blocking extension) freezes every slot and timer of its worker, so timeouts cannot fire. Set `loop_stall_kill_seconds` (`TORQUE_LOOP_STALL_KILL`, `0` is off) and workers touch a heartbeat file in `storage/framework/torque-heartbeats` about once a second; the master sends SIGKILL to a worker whose file is older than the limit and starts a replacement.
+A job that blocks the process (`sleep()`, a blocking PDO query, a blocking extension) freezes every slot and timer of its worker, so timeouts cannot fire. The watchdog is on by default: `loop_stall_kill_seconds` (`TORQUE_LOOP_STALL_KILL`) derives `max(300, longest stream retry_after)`, 300 at package defaults; an integer overrides it and `0` is off. Workers touch a heartbeat file in `storage/framework/torque-heartbeats` about once a second; the master sends SIGKILL to a worker whose file is older than the limit and starts a replacement.
 
 - The heartbeat is local, so `storage` must be on a local disk (the mtime is compared to the host's clock). No Redis is involved, so an outage cannot kill workers.
 - A kill takes every slot in that worker, and also hits a process stopped with SIGSTOP or paused in a debugger.
-- Set the limit above the longest blocking call you accept. Set your cache store's timeout below the limit, as the boot WARN says: the worker's timers read the default cache store, so a network hang there blocks the loop.
-- Killed jobs stay pending and are redelivered after `retry_after`. Without `strict_attempts`, a job that always blocks loops forever.
+- Set the limit above the longest blocking call you accept. Set your cache store's timeout below the limit, as the boot WARN says (it prints at boot on database-cache apps): the worker's timers read the default cache store, so a network hang there blocks the loop.
+- Killed jobs stay pending and are redelivered after `retry_after`. With `strict_attempts` those redeliveries count against the job's limit; without it a job that always blocks loops forever. A kill also takes the sibling slots of that worker.
 - A worker that has not yet written a heartbeat is never killed, so a hang during boot is not covered.
 
 ### `Queue::popUsing()`
@@ -330,7 +330,7 @@ foreach ($stream->tail($uuid) as $event) {
 $stream->isFinished($uuid); // true after completed/failed
 ```
 
-Streams auto-expire after 5 minutes (configurable via `job_streams.ttl`).
+Streams auto-expire after 5 minutes (configurable via `job_events.ttl`).
 
 ## Redis Cluster Support
 
@@ -367,30 +367,36 @@ All options are in `config/torque.php`. Key settings:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `workers` | 4 | Number of worker processes |
-| `coroutines_per_worker` | 50 | Concurrent job slots per worker |
+| `slots_per_worker` | 50 | Concurrent job slots per worker (`TORQUE_SLOTS_PER_WORKER`; the old `TORQUE_COROUTINES` still works) |
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
 | `max_worker_lifetime_jitter` | 0.1 | Random slice each worker subtracts from its own lifetime, as a ratio. The master forks the fleet inside one second, so without this every worker rotates in the same second. Only ever subtracts; `0.0` disables |
-| `drain_grace_seconds` | 10 | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation, and on how long a draining master waits before stopping its fleet. An idle worker or fleet exits immediately, so size this for the longest job you are willing to wait for. Keep it below the stream `retry_after` so a takeover's brief two-fleet overlap cannot double-claim jobs via XAUTOCLAIM. `torque:reload`, `torque:stop` and the `stopwaitsecs` in a generated Supervisor config all derive their default deadline from it, so raising it never leaves a shutdown path waiting less than a full drain |
-| `takeover_ready_timeout` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
+| `drain_grace_seconds` | null | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation, and on how long a draining master waits before stopping its fleet (`TORQUE_DRAIN_GRACE`). Null derives `min(300, longest stream timeout or retry_after)`, 60 at package defaults; an explicit value wins, and a worker logs a WARN at boot when it is below the derived one. An idle worker or fleet exits immediately. Keep it below the stream `retry_after` so a takeover's two-fleet overlap cannot double-claim jobs. `torque:reload`, `torque:stop` and the `stopwaitsecs` of a generated Supervisor config derive from it; regenerate the Supervisor config after changing it |
+| `reload_pause_seconds` | 10 | Seconds a SIGUSR2 reload waits for the fleet to go idle before workers are told to stop (`TORQUE_RELOAD_PAUSE`) |
+| `takeover_ready_timeout_seconds` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
 | `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
 | `metrics.retention` | 86400 | Seconds of per-minute history kept (about 20 bytes per minute) |
 | `metrics.rollups.hourly_days` / `daily_days` | 90 / 730 | Days of hourly and daily `processed,failed` rollups kept, cluster-wide and per stream. Roughly 60 KB in total plus the same per stream; `daily_days` `0` keeps them forever (~7 KB a year) |
+| `dashboard.enabled` | false | The dashboard is off by default; `TORQUE_DASHBOARD=true` turns it on |
 | `dashboard.gauge_max` | null | Scale of the overview gauge in jobs/min; `null` fits it to the busiest minute of the last hour |
 | `stall_warn_seconds` | 300 | Watchdog logs a WARN for any slot whose current job has been running longer than this |
 | `dead_letter.ttl` | 604800 | Seconds a dead-lettered job is kept before it is trimmed |
 | `dead_letter.max_entries` | 100000 | Hard cap on the dead-letter stream, enforced on every write (`XADD MAXLEN ~`). `0` = TTL only |
 | `dead_letter.prune_interval` | 300 | Seconds between the master's own housekeeping runs (dead-letter trim + stale consumer sweep). `0` disables it |
 | `circuit_breaker.enabled` | true | Pause a stream whose jobs are failing permanently at a high rate |
-| `block_for` | 2000 | Poll interval in ms (how often idle Fibers check for new jobs) |
+| `poll_interval_ms` | 2000 | Poll interval in ms: how often idle Fibers check for new jobs (`TORQUE_POLL_INTERVAL_MS`; the old `TORQUE_BLOCK_FOR` still works). Not the connection's `block_for` |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
-| `redis.read_timeout` | 30 | Seconds a slot waits for a Redis reply before it gives up and reconnects (`TORQUE_REDIS_READ_TIMEOUT`) |
-| `memory_limit` | 0 | Megabytes of real memory (`memory_get_usage(true)`) at which a worker drains and exits with status 12, like `queue:work --memory`; the master starts a replacement. Checked once a second. The drain waits for running jobs with no grace force exit, so a hung job holds that worker until a signal, `queue:restart`, the worker lifetime or `max_jobs_per_worker` ends it, and the stall watchdog only warns. Enable `timeouts.enabled` to end a hung job. `0` is off |
+| `redis.read_timeout_seconds` | 30 | Seconds a slot waits for a Redis reply before it gives up and reconnects (`TORQUE_REDIS_READ_TIMEOUT`) |
+| `memory_limit` | 512 | Megabytes of real memory (`memory_get_usage(true)`) at which a worker drains and exits with status 12, like `queue:work --memory`; the master starts a replacement. Checked once a second. The drain waits for running jobs with no grace force exit, so a hung job holds that worker until a signal, `queue:restart`, the worker lifetime or `max_jobs_per_worker` ends it, and the stall watchdog only warns. Keep `timeouts.enabled` on to end a hung job. A worker logs a WARN at boot when PHP's ini `memory_limit` is below this, since PHP would fatal first. `0` is off (`TORQUE_MEMORY_LIMIT`) |
+| streams (`default`) | see file | Shipped `default` stream reads `TORQUE_QUEUE`, `TORQUE_RETRY_AFTER` (60), `TORQUE_MAX_RETRIES` (3), `TORQUE_BACKOFF` (`exponential`) and `TORQUE_STREAM_TIMEOUT` (none). A published config replaces the whole `streams` block, so the env vars apply only to the unpublished file |
 | `force` | false | Keep processing during `artisan down`, like `queue:work --force`. Off, slots stop polling and claiming while the app is down; in-flight jobs finish and jobs wait in the stream |
-| `job_limits` | `job` | `job`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `stream`: kill switch, only `max_retries` and 2**attempts count, for every job |
-| `strict_attempts` | false | Also check attempts and `retryUntil` before a job runs, as `queue:work` does, which limits `release()`. Off, because `RateLimited` and `WithoutOverlapping` release loops use up attempts and would start failing |
-| `timeouts.enabled` | false | Enforce `$job->timeout() ?? stream timeout` (`TORQUE_TIMEOUTS`). A timeout rotates the whole worker; see Timeouts |
-| `loop_stall_kill_seconds` | 0 | SIGKILL a worker whose heartbeat file is older than this many seconds (`TORQUE_LOOP_STALL_KILL`); `0` is off. See Blocked event loop watchdog |
+| `honour_job_limits` | true | `true`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `false`: kill switch, only `max_retries` and 2**attempts count, for every job, with no release limit (`TORQUE_HONOUR_JOB_LIMITS`; the old `TORQUE_JOB_LIMITS=stream` still maps to false) |
+| `strict_attempts` | true | Also check tries and `retryUntil` before a job runs, as `queue:work` does, and count redeliveries (`TORQUE_STRICT_ATTEMPTS`). Self-releases from `RateLimited`, `WithoutOverlapping` or `release()` do not use up tries; they count against `release_limit_seconds` |
+| `release_limit_seconds` | 86400 | Seconds a job may keep calling `release()`, from its first release; past it the job dead-letters with reason `release_limit`. `0` is off; a stream can override it; `retryUntil` replaces it and `$tries = 0` opts out (`TORQUE_RELEASE_LIMIT`) |
+| `timeouts.enabled` | true | Enforce `$job->timeout() ?? stream timeout` for jobs that declare one (`TORQUE_TIMEOUTS`). A timeout rotates the whole worker; see Timeouts |
+| `timeouts.release_delay_seconds` | 10 | Minimum delay when a timed-out job is released |
+| `timeouts.settle_seconds` | 5 | Budget for `interrupted()` and the timeout listeners; at most half of `drain_grace_seconds` |
+| `loop_stall_kill_seconds` | null | SIGKILL a worker whose heartbeat file is older than this many seconds (`TORQUE_LOOP_STALL_KILL`). Null derives `max(300, longest retry_after)`, 300 at package defaults; `0` is off. See Blocked event loop watchdog |
 
 ### Autoscaling
 
@@ -446,7 +452,7 @@ State is shared across the whole fleet through Redis (every key carries an expir
 
 ## Dashboard
 
-Torque includes a self-contained dashboard at `/torque` (configurable). It is built with **Livewire 4** and plain Blade + Tailwind, served Horizon/Pulse-style: a set of full-page Livewire components share one Blade layout, and the compiled `dist/torque.css` is inlined into it. Livewire (a hard dependency) ships its own runtime and bundled Alpine through your app, so there is **no React, no Flux, no paid UI library, no host Tailwind or Vite build, and no `npm` step in your application**. Enable it in config:
+Torque includes a self-contained dashboard at `/torque` (configurable). It is built with **Livewire 4** and plain Blade + Tailwind, served Horizon/Pulse-style: a set of full-page Livewire components share one Blade layout, and the compiled `dist/torque.css` is inlined into it. Livewire (a hard dependency) ships its own runtime and bundled Alpine through your app, so there is **no React, no Flux, no paid UI library, no host Tailwind or Vite build, and no `npm` step in your application**. The dashboard is off by default as of 2.0. Enable it with `TORQUE_DASHBOARD=true` or in config:
 
 ```php
 'dashboard' => [
@@ -575,7 +581,7 @@ Redis Streams
 
 1. **Master** spawns N worker processes via `pcntl_exec()` (`php artisan torque:worker`)
 2. Each **worker** runs a Revolt event loop with M Fiber slots
-3. Each Fiber polls for messages with non-blocking `XREADGROUP` (no BLOCK). When no work is available, the Fiber yields to the event loop with a configurable delay (`block_for` / 1000 seconds). This ensures timers (delayed job migration, metrics, pause checks) always fire reliably
+3. Each Fiber polls for messages with non-blocking `XREADGROUP` (no BLOCK). When no work is available, the Fiber yields to the event loop with a configurable delay (`poll_interval_ms` / 1000 seconds). This ensures timers (delayed job migration, metrics, pause checks) always fire reliably
 4. Fiber startup is staggered across the poll interval so polling is evenly distributed
 5. **Work-stealing**: idle Fibers claim stale messages from dead consumers via `XAUTOCLAIM` (per-queue `retry_after` as idle threshold)
 6. On completion: `XACK` + `XDEL`. On failure: retry with exponential backoff or dead-letter
@@ -615,7 +621,7 @@ Redis Streams (not LISTs like Horizon) provide:
 | Worker pause/resume events | `WorkerPausing` / `WorkerResuming` (13.8) | Same events, dispatched on `torque:pause` flips |
 | Worker lifecycle events | `WorkerStarting`, `WorkerStopping`, `WorkerIdle`, `WorkerQueuePaused`, `WorkerQueueResumed`, `Looping` | `WorkerStarting` and `WorkerStopping` once per worker; `Looping` on every loop. A listener returning false from `Looping` is honoured |
 | Pop and release events | `JobPopping`, `JobPopped`, `JobReleased`, `JobReleasedAfterException` | Dispatched. `JobPopping` fires on every poll (about 25 per second at 50 slots), so keep its listeners cheap. A throwing listener on the job events does not change the job's outcome, unlike stock |
-| Job timeout event | `JobTimedOut` | Dispatched when `timeouts.enabled` is on (opt-in, 1.3.0) |
+| Job timeout event | `JobTimedOut` | Dispatched when `timeouts.enabled` is on (the default since 2.0) |
 | Maintenance mode | `queue:work` waits while `artisan down`, `--force` overrides | Same: slots stop polling, `force` config overrides |
 | Framework queue pause | `queue:pause` / `queue:pause --all` (13.25) | Honored: global pause stops the worker, per-queue pause skips that stream (keys on the `torque` connection); `torque:pause` stays independent |
 | Enum queue names | `\UnitEnum` accepted by all drivers (13.25) | Same on `StreamQueue` via `enum_value()` |
@@ -639,7 +645,7 @@ Torque::routeMailNotificationsTo('ops@example.com');
 Torque::routeSlackNotificationsTo($webhookUrl);
 ```
 
-Slack needs `laravel/slack-notification-channel`. A webhook URL route gets the legacy Slack message; any other route gets Block Kit.
+Slack needs `laravel/slack-notification-channel`. Every route gets a Block Kit message (needs `laravel/slack-notification-channel` 3.6 or newer).
 
 - The event and the notifications run in a short-lived child process that boots the app fresh, so register listeners and routes in a service provider.
 - One alert can take up to 60 seconds (`long_wait_alert_seconds`), shared across its steps. A throwing listener can run again for the same episode.
@@ -716,13 +722,13 @@ A spawned replacement would escape supervision permanently, which is why the def
 php artisan torque:reload
 ```
 
-The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
+The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout_seconds`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
 
-During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. Keep `TORQUE_DRAIN_GRACE` (default `10`) below the stream `retry_after` so the brief overlap cannot double-claim jobs. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
+During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. Keep `drain_grace_seconds` (`TORQUE_DRAIN_GRACE`, derived by default) below the stream `retry_after` so the brief overlap cannot double-claim jobs. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
 
 #### Two clocks, one ceiling
 
-`--timeout` is how long `torque:reload` itself keeps watching; `drain_grace_seconds` is what the master and its workers hold themselves to. They are not the same number, and the worst case of a drain is twice the grace: the master waits for its fleet to report idle, SIGTERMs it, and then every worker gets the window again for the job it still holds.
+`--timeout` is how long `torque:reload` itself keeps watching; `drain_grace_seconds` is what the master and its workers hold themselves to. They are not the same number, and the worst case of a drain is the reload pause (`reload_pause_seconds`, 10) plus the grace plus a slack (15): the master waits up to the pause for its fleet to report idle, SIGTERMs it, and then every worker gets the grace window for the job it still holds. At package defaults that is 85 seconds.
 
 Left unset, `--timeout` is derived from that worst case, so the default can never be shorter than the drain it waits for. Passing it explicitly is for deploy tools with a run timeout of their own:
 
@@ -733,7 +739,7 @@ php artisan torque:reload --drain --if-running --timeout=240
 
 A short explicit timeout means "stop watching", not "cut the drain short". Past it the command reports that the master is still draining and returns successfully, without a signal: pickup has been paused since the SIGUSR2, and the master exits on its own once the fleet is idle or the grace runs out. The SIGTERM escalation is reserved for a master still alive past its own ceiling, which is a wedged one. `torque:stop` derives its pre-SIGKILL window the same way and takes the same `--timeout` override.
 
-A drain pause belongs to the master that wrote it, so a master starting into a `drain:<pid>` pause whose PID is no longer running deletes the key and logs it, instead of honouring the rest of its TTL (`drain_grace_seconds + 60`, hours on installations with a long grace) after a reload was killed mid-drain. A deliberate `torque:pause` is never cleared automatically, and `torque:status` names which of the two a pause is.
+A drain pause belongs to the master that wrote it, so a master starting into a `drain:<pid>` pause whose PID is no longer running deletes the key and logs it, instead of honouring the rest of its TTL (`reload_pause_seconds + drain_grace_seconds + 60`, hours on installations with a long grace) after a reload was killed mid-drain. A deliberate `torque:pause` is never cleared automatically, and `torque:status` names which of the two a pause is.
 
 Mutual exclusion between masters is a lifetime `flock` on `storage/torque.lock` (released by the kernel on any exit, including SIGKILL), and the PID file self-heals every second: the owning master rewrites it if missing, reclaims it from a stale PID, and self-demotes into a drain if another live master owns it. Concurrent reloads fail fast on `storage/torque.reload.lock`.
 

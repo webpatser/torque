@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-06
+
+Safer defaults, a time limit on `release()` loops, a derived drain window, six renamed config keys and a dashboard that is off until you enable it. Upgrading from before 1.4.0 is refused at start; `UPGRADE.md` has the path, the new config keys and the per-app notes.
+
+### Changed
+- **`strict_attempts` is on by default.** A job is checked against its tries and `retryUntil` before it runs, and a delivery after the first counts against the limit.
+- **Timeouts are on by default** (`timeouts.enabled`). Only jobs that declare a `$timeout` are limited; no stream timeout is added. Audit `$timeout` values that were ignored until now.
+- **`memory_limit` defaults to 512.** A boot WARN fires when PHP's ini `memory_limit` is below it.
+- **`loop_stall_kill_seconds` defaults to a derived value:** `max(300, longest retry_after)`, 300 at package defaults. `0` is off.
+- **Self-releases no longer use up tries.** `RateLimited`, `WithoutOverlapping`, `ThrottlesExceptions` and your own `release()` count against the new `release_limit_seconds` instead. Worker-issued retries still count as tries.
+- **`drain_grace_seconds` is derived:** `min(300, longest stream timeout or retry_after)`, 60 at package defaults. An explicit value wins and a worker WARNs when it is below the derived one. Regenerate Supervisor configs: `stopwaitsecs` follows the worst case (85 at defaults).
+- **`cache:clear` no longer drains the fleet.** A cache baseline going from set to empty is adopted with one log line. `queue:restart` still drains.
+- **Renamed config keys** (the old keys and env vars still work for one version and WARN at master boot; Torque 3.0 makes them a boot failure): `coroutines_per_worker` to `slots_per_worker` (`TORQUE_SLOTS_PER_WORKER`), `block_for` to `poll_interval_ms` (`TORQUE_POLL_INTERVAL_MS`), `redis.read_timeout` to `redis.read_timeout_seconds`, `takeover_ready_timeout` to `takeover_ready_timeout_seconds`, `job_streams` to `job_events`, `job_limits` to `honour_job_limits` (`TORQUE_HONOUR_JOB_LIMITS`). The connection's `block_for` is unchanged.
+- **The dashboard is off by default.** Set `TORQUE_DASHBOARD=true` or `dashboard.enabled`.
+- **`StreamQueue`, `StreamJob` and `WorkerProcess` are `@internal`.** The public API is listed in `UPGRADE.md`.
+- **A stored version below 1.4.0 refuses to start**, with a message naming the path. `SET {prefix}version 1.4.0` is the documented escape hatch.
+
+### Added
+- **`release_limit_seconds`** (`TORQUE_RELEASE_LIMIT`, default 86400, per-stream override, `0` is off). Past it a job dead-letters with reason `release_limit`. `retryUntil` replaces it and `$tries = 0` opts out.
+- **`drain_grace_seconds` derivation, `reload_pause_seconds`** (`TORQUE_RELOAD_PAUSE`, 10), **`timeouts.release_delay_seconds`** (10) and **`timeouts.settle_seconds`** (5), read through one resolver.
+- **Stream env vars** for the shipped `default` stream: `TORQUE_QUEUE`, `TORQUE_RETRY_AFTER`, `TORQUE_MAX_RETRIES`, `TORQUE_BACKOFF`, `TORQUE_STREAM_TIMEOUT`.
+- **Boot WARNs** for ini `memory_limit` below the setting, an effective grace below the derived one, and renamed keys in use.
+
+### Removed
+- **The 0.16.0 and 1.0.0 upgrade steps and `LEGACY_BUCKETS_SUFFIX`.** `torque:prune --deep` still cleans old metric buckets.
+- **The `{host}-{pid}` worker id form.** Only canonical ids parse with a pid.
+- **The legacy Slack message.** Slack alerts need `laravel/slack-notification-channel` 3.6 or newer, enforced by a composer conflict.
+
+### Fixed
+- **A job that keeps releasing no longer loops forever.** Always-throttled jobs (`ThrottlesExceptions`) dead-letter at the release limit.
+
+See `UPGRADE.md` for the steps from 1.4.x.
+
 ## [1.4.1] - 2026-11-05
 
 ### Added
@@ -760,7 +793,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/webpatser/torque/compare/v1.4.1...v2.0.0
 [1.4.1]: https://github.com/webpatser/torque/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/webpatser/torque/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/webpatser/torque/compare/v1.2.0...v1.3.0

@@ -23,6 +23,8 @@ return [
     |--------------------------------------------------------------------------
     | Worker processes
     |--------------------------------------------------------------------------
+    | How many worker processes the master forks. With `autoscale.enabled` this
+    | is the starting size.
     */
     'workers' => (int) env('TORQUE_WORKERS', 4),
 
@@ -40,7 +42,8 @@ return [
     |--------------------------------------------------------------------------
     | Max jobs before worker restart
     |--------------------------------------------------------------------------
-    | Prevents memory leaks from long-running processes.
+    | Prevents memory leaks from long-running processes. The worker drains and
+    | the master starts a replacement.
     */
     'max_jobs_per_worker' => (int) env('TORQUE_MAX_JOBS', 10000),
 
@@ -82,7 +85,11 @@ return [
     | want a rotation or a deploy to take.
     |
     | Null derives it: the longest stream `timeout`, or `retry_after` for a
-    | stream without one, 300 at most. An explicit value wins.
+    | stream without one, 300 at most (60 at package defaults). An explicit value
+    | wins. A worker logs a WARN at boot when the effective value is below the
+    | derived one. Keep it below the stream `retry_after`, so a takeover's brief
+    | two-fleet overlap cannot double-claim jobs. Regenerate a Supervisor config
+    | (`torque:supervisor`) after changing it: `stopwaitsecs` derives from it.
     */
     'drain_grace_seconds' => env('TORQUE_DRAIN_GRACE'),
 
@@ -92,7 +99,8 @@ return [
     |--------------------------------------------------------------------------
     | When the master receives SIGUSR2 (`torque:reload`), it pauses pickup, waits
     | up to this many seconds for its fleet to go idle, and then signals workers
-    | to stop. Each worker then gets `drain_grace_seconds`.
+    | to stop. Each worker then gets `drain_grace_seconds`. The drain pause key
+    | expires after this + `drain_grace_seconds` + 60 seconds.
     */
     'reload_pause_seconds' => (int) env('TORQUE_RELOAD_PAUSE', 10),
 
@@ -105,7 +113,6 @@ return [
     | aborting the takeover and leaving the old master untouched. Keep it
     | below torque:reload's --health-timeout.
     */
-
     'takeover_ready_timeout_seconds' => (int) env('TORQUE_TAKEOVER_READY_TIMEOUT', 30),
 
     /*
@@ -115,6 +122,8 @@ return [
     | The watchdog logs a WARN line every 30s for any slot whose current job
     | has been running longer than this. Helps catch hung user jobs (e.g.
     | external HTTP calls without a timeout) before they age out the worker.
+    | The master also logs a stall warning at boot on database-cache apps, where
+    | the cache cannot carry the heartbeat.
     */
     'stall_warn_seconds' => (int) env('TORQUE_STALL_WARN', 300),
 
@@ -133,9 +142,9 @@ return [
     | `retry_after`), 300 at package defaults; an integer overrides it.
     |
     | No Redis is involved, so an outage cannot kill workers. The killed worker's
-    | jobs stay pending and are redelivered after `retry_after`; only with
-    | `strict_attempts` do those redeliveries count, otherwise a job that always
-    | blocks loops. A worker that never reaches its first heartbeat (a hang during
+    | jobs stay pending and are redelivered after `retry_after`; with
+    | `strict_attempts` (on by default) those redeliveries count against the
+    | limit, with it off a job that always blocks loops. A worker that never reaches its first heartbeat (a hang during
     | boot) is not killed. storage must be on a local disk: the file's mtime is
     | compared to this host's clock.
     */
@@ -148,7 +157,8 @@ return [
     | A worker whose real memory usage (memory_get_usage(true)) reaches this
     | many megabytes drains like at max_jobs_per_worker and exits with status
     | 12, as queue:work does; the master starts a replacement. Checked once a
-    | second. 0 or null turns it off.
+    | second. 0 or null turns it off. Keep PHP's ini `memory_limit` above this,
+    | or PHP fatals before the check; a worker logs a WARN at boot when it is not.
     */
     'memory_limit' => (int) env('TORQUE_MEMORY_LIMIT', 512),
 
@@ -167,6 +177,10 @@ return [
     |--------------------------------------------------------------------------
     | Redis connection
     |--------------------------------------------------------------------------
+    | uri     : Redis or Valkey connection string.
+    | prefix  : prepended to every key Torque writes.
+    | cluster : Redis Cluster hash tag support.
+    | read_timeout_seconds : see below.
     */
     'redis' => [
         'uri' => env('TORQUE_REDIS_URI', 'redis://127.0.0.1:6379'),
@@ -181,6 +195,7 @@ return [
     |--------------------------------------------------------------------------
     | Consumer group
     |--------------------------------------------------------------------------
+    | Name of the consumer group every worker joins on each stream.
     */
     'consumer_group' => env('TORQUE_CONSUMER_GROUP', 'torque'),
 
@@ -190,6 +205,16 @@ return [
     |--------------------------------------------------------------------------
     | Each stream maps to a Redis Stream with its own consumer group.
     | Priority determines processing order when multiple streams have work.
+    | The shipped `default` stream is keyed by TORQUE_QUEUE; its `retry_after`,
+    | `max_retries`, `backoff` and `timeout` read TORQUE_RETRY_AFTER,
+    | TORQUE_MAX_RETRIES, TORQUE_BACKOFF and TORQUE_STREAM_TIMEOUT. A published
+    | config replaces this whole block, so other stream names live in your file.
+    |
+    | `retry_after` is the seconds a delivered job may stay unacknowledged before
+    | another worker claims it (XAUTOCLAIM).
+    |
+    | Optional per-stream `release_limit_seconds` overrides the global one (see
+    | `release_limit_seconds` below).
     |
     | Optional per-stream `max_concurrency` caps how many of a stream's jobs a
     | single worker processes simultaneously (fleet-wide cap = workers x
@@ -201,6 +226,7 @@ return [
     | 0 or 1 is one run and no retry. `backoff` is `exponential` (2, 4, 8, ...),
     | seconds, or seconds per attempt as a list or "1,5,10", the last step
     | repeating. Anything else logs a WARN at boot and is `exponential`.
+    | Backoff counts tries used, not self-releases.
     |
     | `timeout` is the seconds a job that declares none may run (see `timeouts`
     | below). Keep it below `retry_after`, or another worker can steal the job
@@ -224,7 +250,8 @@ return [
     |         `retryUntil`, then `$tries` (0 is no limit), `maxExceptions` and
     |         `$backoff`.
     | false : kill switch. Only `max_retries` and 2**attempts count, for every
-    |         job. Also ignores a stream's `backoff` and `strict_attempts`.
+    |         job. Also ignores a stream's `backoff`, `strict_attempts` and
+    |         `release_limit_seconds`; a worker logs a WARN at every boot.
     */
     'honour_job_limits' => (bool) env('TORQUE_HONOUR_JOB_LIMITS', env('TORQUE_JOB_LIMITS', 'job') !== 'stream'),
 
@@ -232,14 +259,14 @@ return [
     |--------------------------------------------------------------------------
     | Strict attempts
     |--------------------------------------------------------------------------
-    | Off, limits are only checked after a thrown exception. A job that calls
-    | release() is never stopped, which is what keeps the RateLimited and
-    | WithoutOverlapping middleware working: their releases use up attempts.
-    | Each worker logs one line at boot to say so.
+    | Off, limits are only checked after a thrown exception, and only
+    | `release_limit_seconds` stops a job that keeps calling release(). Each
+    | worker logs one line at boot to say so.
     |
     | On, a job is checked before it runs, as with queue:work, and fails once it
-    | is past its attempts or `retryUntil`. Give rate-limited jobs a `retryUntil`
-    | or a high `$tries` first, or they will start failing.
+    | is past its tries or `retryUntil`. Self-releases (RateLimited,
+    | WithoutOverlapping, ThrottlesExceptions, your own release()) do not use up
+    | tries; they count against `release_limit_seconds` instead.
     |
     | On, a delivery after the first also counts against `$tries` or `max_retries`,
     | so a job that kills its worker reaches the dead letter (reason
@@ -254,7 +281,8 @@ return [
     | Release limit
     |--------------------------------------------------------------------------
     | Seconds a job may keep calling release(), counted from the available-at of
-    | its first release; 0 is off. Past it the job reaches the dead letter (reason
+    | its first release; 0 is off. The deadline is checked at pickup, so a
+    | released job that waits in a backlog past it also ends here. Past it the job reaches the dead letter (reason
     | `release_limit`), also with `strict_attempts` off. A stream's own
     | `release_limit_seconds` wins over this one. A job's `retryUntil` replaces the
     | limit, `$tries = 0` opts out, and `honour_job_limits: false` ignores it.
@@ -284,6 +312,11 @@ return [
     | interrupted() and the JobInterrupted, JobTimedOut and JobExceptionOccurred
     | listeners share `settle_seconds`, at most half of `drain_grace_seconds`. The
     | job is failed or released after that, also when one of them has not returned.
+    |
+    | enabled               : TORQUE_TIMEOUTS. Only jobs that declare a `$timeout`
+    |                         (or a stream with `timeout`) are limited.
+    | release_delay_seconds : minimum delay when a timed-out job is released.
+    | settle_seconds        : see above.
     */
     'timeouts' => [
         'enabled' => (bool) env('TORQUE_TIMEOUTS', true),
@@ -295,6 +328,8 @@ return [
     |--------------------------------------------------------------------------
     | Connection pools
     |--------------------------------------------------------------------------
+    | Per-worker pools shared by the slots. `size` is the maximum open
+    | connections; `idle_timeout` is the seconds an unused one is kept.
     */
     'pools' => [
         'mysql' => [
@@ -316,6 +351,11 @@ return [
     | Autoscaling
     |--------------------------------------------------------------------------
     | Master can spin up/down workers based on queue pressure.
+    |
+    | enabled / min_workers / max_workers : bounds of the fleet.
+    | scale_up_threshold / scale_down_threshold : slot utilisation (0 to 1)
+    |     above or below which the master adds or removes a worker.
+    | cooldown : seconds between two scaling decisions.
     */
     'autoscale' => [
         'enabled' => (bool) env('TORQUE_AUTOSCALE', false),
@@ -331,7 +371,8 @@ return [
     | Delayed jobs
     |--------------------------------------------------------------------------
     | Delayed jobs are stored in a sorted set (ZADD with timestamp).
-    | A timer coroutine checks every N seconds and moves ripe jobs to stream.
+    | A timer coroutine checks every `check_interval` seconds and moves ripe jobs
+    | to their stream.
     */
     'delayed' => [
         'check_interval' => 1,
@@ -424,6 +465,7 @@ return [
     | trait can emit custom progress events via $this->emit().
     |
     | Streams auto-expire after `ttl` seconds following a terminal event.
+    | `enabled` turns recording off; `max_events` caps the events kept per job.
     */
     'job_events' => [
         'enabled' => true,
@@ -454,6 +496,8 @@ return [
     |--------------------------------------------------------------------------
     | Metrics
     |--------------------------------------------------------------------------
+    | `enabled` turns the master's fleet metrics off; `publish_interval` is the
+    | seconds between publishes.
     */
     'metrics' => [
         'enabled' => true,
@@ -503,6 +547,10 @@ return [
     |--------------------------------------------------------------------------
     | Dashboard
     |--------------------------------------------------------------------------
+    | Off by default (TORQUE_DASHBOARD=true turns it on). `path` and
+    | `middleware` set the route; the `viewTorque` gate still applies.
+    | `poll_intervals` (ms, 0 is paused) fill the refresh picker and
+    | `default_poll_interval` is the one it opens on.
     */
     'dashboard' => [
         'enabled' => (bool) env('TORQUE_DASHBOARD', false),
@@ -533,7 +581,8 @@ return [
     |--------------------------------------------------------------------------
     | Poll interval (ms)
     |--------------------------------------------------------------------------
-    | How long XREADGROUP blocks waiting for new messages.
+    | How long an idle slot waits before it polls its stream again. Polling does
+    | not block Redis, so timers keep firing. Not the connection's `block_for`.
     */
     'poll_interval_ms' => (int) env('TORQUE_POLL_INTERVAL_MS', env('TORQUE_BLOCK_FOR', 2000)),
 
