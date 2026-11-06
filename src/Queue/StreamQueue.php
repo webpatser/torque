@@ -199,6 +199,9 @@ end
 return {redis.call('XLEN', KEYS[1]), pending, redis.call('ZCARD', KEYS[2]), oldest}
 LUA;
 
+    /** Seconds a job may keep releasing itself when `torque.release_limit_seconds` is not set. */
+    private const int DEFAULT_RELEASE_LIMIT_SECONDS = 86400;
+
     public function __construct(
         private readonly string $redisUri,
         private readonly string $default = 'default',
@@ -1112,11 +1115,69 @@ LUA;
      */
     public function release(string $queue, StreamJob $job, int $delay = 0): void
     {
+        $releases = $job->releases();
+        $deadline = $job->releaseDeadline();
+
+        // Only the first release starts the clock, so releasing again cannot extend it.
+        if ($releases === 0) {
+            $limit = $this->releaseLimitSeconds($queue);
+            $deadline = $limit > 0 ? $this->availableAt(max(0, $delay)) + $limit : null;
+        }
+
+        $this->requeue($queue, $job, $delay, $releases + 1, $deadline);
+    }
+
+    /**
+     * Put a job back on the queue for another try after a failed attempt.
+     *
+     * The same write as a release, with the release counters as they were.
+     */
+    public function retryAfterFailure(string $queue, StreamJob $job, int $delay = 0): void
+    {
+        $this->requeue($queue, $job, $delay, $job->releases(), $job->releaseDeadline());
+    }
+
+    /**
+     * The seconds a job may keep releasing itself on this queue, 0 for no limit.
+     *
+     * Nothing here enforces it: this only decides the deadline a first release
+     * writes. The worker enforces it, so a stock `queue:work` ignores the deadline.
+     */
+    public function releaseLimitSeconds(string $queue): int
+    {
+        $container = Container::getInstance();
+
+        if (! $container->bound('config')) {
+            return self::DEFAULT_RELEASE_LIMIT_SECONDS;
+        }
+
+        $config = $container->make('config');
+        $streams = (array) $config->get('torque.streams', []);
+
+        $limit = $streams[$queue]['release_limit_seconds']
+            ?? $config->get('torque.release_limit_seconds')
+            ?? self::DEFAULT_RELEASE_LIMIT_SECONDS;
+
+        return max(0, (int) $limit);
+    }
+
+    private function requeue(string $queue, StreamJob $job, int $delay, int $releases, ?int $deadline): void
+    {
         $streamKey = $this->getStreamKey($queue);
 
         // Rebuild payload with incremented attempts.
         $payload = self::decodePayload($job->getRawBody(), $this->serializer);
         $payload['attempts'] = ($payload['attempts'] ?? 0) + 1;
+        unset($payload['torque_releases'], $payload['torque_release_deadline']);
+
+        if ($releases > 0) {
+            $payload['torque_releases'] = $releases;
+        }
+
+        if ($deadline !== null) {
+            $payload['torque_release_deadline'] = $deadline;
+        }
+
         $newPayload = $this->encodePayload($payload);
 
         $this->redis->execute(

@@ -102,6 +102,39 @@ class StreamJob extends Job implements JobContract
     }
 
     /**
+     * Get the number of attempts that count against the job's tries: every attempt
+     * except those the job released itself out of.
+     */
+    public function triesUsed(): int
+    {
+        return $this->attempts() - $this->releases();
+    }
+
+    /**
+     * Get the number of times the job released itself.
+     *
+     * Each release raises `attempts` too, so fewer attempts than releases means
+     * something outside Torque reset the attempts (stock `queue:retry` does): this
+     * is a new job, and the counters it carries belong to the old one.
+     */
+    public function releases(): int
+    {
+        $releases = (int) ($this->decoded['torque_releases'] ?? 0);
+
+        return ($this->decoded['attempts'] ?? 0) < $releases ? 0 : $releases;
+    }
+
+    /**
+     * Get the timestamp the job's self-releases must end at, null when it has none.
+     */
+    public function releaseDeadline(): ?int
+    {
+        $deadline = $this->decoded['torque_release_deadline'] ?? null;
+
+        return $deadline === null || $this->releases() === 0 ? null : (int) $deadline;
+    }
+
+    /**
      * Delete the job from the queue.
      *
      * Marks the job as deleted in the base class, then acknowledges and
@@ -138,6 +171,27 @@ class StreamJob extends Job implements JobContract
         parent::release($delay);
 
         $this->streamQueue->release($this->queue, $this, (int) $delay);
+
+        $this->releaseSucceeded = true;
+    }
+
+    /**
+     * Put the job back on the queue for another try after a failed attempt.
+     *
+     * For the worker: unlike release() this is not the job releasing itself, so it
+     * counts as a try and leaves the release counters alone.
+     *
+     * @param  int  $delay  Seconds to delay before the job becomes available again.
+     */
+    public function retryAfterFailure(int $delay = 0): void
+    {
+        if ($this->outcomeIsNotOurs()) {
+            return;
+        }
+
+        parent::release($delay);
+
+        $this->streamQueue->retryAfterFailure($this->queue, $this, $delay);
 
         $this->releaseSucceeded = true;
     }

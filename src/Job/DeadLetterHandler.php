@@ -215,7 +215,8 @@ final class DeadLetterHandler
 
     /**
      * The payload as a new job: attempts back to 0 and `retryUntil` refreshed,
-     * as stock `queue:retry` does, in the format the entry came in.
+     * as stock `queue:retry` does, and the release counters gone, in the format
+     * the entry came in.
      *
      * An entry that cannot be decoded (a serializer mismatch, a corrupt body)
      * is returned byte for byte, as before.
@@ -233,6 +234,7 @@ final class DeadLetterHandler
         }
 
         $payload['attempts'] = 0;
+        unset($payload['torque_releases'], $payload['torque_release_deadline']);
 
         if (isset($payload['data']['command']) && is_string($payload['data']['command'])) {
             try {
