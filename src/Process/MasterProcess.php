@@ -740,9 +740,29 @@ LUA;
      */
     public static function loopStallKillSeconds(array $config): int
     {
-        $seconds = (int) ($config['loop_stall_kill_seconds'] ?? 0);
+        $setting = $config['loop_stall_kill_seconds'] ?? null;
+        $seconds = is_numeric($setting) ? (int) $setting : self::derivedLoopStallKillSeconds($config);
 
         return $seconds > 0 ? max(2, $seconds) : 0;
+    }
+
+    /**
+     * The limit used when `loop_stall_kill_seconds` is null: the longest stream
+     * `retry_after` (60 for a stream that sets none), at least 300. A killed job
+     * returns after its `retry_after`, so the limit never drops below it.
+     *
+     * @param  array<string, mixed>  $config
+     */
+    public static function derivedLoopStallKillSeconds(array $config): int
+    {
+        $streams = is_array($config['streams'] ?? null) ? $config['streams'] : [];
+
+        $retryAfter = array_map(
+            static fn (mixed $stream): int => (is_array($stream) ? max(0, (int) ($stream['retry_after'] ?? 0)) : 0) ?: 60,
+            $streams,
+        );
+
+        return max(300, $retryAfter === [] ? 0 : max($retryAfter));
     }
 
     /**

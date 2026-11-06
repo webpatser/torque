@@ -129,7 +129,8 @@ return [
     | sends SIGKILL to a worker whose heartbeat is older than this, then replaces
     | it. Set it above the longest blocking call you accept: it also kills healthy
     | slots that happen to share the worker. Values of 1 count as 2. 0 is off: no
-    | file and no check.
+    | file and no check. Null (the default) derives max(300, longest stream
+    | `retry_after`), 300 at package defaults; an integer overrides it.
     |
     | No Redis is involved, so an outage cannot kill workers. The killed worker's
     | jobs stay pending and are redelivered after `retry_after`; only with
@@ -138,7 +139,7 @@ return [
     | boot) is not killed. storage must be on a local disk: the file's mtime is
     | compared to this host's clock.
     */
-    'loop_stall_kill_seconds' => (int) env('TORQUE_LOOP_STALL_KILL', 0),
+    'loop_stall_kill_seconds' => env('TORQUE_LOOP_STALL_KILL') === null ? null : (int) env('TORQUE_LOOP_STALL_KILL'),
 
     /*
     |--------------------------------------------------------------------------

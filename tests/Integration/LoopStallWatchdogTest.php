@@ -401,9 +401,17 @@ it('still kills a stalled worker while draining, without replacing it', function
     }
 });
 
-it('reads the setting as off by default and never below the heartbeat can support', function () {
-    expect(config('torque.loop_stall_kill_seconds'))->toBe(0)
-        ->and(MasterProcess::loopStallKillSeconds([]))->toBe(0)
+it('derives the limit from the longest retry_after when the setting is null', function () {
+    expect(config('torque.loop_stall_kill_seconds'))->toBeNull()
+        ->and(MasterProcess::loopStallKillSeconds(config('torque')))->toBe(300)
+        ->and(MasterProcess::loopStallKillSeconds([]))->toBe(300)
+        ->and(MasterProcess::loopStallKillSeconds(['streams' => ['a' => ['retry_after' => 7200], 'b' => []]]))->toBe(7200)
+        ->and(MasterProcess::loopStallKillSeconds(['streams' => ['a' => ['retry_after' => 90]]]))->toBe(300)
+        ->and(MasterProcess::loopStallKillSeconds(['loop_stall_kill_seconds' => 45, 'streams' => ['a' => ['retry_after' => 7200]]]))->toBe(45);
+});
+
+it('reads an explicit 0 as off and never below the heartbeat can support', function () {
+    expect(MasterProcess::loopStallKillSeconds(['loop_stall_kill_seconds' => 0, 'streams' => ['a' => ['retry_after' => 7200]]]))->toBe(0)
         ->and(MasterProcess::loopStallKillSeconds(['loop_stall_kill_seconds' => 0]))->toBe(0)
         ->and(MasterProcess::loopStallKillSeconds(['loop_stall_kill_seconds' => -5]))->toBe(0)
         ->and(MasterProcess::loopStallKillSeconds(['loop_stall_kill_seconds' => 1]))->toBe(2)
