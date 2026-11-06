@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque;
 
+use Illuminate\Contracts\Foundation\CachesConfiguration;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
@@ -37,6 +38,7 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamConnector;
 use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Stream\JobStreamRecorder;
+use Webpatser\Torque\Support\LegacyConfig;
 
 /**
  * Registers the Torque queue driver and artisan commands with Laravel.
@@ -48,7 +50,16 @@ final class TorqueServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
+        // Taken before the merge, because the shipped file still has the old keys
+        // and readers still read them: only what the application itself set is
+        // recorded. A cached config went through this when it was written.
+        $published = $this->app instanceof CachesConfiguration && $this->app->configurationIsCached()
+            ? []
+            : (array) $this->app['config']->get('torque', []);
+
         $this->mergeConfigFrom(__DIR__.'/../config/torque.php', 'torque');
+
+        LegacyConfig::migrate($this->app['config'], $published);
 
         $this->app->singleton(MetricsPublisher::class, function ($app) {
             $config = $app['config']['torque'];

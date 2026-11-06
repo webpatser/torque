@@ -13,6 +13,7 @@ use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\DrainSettings;
+use Webpatser\Torque\Support\LegacyConfig;
 use Webpatser\Torque\Support\LongWaitGate;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
@@ -211,6 +212,8 @@ LUA;
      */
     public function start(): int
     {
+        $this->warnIfLegacyConfig();
+
         // First of all: the check only reads, so a refusal leaves no lock, PID
         // file or worker behind, and a refused reload leaves the old master be.
         if (! $this->upgradePathAllowed()) {
@@ -858,6 +861,15 @@ LUA;
             if ($pid > 0 && (string) $pid === basename($file) && ! posix_kill($pid, 0)) {
                 @unlink($file);
             }
+        }
+    }
+
+    private function warnIfLegacyConfig(): void
+    {
+        $warning = LegacyConfig::warning($this->config);
+
+        if ($warning !== null) {
+            ($this->logger)($warning);
         }
     }
 
