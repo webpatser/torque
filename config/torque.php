@@ -207,11 +207,12 @@ return [
     | while it still runs. The worker logs a WARN at boot if it is not.
     */
     'streams' => [
-        'default' => [
+        env('TORQUE_QUEUE', 'default') => [
             'priority' => 0,
-            'retry_after' => 60,
-            'max_retries' => 3,
-            'backoff' => 'exponential',
+            'retry_after' => (int) env('TORQUE_RETRY_AFTER', 60),
+            'max_retries' => (int) env('TORQUE_MAX_RETRIES', 3),
+            'backoff' => env('TORQUE_BACKOFF', 'exponential'),
+            'timeout' => env('TORQUE_STREAM_TIMEOUT') === null ? null : (int) env('TORQUE_STREAM_TIMEOUT'),
         ],
     ],
 

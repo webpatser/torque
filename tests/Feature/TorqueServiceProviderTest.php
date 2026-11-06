@@ -25,6 +25,59 @@ it('merges the torque config', function () {
         ]);
 });
 
+function shippedStreams(array $env): array
+{
+    $keys = ['TORQUE_QUEUE', 'TORQUE_RETRY_AFTER', 'TORQUE_MAX_RETRIES', 'TORQUE_BACKOFF', 'TORQUE_STREAM_TIMEOUT'];
+    $previous = array_map(fn (string $key) => getenv($key), $keys);
+
+    foreach ($keys as $key) {
+        putenv($env[$key] ?? null ? "{$key}={$env[$key]}" : $key);
+    }
+
+    try {
+        return (require dirname(__DIR__, 2).'/config/torque.php')['streams'];
+    } finally {
+        foreach ($keys as $i => $key) {
+            putenv($previous[$i] === false ? $key : "{$key}={$previous[$i]}");
+        }
+    }
+}
+
+it('keeps the literal default stream when no stream env vars are set', function () {
+    $streams = shippedStreams([]);
+
+    expect($streams)->toBe(['default' => [
+        'priority' => 0,
+        'retry_after' => 60,
+        'max_retries' => 3,
+        'backoff' => 'exponential',
+        'timeout' => null,
+    ]]);
+});
+
+it('reads the stream env vars into the default stream', function () {
+    $streams = shippedStreams([
+        'TORQUE_RETRY_AFTER' => '90',
+        'TORQUE_MAX_RETRIES' => '5',
+        'TORQUE_BACKOFF' => '1,5,10',
+        'TORQUE_STREAM_TIMEOUT' => '45',
+    ]);
+
+    expect($streams['default'])->toMatchArray([
+        'retry_after' => 90,
+        'max_retries' => 5,
+        'backoff' => '1,5,10',
+        'timeout' => 45,
+    ]);
+});
+
+it('keys the shipped stream by TORQUE_QUEUE without leaving a default key', function () {
+    $streams = shippedStreams(['TORQUE_QUEUE' => 'emails']);
+
+    expect(array_keys($streams))->toBe(['emails'])
+        ->and($streams)->not->toHaveKey('default');
+});
+
 it('registers the torque queue connector', function () {
     /** @var QueueManager $manager */
     $manager = app('queue');
