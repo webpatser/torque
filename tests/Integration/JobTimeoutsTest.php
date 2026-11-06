@@ -254,9 +254,9 @@ it('times out a hung job while a bystander finishes, and runs it again on the ne
     });
 });
 
-it('releases with the grace as the delay when the backoff is shorter', function () {
+it('releases with the release delay, not the grace, when the backoff is shorter', function () {
     torque_with_timeout_jobs([new TimeoutProbeJob('hung', seconds: 8, timeout: 1, backoff: 0)], function (Closure $work, Closure $state): void {
-        $run = $work(['grace' => 2]);
+        $run = $work(['grace' => 1, 'release_delay' => 2]);
 
         expect(torque_timeout_row($run['rows'], 'JobReleasedAfterException', 'hung')['backoff'])->toBe(2)
             ->and($state()['delayed'])->toHaveCount(1);
@@ -582,12 +582,12 @@ it('does not cut a settle short at a grace of zero', function () {
     // after a tick and the next tick comes almost a second later. Past that second
     // the settle is always caught by a tick; the tick after it comes well past 1.1s.
     torque_with_timeout_jobs([new TimeoutProbeJob('hung', seconds: 8, timeout: 1)], function (Closure $work, Closure $state): void {
-        $run = $work(['grace' => 0, 'slow_on' => 'JobReleasedAfterException', 'slow_seconds' => 1.1]);
+        $run = $work(['grace' => 0, 'release_delay' => 0, 'slow_on' => 'JobReleasedAfterException', 'slow_seconds' => 1.1]);
 
         expect($run['code'])->toBe(1)
             ->and(torque_timeout_events($run['rows'], 'hung'))->toContain('JobReleasedAfterException', 'JobAttempted');
 
-        // No backoff and no grace, so the release adds it to the stream at once.
+        // No backoff and no release delay, so the release adds it to the stream at once.
         expect($state())->toMatchArray(['waiting' => 1, 'delayed' => [], 'pending' => 0]);
     });
 });

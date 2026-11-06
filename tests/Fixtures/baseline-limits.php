@@ -12,7 +12,8 @@ declare(strict_types=1);
 
 return [
     'strict_attempts' => false,
-    'timeouts' => ['enabled' => false],
+    // 1.x released a timed-out job after the grace, which these fixtures pin low.
+    'timeouts' => ['enabled' => false, 'release_delay_seconds' => 1],
     'memory_limit' => 0,
     'loop_stall_kill_seconds' => 0,
     'drain_grace_seconds' => 10,

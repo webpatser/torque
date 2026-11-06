@@ -59,6 +59,7 @@ use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
+use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Torque;
 
 use function Fledge\Async\async;
@@ -501,6 +502,7 @@ LUA;
         $this->maxLifetime = $maxLifetime;
         $this->memoryLimit = max(0, (int) ($this->config['memory_limit'] ?? 512));
         $this->announceMemorySettings();
+        $this->announceDrainGrace();
         $this->startTime = time();
 
         // Maintenance mode is read once a second for the whole worker, not per
@@ -659,6 +661,12 @@ LUA;
                     // an outage is never mistaken for a restart.
                     $restartBaseline = $current;
                     $restartBaselineKnown = true;
+                } elseif ($restartBaseline !== null && $current === null) {
+                    // cache:clear or an eviction, not a deploy. Unlike the stock
+                    // worker this does not drain: a clear would otherwise restart
+                    // the whole fleet. The next queue:restart still differs from null.
+                    $restartBaseline = null;
+                    fwrite(STDERR, "[torque:worker] queue:restart key is gone (cache:clear or eviction), keeping the worker running and watching for the next queue:restart.\n");
                 } elseif ($current != $restartBaseline) {
                     fwrite(STDERR, "[torque:worker] Received queue:restart signal, draining and exiting.\n");
                     $this->requestStop(WorkerStopReason::ReceivedRestartSignal);
@@ -1263,7 +1271,7 @@ LUA;
         // which exits between jobs, the running jobs finish first. Forcing them
         // out would rerun them in a new worker with their attempts unchanged, and
         // the same memory growth would abandon them again, forever.
-        $drainGrace = (int) ($this->config['drain_grace_seconds'] ?? 10);
+        $drainGrace = DrainSettings::graceSeconds($this->config);
         $drainStartedAt = null;
         EventLoop::repeat($timerPeriod('stop_check_seconds', 1.0), function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey, $events, $workerOptions, $connectionName, $primaryQueue, $streamQueue) {
             // Revolt re-enables a repeat timer before invoking it, so a tick that
@@ -2897,7 +2905,7 @@ LUA;
 
         // Half the grace at most, so a hung callback leaves time for the outcome
         // before the drain's forced exit, and one deadline for all of them.
-        $deadline = microtime(true) + min(max((float) ($this->config['drain_grace_seconds'] ?? 10), 0.0) / 2, 5.0);
+        $deadline = microtime(true) + DrainSettings::settleSeconds($this->config);
         $scope = AttemptScope::current();
 
         $this->runSettleCallback($job, $deadline, fn () => $this->interruptJob($job, $scope, SIGALRM, $events));
@@ -2956,8 +2964,9 @@ LUA;
      * exception event, then the release. A job that settled itself before it hung
      * keeps that outcome, as in handleFailure().
      *
-     * The delay is at least the grace: a shorter one could hand the job to another
-     * worker while whatever it was hung on is still being drained here. The entry
+     * The delay is at least `timeouts.release_delay_seconds`: a shorter one could
+     * hand the job to another worker while whatever it was hung on is still being
+     * drained here, so keep it near the time that takes. The entry
      * stays in the PEL until LUA_RELEASE, and in $inFlight beyond it, so this worker
      * cannot pick it up again. Another can only steal it once it has been idle for
      * retry_after, the same as any job running that long.
@@ -3007,7 +3016,7 @@ LUA;
             return;
         }
 
-        $delay = max($this->retryBackoff($job, $streamConfig), (int) ($this->config['drain_grace_seconds'] ?? 10));
+        $delay = max($this->retryBackoff($job, $streamConfig), DrainSettings::releaseDelaySeconds($this->config));
 
         $job->retryAfterFailure($delay);
 
@@ -3392,6 +3401,21 @@ LUA;
 
         if ($ini !== null && $ini < $this->memoryLimit) {
             fwrite(STDERR, "[torque:worker] WARN PHP memory_limit is {$ini} MB, below the torque memory_limit of {$this->memoryLimit} MB, so PHP will fatal before the worker drains itself. Raise the ini value or lower torque.memory_limit\n");
+        }
+    }
+
+    /**
+     * Say at boot when the grace sits below what the streams ask for. The only
+     * signal for an app whose published config still pins
+     * `env('TORQUE_DRAIN_GRACE', 10)`, which a restart turns into abandoned jobs.
+     */
+    private function announceDrainGrace(): void
+    {
+        $grace = DrainSettings::graceSeconds($this->config);
+        $derived = DrainSettings::derivedGraceSeconds($this->config);
+
+        if ($grace < $derived) {
+            fwrite(STDERR, "[torque:worker] WARN drain_grace_seconds is {$grace}s, below the {$derived}s derived from the longest stream timeout or retry_after, so a restart or rotation abandons jobs still running after {$grace}s. Set torque.drain_grace_seconds to null and unset TORQUE_DRAIN_GRACE to use the derived value, or raise it to at least {$derived}\n");
         }
     }
 

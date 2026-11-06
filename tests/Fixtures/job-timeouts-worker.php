@@ -121,5 +121,9 @@ $events->listen(WorkerStopping::class, static function (WorkerStopping $e) use (
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => (int) ($options['grace'] ?? 1),
     'memory_limit' => (int) ($options['memory_limit'] ?? 0),
-    'timeouts' => ['enabled' => (bool) ($options['enabled'] ?? true)],
+    // The tests size a release against the grace they pin, unless they set their own.
+    'timeouts' => [
+        'enabled' => (bool) ($options['enabled'] ?? true),
+        'release_delay_seconds' => (int) ($options['release_delay'] ?? $options['grace'] ?? 1),
+    ],
 ])))->run();

@@ -8,7 +8,7 @@ declare(strict_types=1);
  * tests/Integration/QueueRestartTest.php.
  *
  * Arguments: redis uri, key prefix, consumer group, queue, log file, cache
- * directory, restartable (1 or 0).
+ * directory, restartable (1 or 0), and optionally JSON settings merged last.
  */
 
 use Illuminate\Queue\Worker;
@@ -35,7 +35,7 @@ config([
 
 Worker::$restartable = $restartable === '1';
 
-(new WorkerProcess(array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', [
+$config = array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', [
     'redis' => ['uri' => $redisUri, 'prefix' => $prefix, 'cluster' => false],
     'consumer_group' => $group,
     'serializer' => 'json',
@@ -48,4 +48,9 @@ Worker::$restartable = $restartable === '1';
     'max_worker_lifetime_jitter' => 0,
     'drain_grace_seconds' => 10,
     'intervals' => require __DIR__.'/fast-intervals.php',
-])))->run();
+], json_decode($argv[8] ?? '[]', true, flags: JSON_THROW_ON_ERROR));
+
+// Without the package's `default` stream, its retry_after of 60 would set the derived grace.
+$config['streams'] = array_intersect_key($config['streams'], [$queue => true]);
+
+(new WorkerProcess($config))->run();

@@ -26,8 +26,10 @@ use Webpatser\Torque\Tests\Fixtures\RestartProbeJob;
  *
  * @param  list<object>  $jobs
  * @param  Closure(array{process: resource, cache: Repository, output: string, log: string, redis: mixed, streamKey: string, group: string}): mixed  $scenario
+ * @param  array<string, mixed>  $settings  Merged last into the worker's config.
+ * @param  bool  $restartedBefore  Whether queue:restart ran before the worker booted, so it starts on a non-null baseline.
  */
-function torque_with_restart_worker(array $jobs, bool $restartable, Closure $scenario): mixed
+function torque_with_restart_worker(array $jobs, bool $restartable, Closure $scenario, array $settings = [], bool $restartedBefore = false): mixed
 {
     $redis = torqueRedis();
     $token = bin2hex(random_bytes(4));
@@ -56,11 +58,17 @@ function torque_with_restart_worker(array $jobs, bool $restartable, Closure $sce
         (void) $queue->push($job, '', $queueName);
     }
 
+    $cache = new Repository(new FileStore(new Filesystem, $cacheDir));
+
+    if ($restartedBefore) {
+        $cache->forever('illuminate:queue:restart', time() - 60);
+    }
+
     $process = null;
 
     try {
         $process = proc_open(
-            [PHP_BINARY, dirname(__DIR__).'/Fixtures/restart-worker.php', torqueRedisUri(), $prefix, $group, $queueName, $logFile, $cacheDir, $restartable ? '1' : '0'],
+            [PHP_BINARY, dirname(__DIR__).'/Fixtures/restart-worker.php', torqueRedisUri(), $prefix, $group, $queueName, $logFile, $cacheDir, $restartable ? '1' : '0', json_encode($settings, JSON_THROW_ON_ERROR)],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', $outputFile, 'a'], 2 => ['file', $outputFile, 'a']],
             $pipes,
         );
@@ -74,7 +82,7 @@ function torque_with_restart_worker(array $jobs, bool $restartable, Closure $sce
 
         return $scenario([
             'process' => $process,
-            'cache' => new Repository(new FileStore(new Filesystem, $cacheDir)),
+            'cache' => $cache,
             'output' => $outputFile,
             'log' => $logFile,
             'redis' => $redis,
@@ -188,6 +196,96 @@ it('lets an in-flight job finish and acknowledge before the worker exits', funct
         expect((int) $pending[0])->toBe(0);
     });
 });
+
+/*
+ * The deploy that 1.x got wrong, scaled down. There the grace was a fixed 10s, so
+ * a queue:restart abandoned any job with more than 10s left and it ran again after
+ * retry_after. A pinned 1s stands in for that 10s against a 3s job, and the same
+ * job under an 8s retry_after shows what the derived grace does with it.
+ */
+it('abandons a job that outlasts a pinned grace, the way the fixed grace of 1.x did', function () {
+    torque_with_restart_worker([new RestartProbeJob(3.0)], restartable: true, scenario: function (array $run): void {
+        torque_wait_until(static fn (): bool => torque_restart_events($run['log']) === ['start'], 20, 'the job to start', $run['output']);
+
+        $run['cache']->forever('illuminate:queue:restart', time());
+
+        $result = torque_exit_of($run['process'], 15);
+
+        expect($result['exited'])->toBeTrue()
+            ->and(torque_restart_events($run['log']))->toBe(['start'])
+            ->and((string) file_get_contents($run['output']))->toContain('Drain window expired');
+
+        // Still pending, so another worker runs it again once retry_after passes.
+        expect((int) $run['redis']->execute('XPENDING', $run['streamKey'], $run['group'])[0])->toBe(1);
+    }, settings: ['drain_grace_seconds' => 1, 'streams' => ['restart' => ['retry_after' => 8]]]);
+});
+
+it('lets that job finish under the derived grace, once and inside retry_after', function () {
+    torque_with_restart_worker([new RestartProbeJob(3.0)], restartable: true, scenario: function (array $run): void {
+        $startedBefore = microtime(true);
+
+        torque_wait_until(static fn (): bool => torque_restart_events($run['log']) === ['start'], 20, 'the job to start', $run['output']);
+
+        $run['cache']->forever('illuminate:queue:restart', time());
+
+        $result = torque_exit_of($run['process'], 15);
+        $output = (string) file_get_contents($run['output']);
+
+        expect($result['exited'])->toBeTrue()
+            ->and($result['code'])->toBe(0)
+            ->and(microtime(true) - $startedBefore)->toBeLessThan(8.0)
+            ->and(torque_restart_events($run['log']))->toBe(['start', 'done'])
+            ->and($output)->toContain('draining for up to 8s')
+            ->and($output)->toContain('Drain complete');
+
+        // Acknowledged and not released: nothing is left for anyone to deliver again.
+        expect((int) $run['redis']->execute('XPENDING', $run['streamKey'], $run['group'])[0])->toBe(0)
+            ->and((int) $run['redis']->execute('ZCARD', $run['streamKey'].':delayed'))->toBe(0);
+    }, settings: ['drain_grace_seconds' => null, 'streams' => ['restart' => ['retry_after' => 8]]]);
+});
+
+it('does not drain on cache:clear, and still drains on a later queue:restart', function () {
+    torque_with_restart_worker([], restartable: true, scenario: function (array $run): void {
+        $run['cache']->flush();
+
+        torque_wait_until(static fn (): bool => str_contains((string) file_get_contents($run['output']), 'queue:restart key is gone'), 5, 'the worker to see the clear', $run['output']);
+
+        // Five check intervals at the fixture's 0.2s, all of them seeing the cleared key.
+        expect(torque_exit_of($run['process'], 1)['exited'])->toBeFalse();
+
+        $output = (string) file_get_contents($run['output']);
+
+        expect(substr_count($output, 'queue:restart key is gone'))->toBe(1)
+            ->and($output)->not->toContain('draining');
+
+        $run['cache']->forever('illuminate:queue:restart', time());
+
+        $result = torque_exit_of($run['process'], 15);
+
+        expect($result['exited'])->toBeTrue()
+            ->and($result['code'])->toBe(0)
+            ->and((string) file_get_contents($run['output']))->toContain('Received queue:restart signal');
+    }, restartedBefore: true);
+});
+
+it('warns at boot when the grace is below the derived value', function () {
+    torque_with_restart_worker([], restartable: true, scenario: function (array $run): void {
+        expect((string) file_get_contents($run['output']))
+            ->toContain('WARN drain_grace_seconds is 3s')
+            ->toContain('below the 20s derived')
+            ->toContain('Set torque.drain_grace_seconds to null and unset TORQUE_DRAIN_GRACE');
+    }, settings: ['drain_grace_seconds' => 3, 'streams' => ['restart' => ['retry_after' => 20]]]);
+});
+
+it('does not warn about a grace at or above the derived value', function (?int $grace) {
+    torque_with_restart_worker([], restartable: true, scenario: function (array $run): void {
+        expect((string) file_get_contents($run['output']))->not->toContain('WARN drain_grace_seconds');
+    }, settings: ['drain_grace_seconds' => $grace, 'streams' => ['restart' => ['retry_after' => 20]]]);
+})->with([
+    'derived' => [null],
+    'equal' => [20],
+    'above' => [30],
+]);
 
 it('keeps running when the worker is not restartable', function () {
     torque_with_restart_worker([], restartable: false, scenario: function (array $run): void {
