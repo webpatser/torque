@@ -499,7 +499,8 @@ LUA;
 
         $this->maxJobs = $maxJobs;
         $this->maxLifetime = $maxLifetime;
-        $this->memoryLimit = max(0, (int) ($this->config['memory_limit'] ?? 0));
+        $this->memoryLimit = max(0, (int) ($this->config['memory_limit'] ?? 512));
+        $this->announceMemorySettings();
         $this->startTime = time();
 
         // Maintenance mode is read once a second for the whole worker, not per
@@ -3351,7 +3352,7 @@ LUA;
 
     private function enforcesStrictAttempts(): bool
     {
-        return $this->honoursJobLimits() && (bool) ($this->config['strict_attempts'] ?? false);
+        return $this->honoursJobLimits() && (bool) ($this->config['strict_attempts'] ?? true);
     }
 
     /**
@@ -3373,7 +3374,52 @@ LUA;
 
     private function timeoutsEnabled(): bool
     {
-        return (bool) ($this->config['timeouts']['enabled'] ?? false);
+        return (bool) ($this->config['timeouts']['enabled'] ?? true);
+    }
+
+    /**
+     * Say at boot when PHP's own memory_limit sits below the worker's: PHP would
+     * fatal before the worker's check ever drains it. An ini of -1 is unlimited
+     * and a setting of 0 is off.
+     */
+    private function announceMemorySettings(): void
+    {
+        if ($this->memoryLimit <= 0) {
+            return;
+        }
+
+        $ini = self::iniMemoryMegabytes((string) ini_get('memory_limit'));
+
+        if ($ini !== null && $ini < $this->memoryLimit) {
+            fwrite(STDERR, "[torque:worker] WARN PHP memory_limit is {$ini} MB, below the torque memory_limit of {$this->memoryLimit} MB, so PHP will fatal before the worker drains itself. Raise the ini value or lower torque.memory_limit\n");
+        }
+    }
+
+    /**
+     * An ini memory value in megabytes, or null for unlimited or unparseable.
+     */
+    private static function iniMemoryMegabytes(string $value): ?float
+    {
+        $value = trim($value);
+
+        if ($value === '' || ! preg_match('/^(-?\d+)\s*([kmg]?)b?$/i', $value, $m)) {
+            return null;
+        }
+
+        $number = (int) $m[1];
+
+        if ($number < 0) {
+            return null;
+        }
+
+        $megabytes = match (strtolower($m[2])) {
+            'g' => $number * 1024.0,
+            'm' => (float) $number,
+            'k' => $number / 1024,
+            default => $number / 1024 / 1024,
+        };
+
+        return $megabytes > 0 ? $megabytes : null;
     }
 
     /**

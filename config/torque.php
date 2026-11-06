@@ -140,7 +140,7 @@ return [
     | 12, as queue:work does; the master starts a replacement. Checked once a
     | second. 0 or null turns it off.
     */
-    'memory_limit' => (int) env('TORQUE_MEMORY_LIMIT', 0),
+    'memory_limit' => (int) env('TORQUE_MEMORY_LIMIT', 512),
 
     /*
     |--------------------------------------------------------------------------
@@ -236,7 +236,7 @@ return [
     | a job left running past `drain_grace_seconds` by a restart, a rotation or
     | another job's timeout uses up a try as well, so leave room in the limit.
     */
-    'strict_attempts' => (bool) env('TORQUE_STRICT_ATTEMPTS', false),
+    'strict_attempts' => (bool) env('TORQUE_STRICT_ATTEMPTS', true),
 
     /*
     |--------------------------------------------------------------------------
@@ -275,7 +275,7 @@ return [
     | failed or released after that, also when one of them has not returned.
     */
     'timeouts' => [
-        'enabled' => (bool) env('TORQUE_TIMEOUTS', false),
+        'enabled' => (bool) env('TORQUE_TIMEOUTS', true),
     ],
 
     /*
