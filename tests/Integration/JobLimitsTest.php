@@ -481,6 +481,15 @@ describe('strict_attempts', function () {
             ->and($run['output'])->not->toContain('neither is one whose worker keeps dying');
     });
 
+    it('on: warns at boot when max_retries is 1, and stays quiet for 3', function () {
+        $one = torque_run_limits_worker(new JobLimitsProbeJob(tries: 1), ['max_retries' => 1], maxJobs: 1, options: ['strict_attempts' => true]);
+        $three = torque_run_limits_worker(new JobLimitsProbeJob(tries: 1), ['max_retries' => 3], maxJobs: 1, options: ['strict_attempts' => true]);
+
+        expect($one['output'])->toContain('WARN stream')
+            ->and($one['output'])->toContain('a worker death dead-letters a job that does not declare its own $tries (redelivery_limit)')
+            ->and($three['output'])->not->toContain('a worker death dead-letters a job');
+    });
+
     it('on: fails a job past retryUntil without running it', function () {
         $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 5, retryUntil: time() - 10), ['max_retries' => 3], maxJobs: 1, options: ['strict_attempts' => true]);
 

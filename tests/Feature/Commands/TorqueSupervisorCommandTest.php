@@ -2,6 +2,12 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Facades\Artisan;
+use Symfony\Component\Console\Output\ConsoleOutputInterface;
+use Symfony\Component\Console\Output\ConsoleSectionOutput;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Output\StreamOutput;
+
 afterEach(function () {
     // Clean up any generated config files.
     $default = storage_path('torque-supervisor.conf');
@@ -110,7 +116,7 @@ it('generates valid supervisor config with required directives', function () {
     expect($content)
         ->toContain('[program:torque]')
         ->toContain('process_name=')
-        ->toContain('command=php')
+        ->toContain('command="'.PHP_BINARY.'"')
         ->toContain('torque:start')
         ->toContain('autostart=true')
         ->toContain('autorestart=true')
@@ -186,6 +192,200 @@ it('includes correct log path', function () {
     $content = file_get_contents($expectedPath);
 
     expect($content)->toContain(storage_path('logs/torque.log'));
+});
+
+/**
+ * Build a Deployer-like layout: <root>/releases/1, <root>/releases/2 and a
+ * current symlink pointing at the given release.
+ */
+function makeDeployerLayout(string $currentRelease = '1'): string
+{
+    $root = sys_get_temp_dir().'/torque-deployer-'.bin2hex(random_bytes(6));
+
+    mkdir($root.'/releases/1', 0755, true);
+    mkdir($root.'/releases/2', 0755, true);
+    symlink($root.'/releases/'.$currentRelease, $root.'/current');
+
+    return $root;
+}
+
+function removeDeployerLayout(string $root): void
+{
+    @unlink($root.'/current');
+    @rmdir($root.'/releases/1');
+    @rmdir($root.'/releases/2');
+    @rmdir($root.'/releases');
+    @rmdir($root);
+}
+
+it('uses the Deployer current symlink instead of the release path', function () {
+    $root = makeDeployerLayout('1');
+    $originalBase = base_path();
+
+    try {
+        app()->setBasePath($root.'/releases/1');
+
+        $this->artisan('torque:supervisor', ['--stdout' => true])
+            ->assertSuccessful()
+            ->expectsOutputToContain("\"{$root}/current/artisan\" torque:start")
+            ->expectsOutputToContain("stdout_logfile=\"{$root}/current/storage/logs/torque.log\"")
+            ->doesntExpectOutputToContain('releases/1');
+    } finally {
+        app()->setBasePath($originalBase);
+        removeDeployerLayout($root);
+    }
+});
+
+it('keeps base_path when current points at another release', function () {
+    $root = makeDeployerLayout('2');
+    $originalBase = base_path();
+
+    try {
+        app()->setBasePath($root.'/releases/1');
+
+        $this->artisan('torque:supervisor', ['--stdout' => true])
+            ->assertSuccessful()
+            ->expectsOutputToContain("\"{$root}/releases/1/artisan\" torque:start");
+    } finally {
+        app()->setBasePath($originalBase);
+        removeDeployerLayout($root);
+    }
+});
+
+it('lets --app-path override the detected root', function () {
+    $this->artisan('torque:supervisor', ['--app-path' => '/srv/app/current/'])
+        ->assertSuccessful();
+
+    $content = file_get_contents(storage_path('torque-supervisor.conf'));
+
+    expect($content)
+        ->toContain('"/srv/app/current/artisan" torque:start')
+        ->toContain('stdout_logfile="/srv/app/current/storage/logs/torque.log"')
+        ->not->toContain(base_path('artisan'));
+});
+
+it('writes the --php binary quoted into the command line', function () {
+    $this->artisan('torque:supervisor', ['--php' => '/usr/bin/php8.5'])
+        ->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('command="/usr/bin/php8.5" "'.base_path('artisan').'" torque:start');
+});
+
+it('defaults the php binary to the running PHP_BINARY', function () {
+    $this->artisan('torque:supervisor')->assertSuccessful();
+
+    expect(file_get_contents(storage_path('torque-supervisor.conf')))
+        ->toContain('command="'.PHP_BINARY.'" ')
+        ->not->toContain('command=php ');
+});
+
+it('prints the config with --stdout and writes no file', function () {
+    $this->artisan('torque:supervisor', ['--stdout' => true])
+        ->assertSuccessful()
+        ->expectsOutputToContain('[program:torque]')
+        ->expectsOutputToContain('killasgroup=true')
+        ->doesntExpectOutputToContain('Supervisor config written');
+
+    expect(file_exists(storage_path('torque-supervisor.conf')))->toBeFalse();
+});
+
+it('skips the storage_path check with --stdout', function () {
+    $this->artisan('torque:supervisor', ['--stdout' => true, '--path' => '/etc/supervisor/conf.d/torque.conf'])
+        ->assertSuccessful()
+        ->expectsOutputToContain('[program:torque]');
+
+    expect(file_exists('/etc/supervisor/conf.d/torque.conf'))->toBeFalse();
+});
+
+it('points at --stdout in the storage_path error', function () {
+    $this->artisan('torque:supervisor', ['--path' => '/tmp/torque.conf'])
+        ->assertFailed()
+        ->expectsOutputToContain('--stdout');
+});
+
+it('rejects quotes, percent signs and control characters in --php and --app-path', function (string $option, string $value) {
+    $this->artisan('torque:supervisor', ['--stdout' => true, $option => $value])
+        ->assertFailed()
+        ->expectsOutputToContain('may not contain quotes, percent signs or control characters');
+})->with([
+    'php quote' => ['--php', '/usr/bin/php" evil'],
+    'php newline' => ['--php', "/usr/bin/php\nuser=root"],
+    'php percent' => ['--php', '/usr/bin/php%(ENV_HOME)s'],
+    'app-path quote' => ['--app-path', '/srv/app"'],
+    'app-path newline' => ['--app-path', "/srv/app\nuser=root"],
+    'app-path percent' => ['--app-path', '/srv/%(program_name)s'],
+]);
+
+it('rejects a relative --app-path', function () {
+    $this->artisan('torque:supervisor', ['--stdout' => true, '--app-path' => 'srv/app'])
+        ->assertFailed()
+        ->expectsOutputToContain('must be an absolute path');
+});
+
+it('does not double the slash for --app-path=/', function () {
+    $this->artisan('torque:supervisor', ['--stdout' => true, '--app-path' => '/'])
+        ->assertSuccessful()
+        ->expectsOutputToContain('"/artisan" torque:start')
+        ->expectsOutputToContain('stdout_logfile="/storage/logs/torque.log"')
+        ->doesntExpectOutputToContain('//');
+});
+
+it('keeps a storage path outside base_path for the log', function () {
+    $originalStorage = storage_path();
+
+    try {
+        app()->useStoragePath('/var/shared/torque-storage');
+
+        $this->artisan('torque:supervisor', ['--stdout' => true, '--app-path' => '/srv/app/current'])
+            ->assertSuccessful()
+            ->expectsOutputToContain('stdout_logfile="/var/shared/torque-storage/logs/torque.log"')
+            ->doesntExpectOutputToContain('/srv/app/current/storage');
+    } finally {
+        app()->useStoragePath($originalStorage);
+    }
+});
+
+it('warns on stderr that --path is ignored with --stdout and keeps stdout clean', function () {
+    $output = new class(fopen('php://memory', 'w+')) extends StreamOutput implements ConsoleOutputInterface
+    {
+        private ?OutputInterface $stderr = null;
+
+        public function getErrorOutput(): OutputInterface
+        {
+            return $this->stderr ??= new StreamOutput(fopen('php://memory', 'w+'));
+        }
+
+        public function setErrorOutput(OutputInterface $error): void
+        {
+            $this->stderr = $error;
+        }
+
+        public function section(): ConsoleSectionOutput
+        {
+            throw new LogicException('Sections are not supported.');
+        }
+    };
+
+    $exitCode = Artisan::call('torque:supervisor', [
+        '--stdout' => true,
+        '--path' => '/etc/supervisor/conf.d/torque.conf',
+    ], $output);
+
+    $read = function (StreamOutput $stream): string {
+        rewind($stream->getStream());
+
+        return (string) stream_get_contents($stream->getStream());
+    };
+
+    $stdout = trim($read($output));
+    $stderr = $read($output->getErrorOutput());
+
+    expect($exitCode)->toBe(0)
+        ->and($stdout)->toStartWith('[program:torque]')
+        ->and($stdout)->toEndWith('killasgroup=true')
+        ->and($stdout)->not->toContain('--path is ignored')
+        ->and($stderr)->toContain('--path is ignored with --stdout');
 });
 
 it('allows path within storage directory', function () {

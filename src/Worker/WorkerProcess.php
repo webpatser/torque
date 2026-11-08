@@ -3493,7 +3493,13 @@ LUA;
             }
         }
 
-        if (! $this->enforcesStrictAttempts()) {
+        if ($this->enforcesStrictAttempts()) {
+            foreach ($streams as $name => $stream) {
+                if ((int) ($stream['max_retries'] ?? 3) <= 1) {
+                    fwrite(STDERR, "[torque:worker] WARN stream {$name}: strict_attempts is on and max_retries is 1, so a worker death dead-letters a job that does not declare its own \$tries (redelivery_limit) with no re-run. Raise max_retries or set TORQUE_STRICT_ATTEMPTS=false\n");
+                }
+            }
+        } else {
             fwrite(STDERR, "[torque:worker] NOTE strict_attempts is off: attempts and retryUntil are only checked after a thrown exception, so a job that keeps calling release() is limited by release_limit_seconds alone, and not at all if it has a retryUntil or \$tries = 0. A delivery after a worker died is not counted either, so only maxExceptions limits a job whose worker keeps dying\n");
         }
     }

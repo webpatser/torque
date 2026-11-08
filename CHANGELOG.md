@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-08
+
+Supervisor configs now survive Deployer releases, and a low `max_retries` under `strict_attempts` is flagged at boot.
+
+### Added
+- **`torque:supervisor --php`** sets the PHP binary written into `command=` (default `PHP_BINARY`, falling back to `php`).
+- **`torque:supervisor --app-path`** overrides the application root used for the artisan and log paths. Without it, a Deployer layout (`releases/N` next to a `current` symlink that resolves to the same release) uses `current`.
+- **`torque:supervisor --stdout`** prints the config instead of writing a file, so it can be piped: `php artisan torque:supervisor --stdout | sudo tee /etc/supervisor/conf.d/torque.conf`.
+- **Boot WARN** when `strict_attempts` is on and a stream's `max_retries` is 1 or lower, since a worker death then dead-letters the job without a re-run.
+
+### Fixed
+- The generated Supervisor config wrote the Deployer release path (`releases/N`) instead of `current`, and a bare `php`. Both went stale or pointed at the wrong binary after a deploy.
+- The log path now follows the resolved app root only when storage lives inside the app.
+- A relative `--app-path` is rejected, as are `%` in `--php` and `--app-path` values (Supervisor expands it) and quotes or control characters.
+
+### Changed
+- `drain_grace_seconds` docs (config and README) are scoped to takeover restarts; `--drain` restarts are unaffected.
+- `strict_attempts` docs note the `max_retries` 1 case.
+- The `--path` help text mentions `--stdout`.
+
 ## [2.0.0] - 2026-11-06
 
 Safer defaults, a time limit on `release()` loops, a derived drain window, six renamed config keys and a dashboard that is off until you enable it. Upgrading from before 1.4.0 is refused at start; `UPGRADE.md` has the path, the new config keys and the per-app notes.
@@ -793,7 +813,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/webpatser/torque/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/webpatser/torque/compare/v1.4.1...v2.0.0
 [1.4.1]: https://github.com/webpatser/torque/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/webpatser/torque/compare/v1.3.0...v1.4.0

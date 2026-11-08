@@ -87,8 +87,11 @@ return [
     | Null derives it: the longest stream `timeout`, or `retry_after` for a
     | stream without one, 300 at most (60 at package defaults). An explicit value
     | wins. A worker logs a WARN at boot when the effective value is below the
-    | derived one. Keep it below the stream `retry_after`, so a takeover's brief
-    | two-fleet overlap cannot double-claim jobs. Regenerate a Supervisor config
+    | derived one. For takeover restarts (`torque:reload` in its default
+    | takeover mode, and `torque:start --replace`), where two fleets briefly
+    | overlap, keep it below the stream `retry_after` so the overlap cannot
+    | double-claim jobs. `--drain` restarts are unaffected, and a long-running
+    | stream may exceed `retry_after` there. Regenerate a Supervisor config
     | (`torque:supervisor`) after changing it: `stopwaitsecs` derives from it.
     */
     'drain_grace_seconds' => env('TORQUE_DRAIN_GRACE'),
@@ -273,6 +276,10 @@ return [
     | `redelivery_limit`) instead of looping forever. Any worker going away counts:
     | a job left running past `drain_grace_seconds` by a restart, a rotation or
     | another job's timeout uses up a try as well, so leave room in the limit.
+    |
+    | With `max_retries` at 1, any worker death dead-letters a job that does not
+    | declare its own `$tries` (which overrides `max_retries`), so leave headroom
+    | in `max_retries` or turn strict attempts off.
     */
     'strict_attempts' => (bool) env('TORQUE_STRICT_ATTEMPTS', true),
 

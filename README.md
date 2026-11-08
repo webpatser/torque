@@ -259,6 +259,7 @@ Not counted:
 Consequences:
 
 - Leave `$tries` headroom. A job can reach its limit through other jobs' timeouts and rotations; raise `drain_grace_seconds` and keep concurrency low on hang-prone streams.
+- With `max_retries` at 1, any worker death dead-letters a job that does not declare its own `$tries` (which overrides `max_retries`). Leave headroom in `max_retries` or set `TORQUE_STRICT_ATTEMPTS=false`.
 - A job with `retryUntil` is limited only by its deadline.
 - A job running past `retry_after` on a live worker is charged when another worker steals it.
 
@@ -358,7 +359,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
 | `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--deep` also sweeps orphaned job streams, stale index members and stale worker hashes; `--dry-run` to preview |
 | `torque:forget {id?} {--all} {--queue=} {--force}` | Delete a dead-letter entry by its stream id (like `1700000000000-0`, shown by the dashboard and `torque:tail`), or with `--all` every entry; uuids and `queue:failed` ids are rejected. `--queue` limits `--all` to one queue, `--force` skips the confirmation. Only `database-uuids` `failed_jobs` rows are removed with the entry; `--all` leaves rows that have no dead-letter entry. Horizon's `horizon:forget` |
-| `torque:supervisor` | Generate a Supervisor config file |
+| `torque:supervisor` | Generate a Supervisor config file. `--php` sets the PHP binary (default `PHP_BINARY`), `--app-path` overrides the app path (a Deployer `releases/N` path uses the `current` symlink automatically), `--stdout` prints the config instead of writing it |
 
 ## Configuration
 
@@ -371,7 +372,7 @@ All options are in `config/torque.php`. Key settings:
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
 | `max_worker_lifetime_jitter` | 0.1 | Random slice each worker subtracts from its own lifetime, as a ratio. The master forks the fleet inside one second, so without this every worker rotates in the same second. Only ever subtracts; `0.0` disables |
-| `drain_grace_seconds` | null | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation (`TORQUE_DRAIN_GRACE`); how long a draining master waits for an idle fleet is `reload_pause_seconds`. Null derives `min(300, longest stream timeout or retry_after)`, 60 at package defaults; an explicit value wins, and a worker logs a WARN at boot when it is below the derived one. An idle worker or fleet exits immediately. The derived value equals the longest stream timeout or `retry_after` (max 300); an explicit value may exceed the 300 cap, but a grace at or above the stream `retry_after` lets a takeover's two-fleet overlap double-claim jobs. `torque:reload`, `torque:stop` and the `stopwaitsecs` of a generated Supervisor config derive from it; regenerate the Supervisor config after changing it |
+| `drain_grace_seconds` | null | Ceiling on the seconds Fibers get to finish in-flight jobs before the worker hard-exits on rotation (`TORQUE_DRAIN_GRACE`); how long a draining master waits for an idle fleet is `reload_pause_seconds`. Null derives `min(300, longest stream timeout or retry_after)`, 60 at package defaults; an explicit value wins, and a worker logs a WARN at boot when it is below the derived one. An idle worker or fleet exits immediately. The derived value equals the longest stream timeout or `retry_after` (max 300); an explicit value may exceed the 300 cap, but for takeover restarts (`torque:reload` in its default takeover mode, and `torque:start --replace`) a grace at or above the stream `retry_after` lets the two-fleet overlap double-claim jobs; `--drain` restarts are unaffected, and long-running streams may exceed `retry_after` there. `torque:reload`, `torque:stop` and the `stopwaitsecs` of a generated Supervisor config derive from it; regenerate the Supervisor config after changing it |
 | `reload_pause_seconds` | 10 | Seconds a SIGUSR2 reload waits for the fleet to go idle before workers are told to stop (`TORQUE_RELOAD_PAUSE`) |
 | `takeover_ready_timeout_seconds` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
 | `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
@@ -677,6 +678,12 @@ Generate a Supervisor config:
 php artisan torque:supervisor --workers=4 --user=forge
 ```
 
+Options:
+
+- `--php`: the PHP binary written into the config (default `PHP_BINARY`). `PHP_BINARY` is the fully resolved binary (for example a Homebrew Cellar patch-level path) and can go stale after an upgrade, so in production pass a stable path such as `--php=/usr/bin/php8.5`.
+- `--app-path`: override the application path written into the config; it must be absolute. When `base_path()` is a Deployer release (`releases/N`), the sibling `current` symlink is detected and used automatically, so the config survives new releases.
+- `--stdout`: print the config instead of writing a file, for example `php artisan torque:supervisor --stdout | sudo tee /etc/supervisor/conf.d/torque.conf`. `--path` is ignored with `--stdout` (a warning goes to stderr).
+
 This creates `storage/torque-supervisor.conf`. Copy it to your Supervisor config directory:
 
 ```bash
@@ -706,7 +713,7 @@ To preview it before restarting the fleet, run `php artisan torque:prune --deep 
 
 `torque:stop` followed by `torque:start` works for cold deploys, but it leaves a queue-processing gap (jobs queue up in Redis until the new master is back). `torque:reload` swaps the master in one step, with no manual chaining of pause + wait + stop. Pick the mode by who owns the respawn:
 
-**Under a process supervisor (supervisord, systemd) — use `--drain`.** The supervisor owns respawning, so the reload only signals:
+**Under a process supervisor (supervisord, systemd): use `--drain`.** The supervisor owns respawning, so the reload only signals:
 
 ```bash
 # supervisord (autorestart=true): drain, exit, supervisor respawns from the
@@ -716,7 +723,7 @@ php artisan torque:reload --drain
 
 A spawned replacement would escape supervision permanently, which is why the default mode warns when the master looks supervised.
 
-**Unsupervised hosts — the default takeover handshake:**
+**Unsupervised hosts: the default takeover handshake:**
 
 ```bash
 php artisan torque:reload
@@ -724,7 +731,7 @@ php artisan torque:reload
 
 The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout_seconds`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
 
-During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. Keep `drain_grace_seconds` (`TORQUE_DRAIN_GRACE`, derived by default) below the stream `retry_after` so the brief overlap cannot double-claim jobs. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
+During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. For takeover restarts, keep `drain_grace_seconds` (`TORQUE_DRAIN_GRACE`, derived by default) below the stream `retry_after` so the brief overlap cannot double-claim jobs. `--drain` restarts are unaffected by this, and long-running streams may exceed `retry_after` there. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
 
 #### Two clocks, one ceiling
 
@@ -745,7 +752,7 @@ Mutual exclusion between masters is a lifetime `flock` on `storage/torque.lock` 
 
 ### Containerized deployment
 
-When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master — via `/proc/<pid>/cmdline` on Linux, `ps` elsewhere — so a stale PID file left by a previous container reads as "not running", even when its number has since been recycled by an unrelated process. Readers never delete the file (that would race a takeover's atomic rename); the next master simply overwrites it at boot. No manual `rm storage/torque.pid` is needed between restarts.
+When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master, via `/proc/<pid>/cmdline` on Linux, `ps` elsewhere, so a stale PID file left by a previous container reads as "not running", even when its number has since been recycled by an unrelated process. Readers never delete the file (that would race a takeover's atomic rename); the next master simply overwrites it at boot. No manual `rm storage/torque.pid` is needed between restarts.
 
 ## Performance
 
