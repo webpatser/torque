@@ -18,6 +18,7 @@ use Illuminate\Support\Str;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 use Webpatser\Torque\Stream\JobTagExtractor;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -289,7 +290,8 @@ LUA;
         $first = $raw[0];
 
         if ($first === '{' || $first === '[') {
-            return json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+            // Text opening with `{` or `[` decodes to an array or throws.
+            return Narrow::map(json_decode($raw, true, 512, JSON_THROW_ON_ERROR));
         }
 
         if (self::hasIgbinaryArrayHeader($raw) && self::igbinaryEnabled($serializer)) {
@@ -299,7 +301,7 @@ LUA;
                 throw new \InvalidArgumentException('igbinary payload did not decode to an array');
             }
 
-            return $decoded;
+            return Narrow::map($decoded);
         }
 
         throw new \InvalidArgumentException('Unrecognized payload format');
@@ -376,7 +378,7 @@ LUA;
             return 'json';
         }
 
-        return (string) $container->make('config')->get('torque.serializer', 'json');
+        return Narrow::string($container->make('config')->get('torque.serializer', 'json'));
     }
 
     // -------------------------------------------------------------------------
@@ -397,6 +399,8 @@ LUA;
     #[\Override]
     protected function createObjectPayload($job, $queue)
     {
+        // The parent declares a bare array; the payload is keyed by name.
+        /** @var array<string, mixed> $payload */
         $payload = parent::createObjectPayload($job, $queue);
 
         if ($this->jobShouldBeEncrypted($job)) {
@@ -427,7 +431,7 @@ LUA;
     #[\Override]
     public function push($job, $data = '', $queue = null): ?string
     {
-        return $this->enqueueUsing(
+        return Narrow::nullableString($this->enqueueUsing(
             $job,
             $this->createPayload($job, $this->getQueue($queue), $data),
             // Laravel's own RedisQueue passes the raw (possibly enum) queue
@@ -435,7 +439,7 @@ LUA;
             $queue, // @phpstan-ignore argument.type
             null,
             fn (string $payload, \UnitEnum|string|null $queue) => $this->pushRaw($payload, $queue),
-        );
+        ));
     }
 
     /**
@@ -464,7 +468,7 @@ LUA;
 
         $this->recordQueued($payload, $queue);
 
-        return (string) $messageId;
+        return Narrow::string($messageId);
     }
 
     /**
@@ -475,11 +479,13 @@ LUA;
         try {
             $decoded = self::decodePayload($payload, $this->serializer);
 
-            if (isset($decoded['uuid'])) {
+            $uuid = $decoded['uuid'] ?? null;
+
+            if (is_string($uuid)) {
                 app(JobStreamRecorder::class)->onQueued(
-                    $decoded['uuid'],
+                    $uuid,
                     $this->getQueue($queue),
-                    $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
+                    Narrow::string($decoded['displayName'] ?? $decoded['job'] ?? null, 'Unknown'),
                     JobTagExtractor::fromPayload($decoded),
                 );
             }
@@ -504,15 +510,15 @@ LUA;
     #[\Override]
     public function later($delay, $job, $data = '', $queue = null): ?string
     {
-        return $this->enqueueUsing(
+        return Narrow::nullableString($this->enqueueUsing(
             $job,
             $this->createPayload($job, $this->getQueue($queue), $data, $delay),
             // Raw (possibly enum) queue, as Laravel's RedisQueue passes it;
             // see push().
             $queue, // @phpstan-ignore argument.type
             $delay,
-            fn (string $payload, \UnitEnum|string|null $queue, $delay) => $this->laterRaw($delay, $payload, $queue),
-        );
+            fn (string $payload, \UnitEnum|string|null $queue, DateTimeInterface|DateInterval|int $delay) => $this->laterRaw($delay, $payload, $queue),
+        ));
     }
 
     /**
@@ -538,7 +544,7 @@ LUA;
             return '';
         }
 
-        return $decoded['uuid'] ?? $decoded['id'] ?? '';
+        return Narrow::string($decoded['uuid'] ?? $decoded['id'] ?? null);
     }
 
     // -------------------------------------------------------------------------
@@ -574,28 +580,18 @@ LUA;
             '>',
         );
 
-        // XREADGROUP returns null when the block timeout expires with no message.
-        if ($response === null) {
+        // Nil when the block timeout expires with no message.
+        $message = Narrow::streams($response)[$streamKey][0] ?? null;
+
+        if ($message === null) {
             return null;
         }
 
-        // Response shape: [ [streamKey, [ [messageId, [field, value, ...]] ] ] ]
-        $streamData = $response[0] ?? null;
-        if ($streamData === null) {
-            return null;
-        }
-
-        $messages = $streamData[1] ?? [];
-        if ($messages === []) {
-            return null;
-        }
-
-        $message = $messages[0];
-        $messageId = (string) $message[0];
-        $payload = self::extractPayload($message[1]);
+        $messageId = $message['id'];
+        $payload = self::extractPayload($message['fields']);
 
         if ($payload === null) {
-            // Corrupt message — acknowledge and skip.
+            // Corrupt message: acknowledge and skip.
             $this->deleteAndAcknowledge($this->getQueue($queue), $messageId);
 
             return null;
@@ -649,8 +645,7 @@ LUA;
     {
         $streamKey = $this->getStreamKey($queue);
 
-        /** @var array{0: int|string, 1: int|string, 2: int|string, 3?: string|null} $result */
-        $result = $this->redis->execute(
+        $result = Narrow::list($this->redis->execute(
             'EVAL',
             self::LUA_DEPTHS,
             '2',
@@ -658,14 +653,14 @@ LUA;
             $streamKey.':delayed',
             $this->consumerGroup,
             $withOldest ? '1' : '0',
-        );
+        ));
 
-        $reserved = (int) $result[1];
-        $oldest = (string) ($result[3] ?? '');
+        $reserved = Narrow::int($result[1] ?? null);
+        $oldest = Narrow::string($result[3] ?? null);
 
         return [
-            'waiting' => max(0, (int) $result[0] - $reserved),
-            'delayed' => (int) $result[2],
+            'waiting' => max(0, Narrow::int($result[0] ?? null) - $reserved),
+            'delayed' => Narrow::int($result[2] ?? null),
             'reserved' => $reserved,
             'oldest' => $oldest === '' ? null : $oldest,
         ];
@@ -682,7 +677,6 @@ LUA;
     public function consumers($queue = null): array
     {
         try {
-            /** @var list<list<mixed>>|null $rows */
             $rows = $this->redis->execute('XINFO', 'CONSUMERS', $this->getStreamKey($queue), $this->consumerGroup);
         } catch (RedisException $e) {
             if (str_contains($e->getMessage(), 'NOGROUP') || str_contains($e->getMessage(), 'no such key')) {
@@ -692,19 +686,15 @@ LUA;
             throw $e;
         }
 
-        return array_map(function (array $row): array {
-            $fields = [];
-
-            for ($i = 0, $count = count($row); $i + 1 < $count; $i += 2) {
-                $fields[(string) $row[$i]] = $row[$i + 1];
-            }
+        return array_map(function (mixed $row): array {
+            $fields = Narrow::pairs($row);
 
             return [
-                'name' => (string) ($fields['name'] ?? ''),
-                'pending' => (int) ($fields['pending'] ?? 0),
-                'idle' => (int) ($fields['idle'] ?? 0),
+                'name' => Narrow::string($fields['name'] ?? null),
+                'pending' => Narrow::int($fields['pending'] ?? null),
+                'idle' => Narrow::int($fields['idle'] ?? null),
             ];
-        }, $rows ?? []);
+        }, Narrow::list($rows));
     }
 
     /**
@@ -725,8 +715,8 @@ LUA;
     {
         $streamKey = $this->getStreamKey($queue);
 
-        $trimmed = (int) $this->redis->execute('XTRIM', $streamKey, 'MAXLEN', '0');
-        $delayed = (int) $this->redis->execute('ZREMRANGEBYRANK', $streamKey.':delayed', '0', '-1');
+        $trimmed = Narrow::int($this->redis->execute('XTRIM', $streamKey, 'MAXLEN', '0'));
+        $delayed = Narrow::int($this->redis->execute('ZREMRANGEBYRANK', $streamKey.':delayed', '0', '-1'));
         $this->redis->execute('DEL', $streamKey.self::REDELIVERIES_SUFFIX);
 
         return $trimmed + $delayed;
@@ -747,17 +737,17 @@ LUA;
      */
     public function delayedSize($queue = null): int
     {
-        return (int) $this->redis->execute(
+        return Narrow::int($this->redis->execute(
             'ZCARD',
             $this->getStreamKey($queue).':delayed',
-        );
+        ));
     }
 
     /**
      * Get the number of reserved (pending) jobs.
      *
      * In Redis Streams, the Pending Entries List (PEL) is the reservation
-     * mechanism — a message is "reserved" from the moment it is read by a
+     * mechanism: a message is "reserved" from the moment it is read by a
      * consumer until it is ACKed.
      */
     public function reservedSize($queue = null): int
@@ -787,7 +777,7 @@ LUA;
      * Get all pending (waiting) jobs across every queue.
      *
      * Stream entries that are not in the consumer group's Pending Entries List
-     * (PEL) — i.e. jobs that have been XADDed but not yet claimed by any
+     * (PEL), i.e. jobs that have been XADDed but not yet claimed by any
      * consumer.
      *
      * @return Collection<int, InspectedJob>
@@ -802,7 +792,7 @@ LUA;
     /**
      * Get all reserved (in-flight) jobs across every queue.
      *
-     * Stream entries currently in the consumer group's PEL — jobs that have
+     * Stream entries currently in the consumer group's PEL: jobs that have
      * been claimed by a consumer but not yet acknowledged. The XPENDING
      * delivery count is exposed as the inspected job's `attempts`.
      *
@@ -874,17 +864,12 @@ LUA;
         $cursor = '0';
 
         do {
-            /** @var array{0: string|int, 1?: list<string>}|null $result */
-            $result = $this->redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '500');
+            // [next cursor, [key, ...]]; no reply ends the sweep.
+            $result = Narrow::list($this->redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '500'));
+            $cursor = Narrow::string($result[0] ?? null, '0');
 
-            if (! is_array($result)) {
-                break;
-            }
-
-            $cursor = (string) $result[0];
-
-            foreach ($result[1] ?? [] as $key) {
-                $keys[] = (string) $key;
+            foreach (Narrow::list($result[1] ?? null) as $key) {
+                $keys[] = Narrow::string($key);
             }
         } while ($cursor !== '0');
 
@@ -900,19 +885,18 @@ LUA;
     {
         $streamKey = $this->getStreamKey($queue);
 
-        /** @var list<array{0: string, 1: list<string>}>|null $entries */
-        $entries = $this->redis->execute('XRANGE', $streamKey, '-', '+');
+        $entries = Narrow::entries($this->redis->execute('XRANGE', $streamKey, '-', '+'));
 
-        if (empty($entries)) {
+        if ($entries === []) {
             return new Collection;
         }
 
         $pendingIds = $this->pelMessageIds($streamKey, count($entries));
 
         return (new Collection($entries))
-            ->reject(fn (array $entry) => isset($pendingIds[(string) $entry[0]]))
+            ->reject(fn (array $entry) => isset($pendingIds[$entry['id']]))
             ->map(function (array $entry) {
-                $payload = self::extractPayload($entry[1]);
+                $payload = self::extractPayload($entry['fields']);
 
                 return $payload === null ? null : InspectedJob::fromPayload($payload);
             })
@@ -933,19 +917,15 @@ LUA;
 
         return (new Collection($pending))
             ->map(function (array $entry) use ($streamKey) {
-                $messageId = (string) $entry[0];
-                $deliveryCount = (int) $entry[3];
+                $rows = Narrow::entries($this->redis->execute('XRANGE', $streamKey, $entry['id'], $entry['id']));
 
-                /** @var list<array{0: string, 1: list<string>}>|null $rows */
-                $rows = $this->redis->execute('XRANGE', $streamKey, $messageId, $messageId);
-
-                if (empty($rows)) {
+                if ($rows === []) {
                     return null;
                 }
 
-                $payload = self::extractPayload($rows[0][1]);
+                $payload = self::extractPayload($rows[0]['fields']);
 
-                return $payload === null ? null : InspectedJob::fromPayload($payload, $deliveryCount);
+                return $payload === null ? null : InspectedJob::fromPayload($payload, $entry['deliveries']);
             })
             ->filter()
             ->values();
@@ -958,12 +938,11 @@ LUA;
      * ever read from the stream (so the group has not been auto-created).
      * In that case the PEL is by definition empty, so we return an empty list.
      *
-     * @return list<array{0: string, 1: string, 2: int, 3: int}>
+     * @return list<array{id: string, consumer: string, idle: int, deliveries: int}>
      */
     private function fetchPendingEntries(string $streamKey, int $count): array
     {
         try {
-            /** @var list<array{0: string, 1: string, 2: int, 3: int}>|null $pending */
             $pending = $this->redis->execute(
                 'XPENDING',
                 $streamKey,
@@ -980,7 +959,7 @@ LUA;
             throw $e;
         }
 
-        return $pending ?: [];
+        return Narrow::pending($pending);
     }
 
     /**
@@ -992,7 +971,7 @@ LUA;
     {
         $pending = $this->fetchPendingEntries($streamKey, $count);
 
-        return array_flip(array_map(fn (array $row) => (string) $row[0], $pending));
+        return array_flip(array_column($pending, 'id'));
     }
 
     /**
@@ -1004,29 +983,22 @@ LUA;
     {
         $delayedKey = $this->getStreamKey($queue).':delayed';
 
-        /** @var list<string>|null $payloads */
-        $payloads = $this->redis->execute('ZRANGE', $delayedKey, '0', '-1') ?: [];
+        $payloads = array_map(Narrow::string(...), Narrow::list($this->redis->execute('ZRANGE', $delayedKey, '0', '-1')));
 
         return (new Collection($payloads))
             ->map(fn (string $payload) => InspectedJob::fromPayload($payload));
     }
 
     /**
-     * Extract the `payload` field value from a stream entry's flat field list.
+     * Extract the `payload` field value from a stream entry's fields.
      *
      * Returns null when the field is missing (corrupt or non-torque entry).
      *
-     * @param  array<int, mixed>  $fields  Flat list: ['payload', '{json}', ...]
+     * @param  array<string, mixed>  $fields  As read by {@see Narrow::entries()}.
      */
     private static function extractPayload(array $fields): ?string
     {
-        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-            if ((string) $fields[$i] === 'payload') {
-                return (string) $fields[$i + 1];
-            }
-        }
-
-        return null;
+        return array_key_exists('payload', $fields) ? Narrow::string($fields['payload']) : null;
     }
 
     // -------------------------------------------------------------------------
@@ -1068,14 +1040,14 @@ LUA;
     {
         $streamKey = $this->getStreamKey($queue);
 
-        $count = (int) $this->redis->execute(
+        $count = Narrow::int($this->redis->execute(
             'EVAL',
             self::LUA_COUNT_REDELIVERY,
             '1',
             $streamKey.self::REDELIVERIES_SUFFIX,
             $messageId,
             (string) self::REDELIVERIES_TTL,
-        );
+        ));
 
         $this->countedRedeliveries[$streamKey.'|'.$messageId] = true;
 
@@ -1093,7 +1065,7 @@ LUA;
         $returned = 0;
 
         foreach (array_chunk($ids, self::RETURN_UNSTARTED_BATCH) as $batch) {
-            $returned += (int) $this->redis->execute(
+            $returned += Narrow::int($this->redis->execute(
                 'EVAL',
                 self::LUA_RETURN_UNSTARTED,
                 '2',
@@ -1102,7 +1074,7 @@ LUA;
                 $this->consumerGroup,
                 $consumer,
                 ...$batch,
-            );
+            ));
         }
 
         return $returned;
@@ -1157,13 +1129,13 @@ LUA;
         }
 
         $config = $container->make('config');
-        $streams = (array) $config->get('torque.streams', []);
+        $stream = Narrow::map(Narrow::map($config->get('torque.streams'))[$queue] ?? null);
 
-        $limit = $streams[$queue]['release_limit_seconds']
+        $limit = $stream['release_limit_seconds']
             ?? $config->get('torque.release_limit_seconds')
             ?? self::DEFAULT_RELEASE_LIMIT_SECONDS;
 
-        return max(0, (int) $limit);
+        return max(0, Narrow::int($limit));
     }
 
     private function requeue(string $queue, StreamJob $job, int $delay, int $releases, ?int $deadline): void
@@ -1172,7 +1144,7 @@ LUA;
 
         // Rebuild payload with incremented attempts.
         $payload = self::decodePayload($job->getRawBody(), $this->serializer);
-        $payload['attempts'] = ($payload['attempts'] ?? 0) + 1;
+        $payload['attempts'] = Narrow::int($payload['attempts'] ?? null) + 1;
         unset($payload['torque_releases'], $payload['torque_release_deadline']);
 
         if ($releases > 0) {
@@ -1243,7 +1215,7 @@ LUA;
      */
     public function getQueue(\UnitEnum|string|null $queue = null): string
     {
-        return (string) (enum_value($queue) ?: $this->default);
+        return Narrow::string(enum_value($queue) ?: $this->default);
     }
 
     /**

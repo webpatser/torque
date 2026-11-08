@@ -51,6 +51,23 @@ it('falls back to message ID when UUID is missing', function () {
     expect($job->getJobId())->toBe('1680000000000-0');
 });
 
+it('keeps the backoff in the shape the stock worker explodes', function (mixed $backoff, int|string|null $expected) {
+    $payload = ['uuid' => 'abc', 'attempts' => 0, 'delay' => 30];
+
+    if ($backoff !== 'missing') {
+        $payload['backoff'] = $backoff;
+    }
+
+    $job = makeJob($this->container, $this->streamQueue, payload: json_encode($payload));
+
+    expect($job->backoff())->toBe($expected);
+})->with([
+    'array' => [[1, 5, 10], '1,5,10'],
+    'comma string' => ['1,5,10', '1,5,10'],
+    'int' => [5, 5],
+    'missing' => ['missing', null],
+]);
+
 it('returns raw body', function () {
     $payload = json_encode(['uuid' => 'abc', 'attempts' => 0]);
     $job = makeJob($this->container, $this->streamQueue, payload: $payload);

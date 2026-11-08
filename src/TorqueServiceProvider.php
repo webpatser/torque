@@ -38,6 +38,7 @@ use Webpatser\Torque\Queue\StreamConnector;
 use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 use Webpatser\Torque\Support\LegacyConfig;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Registers the Torque queue driver and artisan commands with Laravel.
@@ -53,57 +54,61 @@ final class TorqueServiceProvider extends ServiceProvider
 
         LegacyConfig::migrate($this->app->make('config'));
 
-        $this->app->singleton(MetricsPublisher::class, function ($app) {
-            $config = $app['config']['torque'];
+        $this->app->singleton(MetricsPublisher::class, function (): MetricsPublisher {
+            $config = self::torqueConfig();
+            $redis = Narrow::map($config['redis'] ?? null);
 
             return new MetricsPublisher(
-                redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                prefix: $config['redis']['prefix'] ?? 'torque:',
-                settings: $config['metrics'] ?? [],
+                redisUri: Narrow::string($redis['uri'] ?? null, 'redis://127.0.0.1:6379'),
+                prefix: Narrow::string($redis['prefix'] ?? null, 'torque:'),
+                settings: Narrow::map($config['metrics'] ?? null),
             );
         });
 
-        $this->app->singleton(JobStreamRecorder::class, function ($app) {
-            $config = $app['config']['torque'];
-            $jobStreams = $config['job_events'] ?? [];
+        $this->app->singleton(JobStreamRecorder::class, function (): JobStreamRecorder {
+            $config = self::torqueConfig();
+            $redis = Narrow::map($config['redis'] ?? null);
+            $jobStreams = Narrow::map($config['job_events'] ?? null);
 
             return new JobStreamRecorder(
-                redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                prefix: $config['redis']['prefix'] ?? 'torque:',
-                ttl: (int) ($jobStreams['ttl'] ?? 300),
-                maxEvents: (int) ($jobStreams['max_events'] ?? 1000),
-                enabled: (bool) ($jobStreams['enabled'] ?? true),
+                redisUri: Narrow::string($redis['uri'] ?? null, 'redis://127.0.0.1:6379'),
+                prefix: Narrow::string($redis['prefix'] ?? null, 'torque:'),
+                ttl: Narrow::int($jobStreams['ttl'] ?? null, 300),
+                maxEvents: Narrow::int($jobStreams['max_events'] ?? null, 1000),
+                enabled: Narrow::bool($jobStreams['enabled'] ?? null, true),
             );
         });
 
-        $this->app->singleton(JobStream::class, function ($app) {
-            $config = $app['config']['torque'];
+        $this->app->singleton(JobStream::class, function (): JobStream {
+            $redis = Narrow::map(self::torqueConfig()['redis'] ?? null);
 
             return new JobStream(
-                redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                prefix: $config['redis']['prefix'] ?? 'torque:',
+                redisUri: Narrow::string($redis['uri'] ?? null, 'redis://127.0.0.1:6379'),
+                prefix: Narrow::string($redis['prefix'] ?? null, 'torque:'),
             );
         });
 
-        $this->app->singleton(DeadLetterHandler::class, function ($app) {
-            $config = $app['config']['torque'];
+        $this->app->singleton(DeadLetterHandler::class, function (): DeadLetterHandler {
+            $config = self::torqueConfig();
+            $redis = Narrow::map($config['redis'] ?? null);
+            $deadLetter = Narrow::map($config['dead_letter'] ?? null);
 
             return new DeadLetterHandler(
-                redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                ttl: $config['dead_letter']['ttl'] ?? 604800,
-                prefix: $config['redis']['prefix'] ?? 'torque:',
+                redisUri: Narrow::string($redis['uri'] ?? null, 'redis://127.0.0.1:6379'),
+                ttl: Narrow::int($deadLetter['ttl'] ?? null, 604800),
+                prefix: Narrow::string($redis['prefix'] ?? null, 'torque:'),
                 // Numeric stream names come back from array_keys() as ints;
                 // the retry whitelist compares strictly against strings.
-                allowedQueues: array_map(strval(...), array_keys($config['streams'] ?? [])),
-                maxEntries: (int) ($config['dead_letter']['max_entries'] ?? 100000),
-                cluster: (bool) ($config['redis']['cluster'] ?? false),
+                allowedQueues: array_map(strval(...), array_keys(Narrow::map($config['streams'] ?? null))),
+                maxEntries: Narrow::int($deadLetter['max_entries'] ?? null, 100000),
+                cluster: Narrow::bool($redis['cluster'] ?? null),
             );
         });
 
-        $this->app->singleton(CircuitBreaker::class, function ($app) {
+        $this->app->singleton(CircuitBreaker::class, function (): CircuitBreaker {
             // The dispatcher is resolved lazily inside the breaker so a test's
             // Event::fake() (or any later swap) is honored.
-            return CircuitBreaker::fromConfig($app['config']['torque']);
+            return CircuitBreaker::fromConfig(self::torqueConfig());
         });
 
         Torque::registerDevCommands();
@@ -128,7 +133,7 @@ final class TorqueServiceProvider extends ServiceProvider
             __DIR__.'/Dashboard/resources/views' => resource_path('views/vendor/torque'),
         ], 'torque-views');
 
-        if (config('torque.dashboard.enabled', false)) {
+        if (Narrow::bool(config('torque.dashboard.enabled', false))) {
             $this->registerDefaultGate();
 
             TorqueDashboardController::register();
@@ -155,7 +160,7 @@ final class TorqueServiceProvider extends ServiceProvider
 
         Event::listen(QueuesResumed::class, static function (): void {
             app(CircuitBreaker::class)->forceCloseAll(
-                array_keys((array) config('torque.streams', [])),
+                array_keys(Narrow::map(config('torque.streams', []))),
             );
         });
 
@@ -177,6 +182,16 @@ final class TorqueServiceProvider extends ServiceProvider
                 TorqueBenchCommand::class,
             ]);
         }
+    }
+
+    /**
+     * The `torque` config block.
+     *
+     * @return array<string, mixed>
+     */
+    private static function torqueConfig(): array
+    {
+        return Narrow::map(config('torque'));
     }
 
     /**

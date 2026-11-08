@@ -13,6 +13,7 @@ use InvalidArgumentException;
 use Throwable;
 use Webpatser\Torque\Events\LongWaitDetected;
 use Webpatser\Torque\Notifications\LongWaitNotification;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Torque;
 
 /**
@@ -70,7 +71,7 @@ final class TorqueLongWaitAlertCommand extends Command
 
         // From the start of this process, as booting the app counts against the limit
         // too: the master's kill and the alarm it set before exec do not wait for it.
-        $deadline = (float) ($_SERVER['REQUEST_TIME_FLOAT'] ?? microtime(true)) + max(1, (int) $this->option('limit'));
+        $deadline = Narrow::float($_SERVER['REQUEST_TIME_FLOAT'] ?? microtime(true)) + max(1, (int) $this->option('limit'));
         $stepsLeft = count($steps);
         $succeeded = true;
 

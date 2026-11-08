@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Dashboard\Data;
 
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
 use Webpatser\Torque\Stream\JobStream;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
@@ -62,7 +63,8 @@ final class JobsData
     private static function tagsOf(array $job): array
     {
         foreach (['last_event', 'first_event'] as $which) {
-            $raw = $job[$which]['data']['tags'] ?? null;
+            $data = Narrow::map(Narrow::map($job[$which] ?? null)['data'] ?? null);
+            $raw = $data['tags'] ?? null;
 
             if (is_string($raw) && is_array($tags = json_decode($raw, true))) {
                 return array_values(array_filter($tags, 'is_string'));
@@ -81,6 +83,7 @@ final class JobsData
     {
         // Event data carries exception messages and traces, which can hold
         // credentials; redact before anything reaches a view.
+        /** @var list<array{id: string, type: string, data: array<string, string>}> $events The sanitizer redacts values and keeps the event shape. */
         $events = array_values(PayloadSanitizer::sanitizeEvents($this->jobStream->events($uuid)));
 
         if ($events === []) {

@@ -9,6 +9,7 @@ use Fledge\Async\Redis\RedisException;
 use Illuminate\Support\Str;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -102,10 +103,10 @@ final class BenchRunner
         try {
             return app(StreamQueue::class)->getRedisClient();
         } catch (\Throwable) {
-            $uri = (string) config(
+            $uri = Narrow::string(config(
                 'queue.connections.torque.redis_uri',
                 config('torque.redis.uri', 'redis://127.0.0.1:6379'),
-            );
+            ));
 
             return createRedisClient($uri);
         }
@@ -242,18 +243,15 @@ final class BenchRunner
                 continue;
             }
 
-            $streamData = $response[0] ?? null;
-            if ($streamData === null) {
+            $streamData = Narrow::streams($response);
+            if ($streamData === []) {
                 continue;
             }
 
-            $messages = $streamData[1] ?? [];
+            foreach (reset($streamData) as $message) {
+                $messageId = $message['id'];
 
-            foreach ($messages as $message) {
-                $messageId = (string) $message[0];
-                $fields = $message[1] ?? [];
-
-                $sample = $this->parseFields($fields);
+                $sample = $this->parseFields($message['fields']);
 
                 $observed++;
 
@@ -273,24 +271,19 @@ final class BenchRunner
     /**
      * Parse the flat XADD field list into a sample row.
      *
-     * @param  array<int, mixed>  $fields
+     * @param  array<string, mixed>  $fields
      * @return array{total_ms: float, handle_ns: int, workload: string}|null
      */
     private function parseFields(array $fields): ?array
     {
-        $kv = [];
-        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-            $kv[(string) $fields[$i]] = (string) $fields[$i + 1];
-        }
-
-        if (! isset($kv['total_ms'], $kv['handle_ns'], $kv['workload'])) {
+        if (! isset($fields['total_ms'], $fields['handle_ns'], $fields['workload'])) {
             return null;
         }
 
         return [
-            'total_ms' => (float) $kv['total_ms'],
-            'handle_ns' => (int) $kv['handle_ns'],
-            'workload' => $kv['workload'],
+            'total_ms' => Narrow::float($fields['total_ms']),
+            'handle_ns' => Narrow::int($fields['handle_ns']),
+            'workload' => Narrow::string($fields['workload']),
         ];
     }
 

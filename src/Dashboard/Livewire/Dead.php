@@ -10,6 +10,7 @@ use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\DeadLetterData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Dead-letter screen: search, select, retry and purge permanently failed jobs.
@@ -91,8 +92,8 @@ final class Dead extends Component
                 return true;
             }
 
-            return str_contains(mb_strtolower((string) ($j['name'] ?? '')), $needle)
-                || str_contains(mb_strtolower((string) ($j['exception'] ?? '')), $needle);
+            return str_contains(mb_strtolower(Narrow::string($j['name'] ?? null)), $needle)
+                || str_contains(mb_strtolower(Narrow::string($j['exception'] ?? null)), $needle);
         }));
 
         $pageCount = max(1, (int) ceil(count($list) / self::PER_PAGE));

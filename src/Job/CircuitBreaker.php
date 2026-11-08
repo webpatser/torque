@@ -8,6 +8,7 @@ use Fledge\Async\Redis\RedisClient;
 use Illuminate\Contracts\Events\Dispatcher;
 use Webpatser\Torque\Events\QueueCircuitClosed;
 use Webpatser\Torque\Events\QueueCircuitOpened;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -145,12 +146,14 @@ LUA;
         ?\Closure $logger = null,
         ?RedisClient $client = null,
     ): self {
+        $redis = Narrow::map($config['redis'] ?? null);
+
         return new self(
-            redisUri: (string) ($config['redis']['uri'] ?? 'redis://127.0.0.1:6379'),
-            prefix: (string) ($config['redis']['prefix'] ?? 'torque:'),
-            config: (array) ($config['circuit_breaker'] ?? []),
-            streams: (array) ($config['streams'] ?? []),
-            cluster: (bool) ($config['redis']['cluster'] ?? false),
+            redisUri: Narrow::string($redis['uri'] ?? null, 'redis://127.0.0.1:6379'),
+            prefix: Narrow::string($redis['prefix'] ?? null, 'torque:'),
+            config: Narrow::map($config['circuit_breaker'] ?? null),
+            streams: Narrow::map($config['streams'] ?? null),
+            cluster: Narrow::bool($redis['cluster'] ?? null),
             events: $events,
             logger: $logger,
             client: $client,
@@ -174,7 +177,7 @@ LUA;
             return null;
         }
 
-        $settings = array_merge(self::DEFAULTS, $global, is_array($override) ? $override : []);
+        $settings = array_merge(self::DEFAULTS, $global, Narrow::map($override));
 
         if (! (bool) $settings['enabled']) {
             return null;
@@ -216,13 +219,13 @@ LUA;
         }
 
         try {
-            $ttl = (int) $this->redis()->execute('TTL', $this->key($queue, 'state'));
+            $ttl = Narrow::int($this->redis()->execute('TTL', $this->key($queue, 'state')));
 
             if ($ttl !== -2) {
                 return ['state' => 'open', 'resumes_at' => $ttl > 0 ? time() + $ttl : null];
             }
 
-            if ((int) $this->redis()->execute('EXISTS', $this->key($queue, 'probes')) === 1) {
+            if (Narrow::int($this->redis()->execute('EXISTS', $this->key($queue, 'probes'))) === 1) {
                 return ['state' => 'half-open', 'resumes_at' => null];
             }
         } catch (\Throwable) {
@@ -252,7 +255,7 @@ LUA;
             }
 
             try {
-                if ((int) $this->redis()->execute('EXISTS', $this->key($queue, 'state')) === 1) {
+                if (Narrow::int($this->redis()->execute('EXISTS', $this->key($queue, 'state'))) === 1) {
                     $open[] = $queue;
                 }
             } catch (\Throwable) {
@@ -272,12 +275,12 @@ LUA;
     public function forceClose(string $queue, string $reason = 'manual'): bool
     {
         try {
-            $removed = (int) $this->redis()->execute(
+            $removed = Narrow::int($this->redis()->execute(
                 'DEL',
                 $this->key($queue, 'state'),
                 $this->key($queue, 'probes'),
                 $this->key($queue, 'window'),
-            );
+            ));
         } catch (\Throwable) {
             return false;
         }
@@ -295,11 +298,16 @@ LUA;
     /**
      * Force every given stream's breaker closed.
      *
-     * @param  list<string>  $queues
+     * Names usually come from array_keys(), which turns a numeric name such as
+     * "2" into an int, so each one is cast back to a string here.
+     *
+     * @param  array<array-key>  $queues
      * @return list<string> The queues that had a breaker to close.
      */
     public function forceCloseAll(array $queues, string $reason = 'manual'): array
     {
+        $queues = array_map(static fn (int|string $queue): string => (string) $queue, array_values($queues));
+
         return array_values(array_filter($queues, fn (string $queue): bool => $this->forceClose($queue, $reason)));
     }
 
@@ -313,7 +321,7 @@ LUA;
     {
         return self::resolveConfig(
             $this->config,
-            $this->streams[$queue]['circuit_breaker'] ?? null,
+            Narrow::map($this->streams[$queue] ?? null)['circuit_breaker'] ?? null,
         );
     }
 
@@ -328,10 +336,9 @@ LUA;
             return;
         }
 
-        $cooldown = max(1, (int) $settings['cooldown']);
+        $cooldown = max(1, Narrow::int($settings['cooldown'] ?? null));
 
         try {
-            /** @var array<int, mixed>|null $result */
             $result = $this->redis()->execute(
                 'EVAL',
                 self::LUA_RECORD,
@@ -340,12 +347,12 @@ LUA;
                 $this->key($queue, 'probes'),
                 $this->key($queue, 'window'),
                 $failure ? '1' : '0',
-                (string) max(1, (int) $settings['window']),
-                (string) max(1, (int) $settings['min_samples']),
-                (string) (float) $settings['threshold'],
+                (string) max(1, Narrow::int($settings['window'] ?? null)),
+                (string) max(1, Narrow::int($settings['min_samples'] ?? null)),
+                (string) Narrow::float($settings['threshold'] ?? null),
                 (string) $cooldown,
-                (string) max(1, (int) $settings['half_open_max']),
-                (string) max(1, (int) $settings['retention']),
+                (string) max(1, Narrow::int($settings['half_open_max'] ?? null)),
+                (string) max(1, Narrow::int($settings['retention'] ?? null)),
                 (string) ($cooldown * 2),
             );
         } catch (\Throwable $e) {
@@ -355,13 +362,15 @@ LUA;
             return;
         }
 
-        if (! is_array($result) || $result === []) {
+        $result = Narrow::list($result);
+
+        if ($result === []) {
             return;
         }
 
-        $verb = (string) $result[0];
-        $failures = (int) ($result[1] ?? 0);
-        $samples = max(1, (int) ($result[2] ?? 0));
+        $verb = Narrow::string($result[0]);
+        $failures = Narrow::int($result[1] ?? null);
+        $samples = max(1, Narrow::int($result[2] ?? null));
 
         if ($verb === 'opened') {
             $ratio = round($failures / $samples, 3);

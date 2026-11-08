@@ -10,6 +10,7 @@ use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisConfig;
 use Fledge\Async\Stream\ConnectContext;
 use Fledge\Async\Stream\DnsSocketConnector;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -77,9 +78,11 @@ final class UpgradeRunner
     #[\NoDiscard]
     public static function fromConfig(array $config, \Closure $logger, ?string $currentVersion = null): self
     {
+        $redisConfig = Narrow::map($config['redis'] ?? null);
+
         return new self(
-            redisUri: (string) ($config['redis']['uri'] ?? 'redis://127.0.0.1:6379'),
-            prefix: (string) ($config['redis']['prefix'] ?? 'torque:'),
+            redisUri: Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379'),
+            prefix: Narrow::string($redisConfig['prefix'] ?? null, 'torque:'),
             logger: $logger,
             currentVersion: $currentVersion,
         );
@@ -271,7 +274,7 @@ final class UpgradeRunner
     {
         $value = $redis->execute('GET', $this->prefix.self::VERSION_KEY_SUFFIX);
 
-        return $value === null ? null : (string) $value;
+        return Narrow::nullableString($value);
     }
 
     private function redis(): RedisClient

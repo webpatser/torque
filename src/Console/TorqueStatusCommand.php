@@ -12,6 +12,7 @@ use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\DrainPause;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Redis\UpgradeRunner;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
@@ -34,11 +35,11 @@ final class TorqueStatusCommand extends Command
 
     public function handle(): int
     {
-        /** @var array<string, mixed> $config */
-        $config = config('torque');
+        $config = Narrow::map(config('torque'));
+        $redisConfig = Narrow::map($config['redis'] ?? null);
 
-        $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-        $prefix = $config['redis']['prefix'] ?? 'torque:';
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
 
         // One client for everything: a short-lived CLI process must not open
         // a connection per collaborator, so queue depths and dead-letter
@@ -93,7 +94,7 @@ final class TorqueStatusCommand extends Command
     {
         try {
             $value = $redis->execute('GET', $prefix.'paused');
-            $ttl = (int) $redis->execute('TTL', $prefix.'paused');
+            $ttl = Narrow::int($redis->execute('TTL', $prefix.'paused'));
         } catch (\Throwable) {
             return;
         }
@@ -102,7 +103,7 @@ final class TorqueStatusCommand extends Command
             return;
         }
 
-        $ownerPid = DrainPause::ownerPid((string) $value);
+        $ownerPid = DrainPause::ownerPid(Narrow::string($value));
 
         if ($ownerPid === null) {
             $reason = 'manual <fg=gray>(torque:pause; run `torque:pause continue` to resume)</>';
@@ -155,10 +156,10 @@ final class TorqueStatusCommand extends Command
                 unset($agg['throughput']);
             }
 
-            if ((int) ($agg['workers'] ?? 0) > 0) {
-                $throughput = isset($agg['throughput']) ? (string) $agg['throughput'] : null;
-                $concurrent = (string) ($agg['concurrent'] ?? 0);
-                $avgLatency = (string) ($agg['avg_latency'] ?? 0);
+            if (Narrow::int($agg['workers'] ?? null) > 0) {
+                $throughput = isset($agg['throughput']) ? Narrow::string($agg['throughput']) : null;
+                $concurrent = Narrow::string($agg['concurrent'] ?? null, '0');
+                $avgLatency = Narrow::string($agg['avg_latency'] ?? null, '0');
             }
         } catch (\Throwable) {
             // Placeholders below.
@@ -184,7 +185,7 @@ final class TorqueStatusCommand extends Command
             $waiting = (string) $waitingCount;
             $delayed = (string) $delayedCount;
             $reserved = (string) $reservedCount;
-            $failed = (string) max(0, (int) $redis->execute('XLEN', $prefix.'dead-letter'));
+            $failed = (string) max(0, Narrow::int($redis->execute('XLEN', $prefix.'dead-letter')));
         } catch (\Throwable) {
             // Placeholders below.
         }
@@ -217,7 +218,7 @@ final class TorqueStatusCommand extends Command
             $stored = null;
         }
 
-        $stored = $stored === null ? null : (string) $stored;
+        $stored = Narrow::nullableString($stored);
 
         $this->components->twoColumnDetail(
             'Data version',
@@ -337,9 +338,10 @@ final class TorqueStatusCommand extends Command
         }
 
         // HGETALL returns a flat list: [field, value, field, value, ...]
+        $result = array_values($result);
         $fields = [];
         for ($i = 0, $count = count($result); $i < $count; $i += 2) {
-            $fields[(string) $result[$i]] = (string) $result[$i + 1];
+            $fields[Narrow::string($result[$i])] = Narrow::string($result[$i + 1] ?? null);
         }
 
         return $fields;

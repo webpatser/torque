@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Job;
 
+use Closure;
 use Illuminate\Contracts\Container\Container;
 use Illuminate\Log\Logger;
 use Illuminate\Log\LogManager;
 use Illuminate\Support\Facades\Facade;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * The framework's log manager for a worker running concurrent jobs in one process.
@@ -69,15 +71,21 @@ final class AttemptLogManager extends LogManager
         $manager->dateFormat = $booted->dateFormat;
 
         foreach ($booted->customCreators as $driver => $creator) {
-            $manager->extend($driver, $creator);
+            if ($creator instanceof Closure) {
+                $manager->extend($driver, $creator);
+            }
         }
 
+        $sharedContext = Narrow::map($booted->sharedContext);
+
         $ambient = AttemptScope::ambient();
-        $ambient->logSharedContext = $booted->sharedContext;
+        $ambient->logSharedContext = $sharedContext;
         $ambient->logContext = [];
 
         foreach ($booted->channels as $name => $channel) {
-            $manager->channels[$name] = AttemptLogger::adopt($channel, $name, $booted->sharedContext);
+            if ($channel instanceof Logger) {
+                $manager->channels[$name] = AttemptLogger::adopt($channel, $name, $sharedContext);
+            }
         }
 
         $container->instance('log', $manager);
@@ -113,7 +121,7 @@ final class AttemptLogManager extends LogManager
             return $channel;
         }
 
-        return $this->channels[$name] = AttemptLogger::adopt($channel, $name, $this->sharedContext);
+        return $this->channels[$name] = AttemptLogger::adopt($channel, $name, Narrow::map($this->sharedContext));
     }
 
     public function &__get(string $name): mixed
@@ -127,6 +135,6 @@ final class AttemptLogManager extends LogManager
 
     public function __set(string $name, mixed $value): void
     {
-        AttemptScope::current()->logSharedContext = $value;
+        AttemptScope::current()->logSharedContext = is_array($value) ? Narrow::map($value) : null;
     }
 }

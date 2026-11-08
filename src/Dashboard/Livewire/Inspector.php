@@ -12,6 +12,7 @@ use Webpatser\Torque\Dashboard\Data\DeadLetterData;
 use Webpatser\Torque\Dashboard\Data\JobsData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 use Webpatser\Torque\Job\DeadLetterHandler;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
@@ -80,9 +81,11 @@ final class Inspector extends Component
         $exceptionEv = collect($events)->reverse()->first(
             fn ($e) => in_array($e['type'], ['exception', 'failed', 'dead_lettered'], true),
         );
-        $exception = $exceptionEv['data']['exception_class'] ?? $failedJob['exception'] ?? null;
-        $exceptionMsg = $exceptionEv['data']['exception_message'] ?? $failedJob['message'] ?? '';
-        $trace = $exceptionEv['data']['trace'] ?? $failedJob['trace'] ?? null;
+        $exceptionData = Narrow::map(Narrow::map($exceptionEv)['data'] ?? null);
+        $failedJobRow = Narrow::map($failedJob);
+        $exception = $exceptionData['exception_class'] ?? $failedJobRow['exception'] ?? null;
+        $exceptionMsg = $exceptionData['exception_message'] ?? $failedJobRow['message'] ?? '';
+        $trace = $exceptionData['trace'] ?? $failedJobRow['trace'] ?? null;
 
         $startedCount = count(array_filter($events, fn ($e) => $e['type'] === 'started'));
         $last = $events[count($events) - 1] ?? null;
@@ -98,7 +101,7 @@ final class Inspector extends Component
             'exceptionMsg' => $exceptionMsg,
             'trace' => $trace,
             'attemptVal' => $attemptVal,
-            'lastWorker' => $last['data']['worker'] ?? null,
+            'lastWorker' => Narrow::map(Narrow::map($last)['data'] ?? null)['worker'] ?? null,
             'canRetry' => $status === 'failed' || $failedJob !== null,
             'retryId' => $failedJob['id'] ?? $this->uuid,
             'deadCount' => $chrome['deadCount'],

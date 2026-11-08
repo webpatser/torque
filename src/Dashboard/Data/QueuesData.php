@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Dashboard\Data;
 use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Torque;
 use Webpatser\Torque\Worker\WorkerProcess;
@@ -43,14 +44,16 @@ final class QueuesData
         $cluster = (bool) config('torque.redis.cluster', false);
         $names = array_values(array_unique(array_map(
             static fn (int|string $name): string => WorkerProcess::bareQueueName((string) $name, $cluster),
-            array_keys((array) config('torque.streams', [])),
+            array_keys(Narrow::map(config('torque.streams', []))),
         )));
 
         // Framework pause state (queue:pause / queue:pause --all); one cache
         // round-trip for all names. A broken cache store must not 500 the
         // dashboard, so degrade to "nothing paused".
         try {
-            $paused = array_flip(app('queue')->getPausedQueues(Torque::CONNECTION, $names));
+            /** @var array<int|string> $pausedNames */
+            $pausedNames = app('queue')->getPausedQueues(Torque::CONNECTION, $names);
+            $paused = array_flip($pausedNames);
         } catch (\Throwable) {
             $paused = [];
         }

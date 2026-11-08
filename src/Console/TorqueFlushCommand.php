@@ -4,9 +4,11 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\StreamQueueResolver;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -38,15 +40,16 @@ final class TorqueFlushCommand extends Command
             return self::FAILURE;
         }
 
-        $config = config('torque');
-        $prefix = $config['redis']['prefix'] ?? 'torque:';
-        $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+        $config = Narrow::map(config('torque'));
+        $redisConfig = Narrow::map($config['redis'] ?? null);
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
 
         // Resolve queue names.
         if ($this->option('queues') !== null) {
-            $queues = array_map('trim', explode(',', $this->option('queues')));
+            $queues = array_map('trim', explode(',', Narrow::string($this->option('queues'))));
         } elseif (isset($config['streams']) && is_array($config['streams'])) {
-            $queues = array_keys($config['streams']);
+            $queues = array_map('strval', array_keys($config['streams']));
         } else {
             $queues = ['default'];
         }
@@ -73,8 +76,8 @@ final class TorqueFlushCommand extends Command
             $delayedKey = $streamKey.':delayed';
 
             // Count before flushing.
-            $streamSize = (int) $redis->execute('XLEN', $streamKey);
-            $delayedSize = (int) $redis->execute('ZCARD', $delayedKey);
+            $streamSize = Narrow::int($redis->execute('XLEN', $streamKey));
+            $delayedSize = Narrow::int($redis->execute('ZCARD', $delayedKey));
 
             // XTRIM MAXLEN 0 removes all unclaimed entries; in-flight (PEL) jobs are unaffected.
             if ($streamSize > 0) {
@@ -110,16 +113,16 @@ final class TorqueFlushCommand extends Command
     /**
      * Delete individual job payload keys using SCAN to avoid blocking Redis.
      */
-    private function deleteJobKeys(mixed $redis, string $prefix): int
+    private function deleteJobKeys(RedisClient $redis, string $prefix): int
     {
         $deleted = 0;
         $cursor = '0';
         $pattern = $prefix.'job:*';
 
         do {
-            $result = $redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '200');
-            $cursor = (string) $result[0];
-            $keys = $result[1] ?? [];
+            $result = Narrow::list($redis->execute('SCAN', $cursor, 'MATCH', $pattern, 'COUNT', '200'));
+            $cursor = Narrow::string($result[0] ?? null);
+            $keys = array_map(Narrow::string(...), Narrow::list($result[1] ?? null));
 
             if ($keys !== []) {
                 $redis->execute('DEL', ...$keys);

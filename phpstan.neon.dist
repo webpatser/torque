@@ -11,4 +11,4 @@ parameters:
     excludePaths:
         - src/Dashboard/resources
 
-    level: 8
+    level: 10

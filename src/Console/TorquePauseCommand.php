@@ -8,6 +8,7 @@ use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Job\CircuitBreaker;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -32,11 +33,11 @@ final class TorquePauseCommand extends Command
 
     public function handle(): int
     {
-        /** @var array<string, mixed> $config */
-        $config = config('torque');
+        $config = Narrow::map(config('torque'));
+        $redisConfig = Narrow::map($config['redis'] ?? null);
 
-        $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-        $prefix = $config['redis']['prefix'] ?? 'torque:';
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
 
         $redis = createRedisClient($redisUri);
 
@@ -96,7 +97,7 @@ final class TorquePauseCommand extends Command
         try {
             $result = $redis->execute('EXISTS', $key);
 
-            return (int) $result === 1;
+            return Narrow::int($result) === 1;
         } catch (RedisException) {
             return false;
         }

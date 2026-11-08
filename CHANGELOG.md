@@ -26,6 +26,7 @@ Supervisor configs now survive Deployer releases, and a low `max_retries` under 
 - `drain_grace_seconds` docs (config and README) are scoped to takeover restarts; `--drain` restarts are unaffected.
 - `strict_attempts` docs note the `max_retries` 1 case.
 - The `--path` help text mentions `--stdout`.
+- PHPStan now runs at level 10 on `src/` (no baseline). Redis replies and other untyped values are narrowed through a new internal `Webpatser\Torque\Support\Narrow` helper that matches PHP's cast semantics, so malformed replies read as empty instead of throwing.
 
 ## [2.0.0] - 2026-11-06
 

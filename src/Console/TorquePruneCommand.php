@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Redis\StreamHousekeeper;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Prune Torque's Redis state, Horizon `horizon:snapshot`/`queue:prune` style.
@@ -51,7 +52,7 @@ final class TorquePruneCommand extends Command
             : ($deep ? 0 : 3600);
 
         $housekeeper = StreamHousekeeper::fromConfig(
-            config('torque'),
+            Narrow::map(config('torque')),
             $deadLetters,
             maxEntries: (int) $this->option('dead-letter-max'),
         );

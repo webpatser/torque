@@ -13,6 +13,7 @@ use Illuminate\Contracts\Container\Container;
 use Illuminate\Support\Facades\Facade;
 use ReflectionFunction;
 use ReflectionProperty;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * The framework's auth manager for a worker running concurrent jobs in one process.
@@ -88,11 +89,13 @@ final class AttemptAuthManager extends AuthManager
         $manager->customProviderCreators = $booted->customProviderCreators;
 
         foreach ($booted->customCreators as $driver => $creator) {
-            $manager->extend($driver, $creator);
+            if ($creator instanceof Closure) {
+                $manager->extend($driver, $creator);
+            }
         }
 
         $ambient = AttemptScope::ambient();
-        $ambient->authGuards = $booted->guards;
+        $ambient->authGuards = Narrow::map($booted->guards);
 
         // The default resolver is a closure over the framework's manager; one the
         // application set is the application's.
@@ -103,7 +106,9 @@ final class AttemptAuthManager extends AuthManager
         }
 
         $container->instance('auth', $manager);
-        $container->bind('auth.driver', static fn ($app) => $app['auth']->guard());
+        $container->bind('auth.driver', static function (Container $app): mixed {
+            return $app->make('auth')->guard();
+        });
 
         Facade::clearResolvedInstance('auth');
 
@@ -120,8 +125,11 @@ final class AttemptAuthManager extends AuthManager
 
         // Built in the ambient scope: a custom creator reading the attempt's
         // Context would otherwise pass it on to every other attempt.
-        $guard = $ambient->authGuards[$name]
-            ?? ($ambient->authGuards[$name] = AttemptScope::within($ambient, fn (): mixed => parent::resolve($name)));
+        $guard = $ambient->authGuards[$name] ?? null;
+
+        if (! $guard instanceof Guard) {
+            $guard = $ambient->authGuards[$name] = AttemptScope::within($ambient, fn (): Guard => parent::resolve($name));
+        }
 
         return AttemptScope::current() === $ambient ? $guard : self::forAttempt($guard);
     }
@@ -167,7 +175,7 @@ final class AttemptAuthManager extends AuthManager
         $scope = AttemptScope::current();
 
         if ($name === 'guards') {
-            $scope->authGuards = $value;
+            $scope->authGuards = Narrow::map($value);
         } else {
             $scope->authUserResolver = $value instanceof Closure ? $value : null;
         }

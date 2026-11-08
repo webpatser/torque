@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 /**
@@ -37,7 +38,7 @@ final class TorqueWorkerCommand extends Command
             }
         });
 
-        $config = config('torque');
+        $config = Narrow::map(config('torque'));
 
         if ($this->option('queues') !== null) {
             $config['queues'] = array_map('trim', explode(',', $this->option('queues')));

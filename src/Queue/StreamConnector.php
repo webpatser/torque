@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Queue;
 
 use Illuminate\Queue\Connectors\ConnectorInterface;
+use Webpatser\Torque\Support\Narrow;
 
 final class StreamConnector implements ConnectorInterface
 {
@@ -27,17 +28,18 @@ final class StreamConnector implements ConnectorInterface
     {
         // Use torque.php config as the single source of truth for prefix
         // and consumer group, so dispatch and workers always agree.
-        $torqueConfig = config('torque', []);
+        $torqueConfig = Narrow::map(config('torque', []));
+        $redisConfig = Narrow::map($torqueConfig['redis'] ?? null);
 
         return new StreamQueue(
-            redisUri: $config['redis_uri'] ?? $torqueConfig['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-            default: $config['queue'] ?? 'default',
-            retryAfter: (int) ($config['retry_after'] ?? 90),
-            blockFor: (int) ($config['block_for'] ?? 2000),
-            prefix: $torqueConfig['redis']['prefix'] ?? $config['prefix'] ?? 'torque:',
-            consumerGroup: $torqueConfig['consumer_group'] ?? $config['consumer_group'] ?? 'torque',
-            cluster: (bool) ($torqueConfig['redis']['cluster'] ?? false),
-            serializer: (string) ($torqueConfig['serializer'] ?? $config['serializer'] ?? 'json'),
+            redisUri: Narrow::string($config['redis_uri'] ?? $redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379'),
+            default: Narrow::string($config['queue'] ?? null, 'default'),
+            retryAfter: Narrow::int($config['retry_after'] ?? null, 90),
+            blockFor: Narrow::int($config['block_for'] ?? null, 2000),
+            prefix: Narrow::string($redisConfig['prefix'] ?? $config['prefix'] ?? null, 'torque:'),
+            consumerGroup: Narrow::string($torqueConfig['consumer_group'] ?? $config['consumer_group'] ?? null, 'torque'),
+            cluster: Narrow::bool($redisConfig['cluster'] ?? null),
+            serializer: Narrow::string($torqueConfig['serializer'] ?? $config['serializer'] ?? null, 'json'),
         );
     }
 }

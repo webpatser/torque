@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Metrics;
 
 use Fledge\Async\Redis\RedisClient;
 use Illuminate\Support\Arr;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -396,18 +397,18 @@ LUA;
             + (1 - self::SMOOTHING_ALPHA) * $this->previousSmoothedThroughput($perMinute5);
 
         $redis->execute('HSET', $key,
-            'throughput', (string) round((float) ($aggregate['throughput'] ?? 0.0), 2),
+            'throughput', (string) round(Narrow::float($aggregate['throughput'] ?? null), 2),
             'throughput_1m', (string) round(self::perMinuteRate($buckets, 1, $now), 2),
             'throughput_5m', (string) round($perMinute5, 2),
             'throughput_smoothed', (string) round($smoothed, 2),
             'jobs_last_hour', (string) array_sum($buckets),
-            'concurrent', (string) (int) ($aggregate['concurrent'] ?? 0),
-            'total_slots', (string) (int) ($aggregate['total_slots'] ?? 0),
-            'avg_latency', (string) round((float) ($aggregate['avg_latency'] ?? 0.0), 2),
-            'jobs_processed', (string) (int) ($aggregate['jobs_processed'] ?? 0),
-            'jobs_failed', (string) (int) ($aggregate['jobs_failed'] ?? 0),
-            'memory_mb', (string) round((float) ($aggregate['memory_mb'] ?? 0.0), 2),
-            'workers', (string) (int) ($aggregate['workers'] ?? 0),
+            'concurrent', (string) Narrow::int($aggregate['concurrent'] ?? null),
+            'total_slots', (string) Narrow::int($aggregate['total_slots'] ?? null),
+            'avg_latency', (string) round(Narrow::float($aggregate['avg_latency'] ?? null), 2),
+            'jobs_processed', (string) Narrow::int($aggregate['jobs_processed'] ?? null),
+            'jobs_failed', (string) Narrow::int($aggregate['jobs_failed'] ?? null),
+            'memory_mb', (string) round(Narrow::float($aggregate['memory_mb'] ?? null), 2),
+            'workers', (string) Narrow::int($aggregate['workers'] ?? null),
             'updated_at', (string) $now,
         );
 
@@ -727,7 +728,7 @@ LUA;
         $count = count($members);
 
         for ($i = 0; $i + 1 < $count; $i += 2) {
-            $hosts[(string) $members[$i]] = (int) $members[$i + 1];
+            $hosts[Narrow::string($members[$i])] = Narrow::int($members[$i + 1]);
         }
 
         ksort($hosts);
@@ -937,7 +938,7 @@ LUA;
             return [];
         }
 
-        $classes = array_map(strval(...), $members);
+        $classes = array_map(Narrow::string(...), Narrow::list($members));
         sort($classes);
 
         return $classes;
@@ -1153,11 +1154,11 @@ LUA;
                 break;
             }
 
-            $cursor = (string) $result[0];
-            $keys = is_array($result[1]) ? $result[1] : [];
+            $cursor = Narrow::string($result[0] ?? null);
+            $keys = Narrow::list($result[1] ?? null);
 
             foreach ($keys as $key) {
-                $redis->execute('DEL', (string) $key);
+                $redis->execute('DEL', Narrow::string($key));
             }
         } while ($cursor !== '0');
     }
@@ -1205,11 +1206,11 @@ LUA;
                 break;
             }
 
-            $cursor = (string) $result[0];
-            $keys = is_array($result[1]) ? $result[1] : [];
+            $cursor = Narrow::string($result[0] ?? null);
+            $keys = Narrow::list($result[1] ?? null);
 
             foreach ($keys as $key) {
-                $key = (string) $key;
+                $key = Narrow::string($key);
                 $data = $redis->execute('HGETALL', $key);
 
                 if (is_array($data) && $data !== []) {
@@ -1343,12 +1344,12 @@ LUA;
         $perJob = [];
 
         foreach ($decoded as $class => $outcome) {
-            $outcome = array_values((array) $outcome);
+            $outcome = Narrow::list($outcome);
             $perJob[(string) $class] = [
-                (int) ($outcome[0] ?? 0),
-                (int) ($outcome[1] ?? 0),
-                (float) ($outcome[2] ?? 0),
-                (float) ($outcome[3] ?? 0),
+                Narrow::int($outcome[0] ?? null),
+                Narrow::int($outcome[1] ?? null),
+                Narrow::float($outcome[2] ?? null),
+                Narrow::float($outcome[3] ?? null),
             ];
         }
 
@@ -1375,8 +1376,8 @@ LUA;
         $perQueue = [];
 
         foreach ($decoded as $queue => $outcome) {
-            $outcome = array_values((array) $outcome);
-            $perQueue[(string) $queue] = [(int) ($outcome[0] ?? 0), (int) ($outcome[1] ?? 0)];
+            $outcome = Narrow::list($outcome);
+            $perQueue[(string) $queue] = [Narrow::int($outcome[0] ?? null), Narrow::int($outcome[1] ?? null)];
         }
 
         return $perQueue;
@@ -1429,7 +1430,7 @@ LUA;
             // Gauge fields are "{epoch}:{metric}", counter fields are bare
             // epochs; an int cast reads the leading epoch out of both.
             $stale = array_values(array_filter(
-                array_map(strval(...), $fields),
+                array_map(Narrow::string(...), $fields),
                 static fn (string $field): bool => (int) $field < $oldestKept,
             ));
 
@@ -1510,9 +1511,9 @@ LUA;
         }
 
         foreach ($members as $member) {
-            $class = (string) $member;
+            $class = Narrow::string($member);
 
-            if ((int) $redis->execute('EXISTS', $this->jobKey(self::TIER_DAY, $class)) === 0) {
+            if (Narrow::int($redis->execute('EXISTS', $this->jobKey(self::TIER_DAY, $class))) === 0) {
                 $redis->execute('SREM', $indexKey, $class);
             }
         }
@@ -1576,7 +1577,7 @@ LUA;
             $value = $values[$i] ?? null;
 
             if ($value !== null && $value !== false) {
-                $result[$field] = (string) $value;
+                $result[$field] = Narrow::string($value);
             }
         }
 
@@ -1717,8 +1718,8 @@ LUA;
     private function tierRetentionSeconds(string $tier): int
     {
         return match ($tier) {
-            self::TIER_HOUR => max(0, (int) $this->setting('rollups.hourly_days', 90)) * 86400,
-            self::TIER_DAY => max(0, (int) $this->setting('rollups.daily_days', 730)) * 86400,
+            self::TIER_HOUR => max(0, Narrow::int($this->setting('rollups.hourly_days', 90))) * 86400,
+            self::TIER_DAY => max(0, Narrow::int($this->setting('rollups.daily_days', 730))) * 86400,
             default => $this->retentionSeconds(),
         };
     }
@@ -1730,7 +1731,7 @@ LUA;
      */
     private function retentionSeconds(): int
     {
-        return max(self::BUCKET_SECONDS, (int) $this->setting('retention', 86400));
+        return max(self::BUCKET_SECONDS, Narrow::int($this->setting('retention', 86400)));
     }
 
     /**
@@ -1777,7 +1778,7 @@ LUA;
         $assoc = [];
 
         for ($i = 0, $count = count($pairs); $i < $count; $i += 2) {
-            $assoc[(string) $pairs[$i]] = (string) $pairs[$i + 1];
+            $assoc[Narrow::string($pairs[$i])] = Narrow::string($pairs[$i + 1]);
         }
 
         return $assoc;

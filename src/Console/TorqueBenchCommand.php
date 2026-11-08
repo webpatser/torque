@@ -9,6 +9,7 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Str;
 use Webpatser\Torque\Console\Bench\BenchRunner;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Drive a closed-loop benchmark against a running Torque master.
@@ -195,9 +196,9 @@ final class TorqueBenchCommand extends Command
         /** @var array<string, mixed> $results */
         $results = $envelope['results'] ?? [];
 
-        $count = (int) ($results['count'] ?? 0);
+        $count = Narrow::int($results['count'] ?? null);
         $wall = $results['wall_seconds'] ?? null;
-        $throughput = (float) ($results['throughput_per_sec'] ?? 0.0);
+        $throughput = Narrow::float($results['throughput_per_sec'] ?? null);
 
         /** @var array<string, mixed> $latency */
         $latency = $results['latency_ms'] ?? [];
@@ -209,7 +210,7 @@ final class TorqueBenchCommand extends Command
         );
         $this->components->twoColumnDetail(
             'Wall time',
-            $wall !== null ? number_format((float) $wall, 3).' s' : '<fg=gray>--</>',
+            $wall !== null ? number_format(Narrow::float($wall), 3).' s' : '<fg=gray>--</>',
         );
         $this->components->twoColumnDetail(
             'Memory peak (bench process)',
@@ -233,7 +234,7 @@ final class TorqueBenchCommand extends Command
         $this->components->twoColumnDetail(
             'handle (median)',
             isset($results['handle_ns_median'])
-                ? number_format((int) $results['handle_ns_median']).' ns'
+                ? number_format(Narrow::int($results['handle_ns_median'])).' ns'
                 : '<fg=gray>--</>',
         );
         $this->components->twoColumnDetail('xack', '<fg=gray>v1.1 follow-up</>');
@@ -246,7 +247,7 @@ final class TorqueBenchCommand extends Command
             return '<fg=gray>--</>';
         }
 
-        return number_format((float) $value, 2).' ms';
+        return number_format(Narrow::float($value), 2).' ms';
     }
 
     private function humanBytes(int $bytes): string

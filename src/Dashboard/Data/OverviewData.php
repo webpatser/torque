@@ -9,6 +9,7 @@ use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Stream\JobStream;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\StreamQueueResolver;
 
 /**
@@ -96,23 +97,23 @@ final class OverviewData
         // Without a master there is no smoothed value, so derive the plain
         // 5-minute average from the same buckets.
         $perMinute = isset($agg['throughput_smoothed'])
-            ? (float) $agg['throughput_smoothed']
+            ? Narrow::float($agg['throughput_smoothed'])
             : MetricsPublisher::perMinuteRate($buckets, 5);
         $perMinute1 = isset($agg['throughput_1m'])
-            ? (float) $agg['throughput_1m']
+            ? Narrow::float($agg['throughput_1m'])
             : MetricsPublisher::perMinuteRate($buckets, 1);
 
-        $throughput = (float) ($agg['throughput'] ?? 0);
-        $concurrent = (int) ($agg['concurrent'] ?? 0);
-        $totalSlots = (int) ($agg['total_slots'] ?? 0);
-        $processed = (int) ($agg['jobs_processed'] ?? 0);
-        $failed = (int) ($agg['jobs_failed'] ?? 0);
+        $throughput = Narrow::float($agg['throughput'] ?? null);
+        $concurrent = Narrow::int($agg['concurrent'] ?? null);
+        $totalSlots = Narrow::int($agg['total_slots'] ?? null);
+        $processed = Narrow::int($agg['jobs_processed'] ?? null);
+        $failed = Narrow::int($agg['jobs_failed'] ?? null);
 
         $pending = 0;
         $delayed = 0;
         $queue = StreamQueueResolver::make();
 
-        foreach (array_keys((array) config('torque.streams', [])) as $name) {
+        foreach (array_keys(Narrow::map(config('torque.streams', []))) as $name) {
             $depths = $queue->depths((string) $name);
             $pending += $depths['waiting'];
             $delayed += $depths['delayed'];
@@ -138,11 +139,11 @@ final class OverviewData
                 'throughputPerMinute' => round($perMinute1, 2),
                 'jobsLastHour' => $jobsLastHour,
                 'concurrent' => $concurrent,
-                'latencyMs' => (float) ($agg['avg_latency'] ?? 0),
-                'memoryMb' => (float) ($agg['memory_mb'] ?? 0),
+                'latencyMs' => Narrow::float($agg['avg_latency'] ?? null),
+                'memoryMb' => Narrow::float($agg['memory_mb'] ?? null),
                 'failRate' => $processed > 0 ? round($failed / $processed * 100, 2) : 0,
                 'jobsTotal' => $processed,
-                'workers' => (int) ($agg['workers'] ?? 0),
+                'workers' => Narrow::int($agg['workers'] ?? null),
             ],
             'history' => $history,
             'series' => $series,
@@ -171,7 +172,7 @@ final class OverviewData
         $configured = config('torque.dashboard.gauge_max');
 
         if ($configured !== null) {
-            return max(1, (int) $configured);
+            return max(1, Narrow::int($configured));
         }
 
         $peak = max($current, $buckets === [] ? 0 : max($buckets));

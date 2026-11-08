@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Illuminate\Console\Command;
 use Symfony\Component\Console\Output\OutputInterface;
 use Webpatser\Torque\Support\DrainSettings;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Generate a Supervisor configuration file for running Torque in production.
@@ -75,7 +76,7 @@ final class TorqueSupervisorCommand extends Command
         }
 
         $user = preg_replace('/[^a-zA-Z0-9_\-]/', '', $this->option('user') ?? 'www-data');
-        $workers = (int) ($this->option('workers') ?? config('torque.workers', 4));
+        $workers = Narrow::int($this->option('workers') ?? config('torque.workers', 4));
 
         // Deployer shares storage/ across releases, so the log path under the
         // stable root stays valid after the next deploy. A storage path that
@@ -92,7 +93,7 @@ final class TorqueSupervisorCommand extends Command
         // 60 was shorter than the drain on any installation that raised
         // drain_grace_seconds, so it scales with the worst case and keeps 60
         // as the floor.
-        $stopWaitSecs = max(60, DrainSettings::drainWorstCaseSeconds((array) config('torque')));
+        $stopWaitSecs = max(60, DrainSettings::drainWorstCaseSeconds(Narrow::map(config('torque'))));
 
         // --replace makes the supervised start converge: a live master that
         // is not supervised (stray takeover master, manual start) is absorbed

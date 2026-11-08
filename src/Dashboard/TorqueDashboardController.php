@@ -16,6 +16,7 @@ use Webpatser\Torque\Dashboard\Livewire\Jobs;
 use Webpatser\Torque\Dashboard\Livewire\Overview;
 use Webpatser\Torque\Dashboard\Livewire\Queues;
 use Webpatser\Torque\Dashboard\Livewire\Workers;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\TorqueServiceProvider;
 
 /**
@@ -62,8 +63,10 @@ final class TorqueDashboardController
      */
     private static function registerRoutes(): void
     {
-        Route::prefix(config('torque.dashboard.path', 'torque'))
-            ->middleware(config('torque.dashboard.middleware', ['web', 'auth']))
+        $middleware = config('torque.dashboard.middleware', ['web', 'auth']);
+
+        Route::prefix(Narrow::string(config('torque.dashboard.path', 'torque'), 'torque'))
+            ->middleware(is_string($middleware) ? $middleware : array_values(array_filter(Narrow::list($middleware), is_string(...))))
             ->group(static function (): void {
                 Route::middleware([Authorize::class, DetectCspMismatch::class])->group(static function (): void {
                     Route::get('/', Overview::class)->name('torque.overview');

@@ -76,7 +76,7 @@ final class LegacyConfig
         }
 
         $moves = implode(', ', array_map(
-            static fn (string $old, string $new): string => "{$old} -> {$new}",
+            static fn (int|string $old, mixed $new): string => "{$old} -> ".Narrow::string($new),
             array_keys($recorded),
             $recorded,
         ));

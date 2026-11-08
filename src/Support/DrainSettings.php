@@ -80,7 +80,7 @@ final class DrainSettings
      */
     public static function reloadPauseSeconds(array $config): int
     {
-        return max(0, (int) ($config['reload_pause_seconds'] ?? self::DEFAULT_RELOAD_PAUSE_SECONDS));
+        return max(0, Narrow::int($config['reload_pause_seconds'] ?? null, self::DEFAULT_RELOAD_PAUSE_SECONDS));
     }
 
     /**
@@ -90,7 +90,7 @@ final class DrainSettings
      */
     public static function releaseDelaySeconds(array $config): int
     {
-        return max(0, (int) ($config['timeouts']['release_delay_seconds'] ?? self::DEFAULT_RELEASE_DELAY_SECONDS));
+        return max(0, Narrow::int(Narrow::map($config['timeouts'] ?? null)['release_delay_seconds'] ?? null, self::DEFAULT_RELEASE_DELAY_SECONDS));
     }
 
     /**
@@ -101,7 +101,7 @@ final class DrainSettings
      */
     public static function settleSeconds(array $config): float
     {
-        $settle = max(0.0, (float) ($config['timeouts']['settle_seconds'] ?? self::DEFAULT_SETTLE_SECONDS));
+        $settle = max(0.0, Narrow::float(Narrow::map($config['timeouts'] ?? null)['settle_seconds'] ?? null, (float) self::DEFAULT_SETTLE_SECONDS));
 
         return min($settle, self::graceSeconds($config) / 2);
     }
@@ -124,7 +124,7 @@ final class DrainSettings
      */
     public static function slackSeconds(array $config): int
     {
-        return max(1, (int) ($config['intervals']['drain_slack_seconds'] ?? self::DEFAULT_SLACK_SECONDS));
+        return max(1, Narrow::int(Narrow::map($config['intervals'] ?? null)['drain_slack_seconds'] ?? null, self::DEFAULT_SLACK_SECONDS));
     }
 
     /**
@@ -150,8 +150,8 @@ final class DrainSettings
      */
     private static function streamSeconds(array $stream): int
     {
-        return max(0, (int) ($stream['timeout'] ?? 0))
-            ?: max(0, (int) ($stream['retry_after'] ?? 0))
+        return max(0, Narrow::int($stream['timeout'] ?? null))
+            ?: max(0, Narrow::int($stream['retry_after'] ?? null))
             ?: self::DEFAULT_RETRY_AFTER_SECONDS;
     }
 }

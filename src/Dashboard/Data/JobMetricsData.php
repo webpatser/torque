@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Dashboard\Data;
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
 use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Per-job-class read-model for the jobs screen.
@@ -115,7 +116,7 @@ final class JobMetricsData
 
         usort($jobs, static function (array $a, array $b) use ($field, $ascending): int {
             $comparison = $field === 'class'
-                ? strcasecmp((string) $a[$field], (string) $b[$field])
+                ? strcasecmp(Narrow::string($a[$field]), Narrow::string($b[$field]))
                 : $a[$field] <=> $b[$field];
 
             return $ascending ? $comparison : -$comparison;

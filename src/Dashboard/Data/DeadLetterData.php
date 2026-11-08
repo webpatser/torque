@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Dashboard\Data;
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\PayloadSanitizer;
 
 /**
@@ -74,7 +75,7 @@ final class DeadLetterData
         }
 
         try {
-            return (string) (StreamQueue::decodePayload($payload)['displayName'] ?? '');
+            return Narrow::string(StreamQueue::decodePayload($payload)['displayName'] ?? null);
         } catch (\Throwable) {
             return '';
         }

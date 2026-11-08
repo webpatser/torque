@@ -11,6 +11,7 @@ use Illuminate\Contracts\Encryption\Encrypter;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Queue\Failed\DatabaseUuidFailedJobProvider;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -128,13 +129,13 @@ final class DeadLetterHandler
      */
     public function retry(string $deadLetterId, ?string $targetQueue = null): void
     {
-        $entries = $this->redis->execute('XRANGE', $this->deadLetterStream, $deadLetterId, $deadLetterId);
+        $entries = Narrow::entries($this->redis->execute('XRANGE', $this->deadLetterStream, $deadLetterId, $deadLetterId));
 
-        if (! is_array($entries) || $entries === []) {
+        if ($entries === []) {
             throw new \RuntimeException("Dead-letter entry [{$deadLetterId}] not found.");
         }
 
-        $fields = $this->parseFields($entries[0][1]);
+        $fields = $this->parseFields($entries[0]['fields']);
 
         $queue = $targetQueue ?? $fields['original_queue']
             ?? throw new \RuntimeException("Cannot determine target queue for [{$deadLetterId}].");
@@ -236,9 +237,11 @@ final class DeadLetterHandler
         $payload['attempts'] = 0;
         unset($payload['torque_releases'], $payload['torque_release_deadline']);
 
-        if (isset($payload['data']['command']) && is_string($payload['data']['command'])) {
+        $command = Narrow::map($payload['data'] ?? null)['command'] ?? null;
+
+        if (is_string($command)) {
             try {
-                $instance = $this->commandInstance($payload['data']['command']);
+                $instance = $this->commandInstance($command);
             } catch (ModelNotFoundException) {
                 $instance = null;
             }
@@ -269,7 +272,7 @@ final class DeadLetterHandler
     private function commandInstance(string $command): mixed
     {
         if (! str_starts_with($command, 'O:')) {
-            $command = Container::getInstance()->make(Encrypter::class)->decrypt($command);
+            $command = Narrow::string(Container::getInstance()->make(Encrypter::class)->decrypt($command));
         }
 
         return unserialize($command);
@@ -307,17 +310,17 @@ final class DeadLetterHandler
      */
     public function forget(string $deadLetterId): ?array
     {
-        $entries = $this->redis->execute('XRANGE', $this->deadLetterStream, $deadLetterId, $deadLetterId);
+        $entries = Narrow::entries($this->redis->execute('XRANGE', $this->deadLetterStream, $deadLetterId, $deadLetterId));
 
-        if (! is_array($entries) || $entries === []) {
+        if ($entries === []) {
             return null;
         }
 
-        $fields = $this->parseFields($entries[0][1]);
+        $fields = $this->parseFields($entries[0]['fields']);
 
         $this->redis->execute('XDEL', $this->deadLetterStream, $deadLetterId);
 
-        return ['id' => (string) $entries[0][0], 'uuid' => self::payloadUuid($fields['payload'] ?? '')];
+        return ['id' => $entries[0]['id'], 'uuid' => self::payloadUuid($fields['payload'] ?? '')];
     }
 
     /**
@@ -353,9 +356,9 @@ final class DeadLetterHandler
         $from = '-';
 
         while (true) {
-            $page = $this->redis->execute('XRANGE', $this->deadLetterStream, $from, '+', 'COUNT', '500');
+            $page = Narrow::entries($this->redis->execute('XRANGE', $this->deadLetterStream, $from, '+', 'COUNT', '500'));
 
-            if (! is_array($page) || $page === []) {
+            if ($page === []) {
                 break;
             }
 
@@ -363,7 +366,7 @@ final class DeadLetterHandler
             $uuids = [];
 
             foreach ($page as $entry) {
-                $fields = $this->parseFields($entry[1]);
+                $fields = $this->parseFields($entry['fields']);
 
                 if ($wanted !== null && WorkerProcess::bareQueueName($fields['original_queue'] ?? '', $this->cluster) !== $wanted) {
                     continue;
@@ -371,8 +374,8 @@ final class DeadLetterHandler
 
                 $uuid = self::payloadUuid($fields['payload'] ?? '');
 
-                $ids[] = (string) $entry[0];
-                $removed[] = ['id' => (string) $entry[0], 'uuid' => $uuid];
+                $ids[] = $entry['id'];
+                $removed[] = ['id' => $entry['id'], 'uuid' => $uuid];
 
                 if ($uuid !== null) {
                     $uuids[] = $uuid;
@@ -391,7 +394,7 @@ final class DeadLetterHandler
                 break;
             }
 
-            $from = '('.$page[array_key_last($page)][0];
+            $from = '('.$page[count($page) - 1]['id'];
         }
 
         return $removed;
@@ -449,24 +452,20 @@ final class DeadLetterHandler
     {
         // Stream ids are `{millisecond epoch}-{seq}`, so a time window is just
         // a low id: no scanning, no post-filtering.
-        $entries = $this->redis->execute(
+        $entries = Narrow::entries($this->redis->execute(
             'XREVRANGE',
             $this->deadLetterStream,
             '+',
             self::lowId($sinceMs),
             'COUNT',
             (string) $count,
-        );
-
-        if (! is_array($entries) || $entries === []) {
-            return [];
-        }
+        ));
 
         $result = [];
 
         foreach ($entries as $entry) {
-            $id = (string) $entry[0];
-            $fields = $this->parseFields($entry[1]);
+            $id = $entry['id'];
+            $fields = $this->parseFields($entry['fields']);
 
             $result[] = [
                 'id' => $id,
@@ -495,30 +494,26 @@ final class DeadLetterHandler
     {
         // Fetch one extra so we can exclude the cursor entry itself,
         // then take only $count entries that are strictly older.
-        $entries = $this->redis->execute(
+        $entries = Narrow::entries($this->redis->execute(
             'XREVRANGE',
             $this->deadLetterStream,
             $beforeId,
             self::lowId($sinceMs),
             'COUNT',
             (string) ($count + 1),
-        );
-
-        if (! is_array($entries) || $entries === []) {
-            return [];
-        }
+        ));
 
         $result = [];
 
         foreach ($entries as $entry) {
-            $id = (string) $entry[0];
+            $id = $entry['id'];
 
             // Exclude the cursor entry itself (strict "before").
             if ($id === $beforeId) {
                 continue;
             }
 
-            $fields = $this->parseFields($entry[1]);
+            $fields = $this->parseFields($entry['fields']);
 
             $result[] = [
                 'id' => $id,
@@ -570,21 +565,13 @@ final class DeadLetterHandler
     }
 
     /**
-     * Parse a flat field list from XRANGE into an associative array.
+     * Stringify the fields of a stream entry, as {@see Narrow::entries()} reads them.
      *
-     * Redis returns fields as `[key, value, key, value, ...]`.
-     *
-     * @param  array<int, string>  $fields
+     * @param  array<string, mixed>  $fields
      * @return array<string, string>
      */
     private function parseFields(array $fields): array
     {
-        $parsed = [];
-
-        for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-            $parsed[(string) $fields[$i]] = (string) $fields[$i + 1];
-        }
-
-        return $parsed;
+        return array_map(Narrow::string(...), $fields);
     }
 }

@@ -10,6 +10,7 @@ use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\OverviewData;
 use Webpatser\Torque\Dashboard\Data\WorkersData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Cluster overview screen: throughput gauge, headline stats, live activity.
@@ -42,7 +43,7 @@ final class Overview extends Component
             'series' => $data['series'],
             'minuteHistory' => $data['minuteHistory'],
             'window' => $window,
-            'live' => array_slice($data['live'], 0, 6),
+            'live' => array_slice(Narrow::list($data['live']), 0, 6),
             'deadCount' => $data['deadCount'],
             'hosts' => rescue(fn (): array => app(WorkersData::class)->get($window->key)['hosts'], [], false),
         ]);

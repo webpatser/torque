@@ -11,6 +11,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -124,7 +125,7 @@ final class BenchJob implements ShouldQueue
             // Fall through.
         }
 
-        $uri = (string) config('queue.connections.torque.redis_uri', config('torque.redis.uri', 'redis://127.0.0.1:6379'));
+        $uri = Narrow::string(config('queue.connections.torque.redis_uri', config('torque.redis.uri', 'redis://127.0.0.1:6379')));
 
         return createRedisClient($uri);
     }

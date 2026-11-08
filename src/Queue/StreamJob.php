@@ -10,6 +10,7 @@ use Illuminate\Contracts\Queue\Job as JobContract;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Jobs\Job;
 use Illuminate\Queue\TimeoutExceededException;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Represents a single job read from a Redis Stream via XREADGROUP.
@@ -63,7 +64,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function getJobId(): string
     {
-        return $this->decoded['uuid'] ?? $this->messageId;
+        return Narrow::string($this->decoded['uuid'] ?? null, $this->messageId);
     }
 
     /**
@@ -100,7 +101,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function attempts(): int
     {
-        return ($this->decoded['attempts'] ?? 0) + 1;
+        return Narrow::int($this->decoded['attempts'] ?? null) + 1;
     }
 
     /**
@@ -121,9 +122,9 @@ class StreamJob extends Job implements JobContract
      */
     public function releases(): int
     {
-        $releases = (int) ($this->decoded['torque_releases'] ?? 0);
+        $releases = Narrow::int($this->decoded['torque_releases'] ?? null);
 
-        return ($this->decoded['attempts'] ?? 0) < $releases ? 0 : $releases;
+        return Narrow::int($this->decoded['attempts'] ?? null) < $releases ? 0 : $releases;
     }
 
     /**
@@ -133,7 +134,7 @@ class StreamJob extends Job implements JobContract
     {
         $deadline = $this->decoded['torque_release_deadline'] ?? null;
 
-        return $deadline === null || $this->releases() === 0 ? null : (int) $deadline;
+        return $deadline === null || $this->releases() === 0 ? null : Narrow::int($deadline);
     }
 
     /**
@@ -243,7 +244,7 @@ class StreamJob extends Job implements JobContract
 
             $this->failed($e);
         } finally {
-            $this->resolve(Dispatcher::class)->dispatch(new JobFailed($this->connectionName, $this, $e));
+            $this->container->make(Dispatcher::class)->dispatch(new JobFailed($this->connectionName, $this, $e));
         }
     }
 
@@ -256,7 +257,8 @@ class StreamJob extends Job implements JobContract
     private function warnAboutOpenTransaction(): void
     {
         try {
-            $connection = $this->container->make('db')->connection($this->container['config']['queue.failed.database']);
+            $database = Narrow::nullableString($this->container->make('config')->get('queue.failed.database'));
+            $connection = $this->container->make('db')->connection($database);
 
             if ($connection->transactionLevel() > 0) {
                 fwrite(STDERR, "[torque:worker] WARN job {$this->messageId} timed out while connection {$connection->getName()} still has a transaction open; its failed_jobs row and batch counts are lost unless that transaction commits. Its dead-letter entry survives.\n");
@@ -364,9 +366,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function maxExceptions(): ?int
     {
-        $max = $this->decoded['maxExceptions'] ?? null;
-
-        return $max === null ? null : (int) $max;
+        return Narrow::nullableInt($this->decoded['maxExceptions'] ?? null);
     }
 
     /**
@@ -375,9 +375,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function maxTries(): ?int
     {
-        $max = $this->decoded['maxTries'] ?? null;
-
-        return $max === null ? null : (int) $max;
+        return Narrow::nullableInt($this->decoded['maxTries'] ?? null);
     }
 
     /**
@@ -387,12 +385,24 @@ class StreamJob extends Job implements JobContract
      * payload's `delay`: a job dispatched with a delay has declared no backoff,
      * and its retries must not wait that delay again.
      *
-     * @return int|int[]|string|null
+     * The shape stays what Laravel's stock worker expects, since it runs
+     * `explode(',', $job->backoff())` on it: Laravel writes "1,5,10" for
+     * [1, 5, 10], an int stays an int, and an array is joined the same way.
      */
     #[\Override]
-    public function backoff(): mixed
+    public function backoff(): int|string|null
     {
-        return $this->decoded['backoff'] ?? null;
+        $backoff = $this->decoded['backoff'] ?? null;
+
+        if (is_int($backoff)) {
+            return $backoff;
+        }
+
+        if (is_array($backoff)) {
+            return implode(',', array_map(static fn (mixed $seconds): string => Narrow::string($seconds), $backoff));
+        }
+
+        return Narrow::nullableString($backoff);
     }
 
     /**
@@ -401,9 +411,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function retryUntil(): ?int
     {
-        $until = $this->decoded['retryUntil'] ?? null;
-
-        return $until === null ? null : (int) $until;
+        return Narrow::nullableInt($this->decoded['retryUntil'] ?? null);
     }
 
     /**
@@ -412,9 +420,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function timeout(): ?int
     {
-        $timeout = $this->decoded['timeout'] ?? null;
-
-        return $timeout === null ? null : (int) $timeout;
+        return Narrow::nullableInt($this->decoded['timeout'] ?? null);
     }
 
     /**
@@ -423,7 +429,7 @@ class StreamJob extends Job implements JobContract
     #[\Override]
     public function shouldFailOnTimeout(): bool
     {
-        return (bool) ($this->decoded['failOnTimeout'] ?? false);
+        return Narrow::bool($this->decoded['failOnTimeout'] ?? null);
     }
 
     /**
@@ -432,6 +438,6 @@ class StreamJob extends Job implements JobContract
      */
     public function countsCrashesAsExceptions(): bool
     {
-        return (bool) ($this->decoded['countCrashesAsExceptions'] ?? false);
+        return Narrow::bool($this->decoded['countCrashesAsExceptions'] ?? null);
     }
 }

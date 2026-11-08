@@ -9,6 +9,7 @@ use Livewire\Attributes\Layout;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\QueuesData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Queues screen: per-stream depth over the configured Redis Streams.
@@ -30,8 +31,8 @@ final class Queues extends Component
         $totals = [
             'pending' => array_sum(array_column($queues, 'pending')),
             'delayed' => array_sum(array_column($queues, 'delayed')),
-            'processed' => array_sum(array_map(fn ($q) => (int) ($q['processed'] ?? 0), $queues)),
-            'failed' => array_sum(array_map(fn ($q) => (int) ($q['failed'] ?? 0), $queues)),
+            'processed' => array_sum(array_map(fn ($q) => Narrow::int($q['processed'] ?? null), $queues)),
+            'failed' => array_sum(array_map(fn ($q) => Narrow::int($q['failed'] ?? null), $queues)),
         ];
 
         return view('torque::dashboard.queues', [
@@ -43,7 +44,7 @@ final class Queues extends Component
             'hasWait' => collect($queues)->contains(fn ($q) => $q['wait'] !== null),
             // Unlike the others this is a "> 0" test: a permanently visible
             // column of zeros would be noise on a healthy cluster.
-            'hasFailed' => collect($queues)->contains(fn ($q) => (int) ($q['failed'] ?? 0) > 0),
+            'hasFailed' => collect($queues)->contains(fn ($q) => Narrow::int($q['failed'] ?? null) > 0),
             'deadCount' => $this->chrome()['deadCount'],
             'workerCount' => $this->chrome()['workerCount'],
         ]);

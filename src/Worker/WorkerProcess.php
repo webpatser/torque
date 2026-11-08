@@ -60,6 +60,7 @@ use Webpatser\Torque\Queue\StreamJob;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Support\DrainSettings;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Torque;
 
 use function Fledge\Async\async;
@@ -343,24 +344,30 @@ LUA;
 
         $this->isRunning = true;
 
-        $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-        $prefix = $this->config['redis']['prefix'] ?? 'torque:';
-        $consumerGroup = $this->config['consumer_group'] ?? 'torque';
-        $concurrency = (int) ($this->config['slots_per_worker'] ?? 50);
-        $pollInterval = ((int) ($this->config['poll_interval_ms'] ?? 2000)) / 1000.0;
-        $maxJobs = (int) ($this->config['max_jobs_per_worker'] ?? 10_000);
+        $redisConfig = Narrow::map($this->config['redis'] ?? null);
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
+        $consumerGroup = Narrow::string($this->config['consumer_group'] ?? null, 'torque');
+        $concurrency = Narrow::int($this->config['slots_per_worker'] ?? null, 50);
+        $pollInterval = Narrow::int($this->config['poll_interval_ms'] ?? null, 2000) / 1000.0;
+        $maxJobs = Narrow::int($this->config['max_jobs_per_worker'] ?? null, 10_000);
         // Jitter here and nowhere else: $this->maxLifetime and the per-Fiber
         // capture below both read this local, so one call keeps every limit
         // check in this process on the same deadline.
         $maxLifetime = self::jitteredLifetime(
-            (int) ($this->config['max_worker_lifetime'] ?? 3600),
-            (float) ($this->config['max_worker_lifetime_jitter'] ?? 0.1),
+            Narrow::int($this->config['max_worker_lifetime'] ?? null, 3600),
+            Narrow::float($this->config['max_worker_lifetime_jitter'] ?? null, 0.1),
         );
-        $poolSize = (int) ($this->config['pools']['redis']['size'] ?? 30);
-        /** @var list<string> $queues */
-        $queues = (array) ($this->config['queues'] ?? ['default']);
+        $poolSize = Narrow::int(Narrow::map(Narrow::map($this->config['pools'] ?? null)['redis'] ?? null)['size'] ?? null, 30);
+        // As the (array) cast did: one name on its own is a list of one.
+        $configuredQueues = $this->config['queues'] ?? ['default'];
+        $queues = array_map(
+            static fn (mixed $queue): string => Narrow::string($queue),
+            is_array($configuredQueues) ? array_values($configuredQueues) : [$configuredQueues],
+        );
         $connectionName = Torque::CONNECTION;
-        $streams = $this->config['streams'] ?? [];
+        $streams = array_map(Narrow::map(...), Narrow::map($this->config['streams'] ?? null));
+        $metricsConfig = Narrow::map($this->config['metrics'] ?? null);
 
         // Pool for job operations (delete, release, etc.)
         $redisPool = new RedisPool($redisUri, size: $poolSize);
@@ -370,9 +377,9 @@ LUA;
         // We create them lazily inside the Fiber loop instead of sharing one.
 
         $metrics = new MetricsCollector(totalSlots: $concurrency);
-        $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix, settings: $this->config['metrics'] ?? []);
+        $metricsPublisher = new MetricsPublisher(redisUri: $redisUri, prefix: $prefix, settings: $metricsConfig);
 
-        $cluster = (bool) ($this->config['redis']['cluster'] ?? false);
+        $cluster = Narrow::bool($redisConfig['cluster'] ?? null);
 
         // One name per queue from here on, whichever way the config wrote it:
         // the hash tag belongs to the Redis key, which $buildStreamKey adds back.
@@ -385,12 +392,12 @@ LUA;
         $streamQueue = new StreamQueue(
             redisUri: $redisUri,
             default: $queues[0] ?? 'default',
-            retryAfter: (int) ($streams[$queues[0]]['retry_after'] ?? 90),
+            retryAfter: Narrow::int($streams[$queues[0]]['retry_after'] ?? null, 90),
             blockFor: 0,
             prefix: $prefix,
             consumerGroup: $consumerGroup,
             cluster: $cluster,
-            serializer: (string) ($this->config['serializer'] ?? 'json'),
+            serializer: Narrow::string($this->config['serializer'] ?? null, 'json'),
         );
 
         $events = app(Dispatcher::class);
@@ -426,7 +433,7 @@ LUA;
         // in Laravel, not of Job::fail() itself, so without this listener every
         // failure lands in the dead-letter stream but queue:failed and queue:retry
         // stay empty. Guarded so a broken failer write is loud but never fatal.
-        $failerSerializer = (string) ($this->config['serializer'] ?? 'json');
+        $failerSerializer = Narrow::string($this->config['serializer'] ?? null, 'json');
         $events->listen(JobFailed::class, function (JobFailed $event) use ($failerSerializer): void {
             try {
                 app('queue.failer')->log(
@@ -444,12 +451,12 @@ LUA;
             }
         });
 
-        $deadLetterConfig = $this->config['dead_letter'] ?? [];
+        $deadLetterConfig = Narrow::map($this->config['dead_letter'] ?? null);
         $deadLetterHandler = new DeadLetterHandler(
             redisUri: $redisUri,
-            ttl: (int) ($deadLetterConfig['ttl'] ?? 604800),
+            ttl: Narrow::int($deadLetterConfig['ttl'] ?? null, 604800),
             prefix: $prefix,
-            maxEntries: (int) ($deadLetterConfig['max_entries'] ?? 100000),
+            maxEntries: Narrow::int($deadLetterConfig['max_entries'] ?? null, 100000),
         );
 
         // Failure-storm breaker. Shared across the fleet through Redis, so a
@@ -458,7 +465,7 @@ LUA;
         $circuitBreaker = new CircuitBreaker(
             redisUri: $redisUri,
             prefix: $prefix,
-            config: (array) ($this->config['circuit_breaker'] ?? []),
+            config: Narrow::map($this->config['circuit_breaker'] ?? null),
             streams: $streams,
             cluster: $cluster,
             events: $events,
@@ -502,7 +509,7 @@ LUA;
 
         $this->maxJobs = $maxJobs;
         $this->maxLifetime = $maxLifetime;
-        $this->memoryLimit = max(0, (int) ($this->config['memory_limit'] ?? 512));
+        $this->memoryLimit = max(0, Narrow::int($this->config['memory_limit'] ?? null, 512));
         $this->announceMemorySettings();
         $this->announceDrainGrace();
         $this->startTime = time();
@@ -526,7 +533,7 @@ LUA;
             memory: $this->memoryLimit,
             timeout: 60,
             sleep: max(1, (int) ceil($pollInterval)),
-            maxTries: max(1, (int) ($streams[$queues[0] ?? 'default']['max_retries'] ?? 3)),
+            maxTries: max(1, Narrow::int($streams[$queues[0] ?? 'default']['max_retries'] ?? null, 3)),
             force: $force,
             maxJobs: $maxJobs,
             maxTime: $maxLifetime,
@@ -544,7 +551,7 @@ LUA;
         // its current job, or absent when the slot is idle.
         /** @var array<int, int> $slotStarts */
         $slotStarts = [];
-        $stallThreshold = (int) ($this->config['stall_warn_seconds'] ?? 300);
+        $stallThreshold = Narrow::int($this->config['stall_warn_seconds'] ?? null, 300);
 
         // Per-slot StreamJob tracker. Maintained in lockstep with $slotStarts so
         // SIGTERM/SIGINT can reach the user command via $job->getResolvedJob().
@@ -613,12 +620,13 @@ LUA;
                 $circuitBreaker->openQueues($queues),
             );
 
-            $redisPool->use(function (mixed $redis) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queues) {
+            $redisPool->use(function (mixed $connection) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queues) {
+                $redis = self::pooledClient($connection);
                 $value = $redis->execute('GET', $prefix.'paused');
-                $ttl = (int) $redis->execute('TTL', $prefix.'paused');
+                $ttl = Narrow::int($redis->execute('TTL', $prefix.'paused'));
 
                 $torquePaused = self::shouldPauseFor(
-                    $value === null ? null : (string) $value,
+                    Narrow::nullableString($value),
                     $ttl,
                     $masterPidForPause,
                 );
@@ -793,6 +801,10 @@ LUA;
                             // The slot's read: new messages, then the pending list, then
                             // dead consumers' messages. Non-blocking.
                             $readChain = function (array $readQueues) use ($fiberRedis, $prefix, $consumerGroup, $buildStreamKey, $streams, $loopCount, &$redelivered, &$recheckPending): ?array {
+                                // Queue names already; this only tells analysis so (PHPStan
+                                // ignores a @param docblock on a closure assigned to a variable).
+                                $readQueues = array_map(static fn (mixed $queue): string => Narrow::string($queue), $readQueues);
+
                                 $found = $this->readNextMessage($fiberRedis, $readQueues, $prefix, $consumerGroup, $buildStreamKey);
 
                                 // Whatever the reads below find was delivered before.
@@ -857,7 +869,7 @@ LUA;
                                     $this->inFlight[$key] = true;
 
                                     $job = null;
-                                    $wire = (string) ($this->config['serializer'] ?? 'json');
+                                    $wire = Narrow::string($this->config['serializer'] ?? null, 'json');
 
                                     if (StreamQueue::isValidPayload($read['payload'], $wire)) {
                                         try {
@@ -996,7 +1008,7 @@ LUA;
 
                     $queueName = self::queueNameFromStreamKey($message['stream'], $prefix, $cluster);
 
-                    $wireSerializer = (string) ($this->config['serializer'] ?? 'json');
+                    $wireSerializer = Narrow::string($this->config['serializer'] ?? null, 'json');
                     $redeliveryOwed = $redelivered;
                     $quarantineReason = null;
 
@@ -1240,7 +1252,7 @@ LUA;
         // "0 workers" before the exit. An idle worker now exits within a tick, so
         // this normally publishes once more; it still matters for a worker held
         // open by an in-flight job for the full grace.
-        $metricsInterval = (float) ($this->config['metrics']['publish_interval'] ?? 1);
+        $metricsInterval = Narrow::float($metricsConfig['publish_interval'] ?? null, 1.0);
         EventLoop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
             $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
         });
@@ -1559,25 +1571,13 @@ LUA;
      */
     private function parseXreadgroupMessages(mixed $result): array
     {
-        if ($result === null || ! is_array($result)) {
-            return [];
-        }
-
         $parsed = [];
 
-        foreach ($result as $streamData) {
-            if ($streamData === null) {
-                continue;
-            }
-
-            $streamKey = (string) $streamData[0];
-
-            foreach ($streamData[1] ?? [] as $message) {
-                $messageId = (string) $message[0];
-
+        foreach (Narrow::streams($result) as $streamKey => $entries) {
+            foreach ($entries as $entry) {
                 // Reading a PEL lists an entry trimmed from the stream with nil
                 // fields; trimmedPendingEntries() reports those.
-                $payload = is_array($message[1] ?? null) ? self::payloadField($message[1]) : null;
+                $payload = self::payloadField($entry['fields']);
 
                 if ($payload === null) {
                     continue;
@@ -1585,7 +1585,7 @@ LUA;
 
                 $parsed[] = [
                     'stream' => $streamKey,
-                    'id' => $messageId,
+                    'id' => $entry['id'],
                     'payload' => $payload,
                 ];
             }
@@ -1604,16 +1604,12 @@ LUA;
      */
     public static function trimmedPendingEntries(mixed $result): array
     {
-        if (! is_array($result)) {
-            return [];
-        }
-
         $trimmed = [];
 
-        foreach ($result as $streamData) {
-            foreach ($streamData[1] ?? [] as $message) {
-                if (isset($message[0]) && ($message[1] ?? []) === []) {
-                    $trimmed[] = ['stream' => (string) $streamData[0], 'id' => (string) $message[0]];
+        foreach (Narrow::streams($result) as $streamKey => $entries) {
+            foreach ($entries as $entry) {
+                if ($entry['fields'] === []) {
+                    $trimmed[] = ['stream' => $streamKey, 'id' => $entry['id']];
                 }
             }
         }
@@ -1622,19 +1618,13 @@ LUA;
     }
 
     /**
-     * The `payload` value in a flat [field, value, ...] stream entry.
+     * The `payload` value of a stream entry's fields, the first one if repeated.
      *
-     * @param  array<int, mixed>  $fields
+     * @param  array<string, mixed>  $fields
      */
     private static function payloadField(array $fields): ?string
     {
-        for ($i = 0, $count = count($fields); $i + 1 < $count; $i += 2) {
-            if ((string) $fields[$i] === 'payload') {
-                return (string) $fields[$i + 1];
-            }
-        }
-
-        return null;
+        return array_key_exists('payload', $fields) ? Narrow::string($fields['payload']) : null;
     }
 
     /**
@@ -1683,7 +1673,7 @@ LUA;
             // socket may never end, so this wait has a limit of its own. Past it the
             // reply cannot be trusted, and finding nothing beats running one twice.
             $outstanding = $this->newReads;
-            $waitUntil = hrtime(true) + (int) (self::outstandingReadWait((float) ($this->config['redis']['read_timeout_seconds'] ?? self::DEFAULT_READ_TIMEOUT)) * 1_000_000_000);
+            $waitUntil = hrtime(true) + (int) (self::outstandingReadWait($this->readTimeoutSetting()) * 1_000_000_000);
 
             while (array_intersect_key($outstanding, $this->newReads) !== []) {
                 if (hrtime(true) >= $waitUntil) {
@@ -1819,8 +1809,8 @@ LUA;
         $reply = $readerRedis->execute('XPENDING', $streamKey, $consumerGroup, 'IDLE', (string) $minIdleMs, '-', '+', (string) $count, $this->consumerId);
         $ids = [];
 
-        foreach (is_array($reply) ? $reply : [] as $entry) {
-            $ids[(string) $entry[0]] = true;
+        foreach (Narrow::pending($reply) as $entry) {
+            $ids[$entry['id']] = true;
         }
 
         return $ids;
@@ -1877,7 +1867,7 @@ LUA;
             // This prevents stealing from consumers that are still alive but
             // processing slow jobs (e.g. exports, slow scraping).
             $streamConfig = $streams[$queue] ?? [];
-            $minIdleMs = ((int) ($streamConfig['retry_after'] ?? 60)) * 1000;
+            $minIdleMs = Narrow::int($streamConfig['retry_after'] ?? null, 60) * 1000;
             $ownUnstarted = null;
 
             try {
@@ -1971,26 +1961,19 @@ LUA;
             return $claim;
         }
 
-        $claim['cursor'] = (string) ($result[0] ?? '0-0');
+        $claim['cursor'] = Narrow::string($result[0] ?? null, '0-0');
 
-        foreach (is_array($result[1] ?? null) ? $result[1] : [] as $entry) {
-            if (! isset($entry[0])) {
-                continue;
-            }
-
-            $id = (string) $entry[0];
-            $fields = $entry[1] ?? [];
-
-            if ($fields === []) {
-                $claim['trimmed'][] = $id;
+        foreach (Narrow::entries($result[1] ?? null) as $entry) {
+            if ($entry['fields'] === []) {
+                $claim['trimmed'][] = $entry['id'];
 
                 continue;
             }
 
-            $payload = self::payloadField($fields);
+            $payload = self::payloadField($entry['fields']);
 
             if ($payload !== null) {
-                $claim['messages'][] = ['stream' => $streamKey, 'id' => $id, 'payload' => $payload];
+                $claim['messages'][] = ['stream' => $streamKey, 'id' => $entry['id'], 'payload' => $payload];
             }
         }
 
@@ -2060,7 +2043,7 @@ LUA;
      */
     public static function intervalSeconds(array $config, string $key, float $default): float
     {
-        $value = $config['intervals'][$key] ?? null;
+        $value = Narrow::map($config['intervals'] ?? null)[$key] ?? null;
 
         return is_numeric($value) ? max(self::MIN_INTERVAL_SECONDS, (float) $value) : $default;
     }
@@ -2343,7 +2326,10 @@ LUA;
         }
 
         try {
-            return array_values($manager->getPausedQueues($connectionName, $queues));
+            return array_map(
+                static fn (mixed $queue): string => Narrow::string($queue),
+                array_values($manager->getPausedQueues($connectionName, $queues)),
+            );
         } catch (\Throwable) {
             return null;
         }
@@ -2681,12 +2667,31 @@ LUA;
      */
     public function createReaderClient(string $redisUri): RedisClient
     {
-        $readTimeout = (float) ($this->config['redis']['read_timeout_seconds'] ?? self::DEFAULT_READ_TIMEOUT);
+        $readTimeout = $this->readTimeoutSetting();
 
         return new RedisClient(new ReconnectingRedisLink(
             createRedisConnector($redisUri),
             readTimeout: $readTimeout > 0 ? $readTimeout : null,
         ));
+    }
+
+    /** `redis.read_timeout_seconds` as configured, the default when it is not set. */
+    private function readTimeoutSetting(): float
+    {
+        return Narrow::float(Narrow::map($this->config['redis'] ?? null)['read_timeout_seconds'] ?? null, self::DEFAULT_READ_TIMEOUT);
+    }
+
+    /**
+     * The client a RedisPool callback receives, which the pool types as mixed.
+     * Anything else fails as loudly as the method call on it would have.
+     */
+    private static function pooledClient(mixed $connection): RedisClient
+    {
+        if (! $connection instanceof RedisClient) {
+            throw new \UnexpectedValueException('The Redis pool handed out '.get_debug_type($connection).', not a RedisClient.');
+        }
+
+        return $connection;
     }
 
     /**
@@ -2739,7 +2744,7 @@ LUA;
                 return;
             }
 
-            if ((int) $cache->get($marker) !== $attempt) {
+            if (Narrow::int($cache->get($marker)) !== $attempt) {
                 $cache->put($marker, $attempt, $expires);
 
                 return;
@@ -2785,7 +2790,7 @@ LUA;
         try {
             $marker = 'job-processing:'.$uuid;
 
-            if ((int) $cache->get($marker) === $job->attempts()) {
+            if (Narrow::int($cache->get($marker)) === $job->attempts()) {
                 $cache->forget($marker);
             }
         } catch (\Throwable $e) {
@@ -3079,14 +3084,14 @@ LUA;
 
         // Fire a domain event so users can hook in custom notification logic.
         try {
-            $decoded = StreamQueue::decodePayload($message['payload'], (string) ($this->config['serializer'] ?? 'json'));
+            $decoded = StreamQueue::decodePayload($message['payload'], Narrow::string($this->config['serializer'] ?? null, 'json'));
         } catch (\Throwable) {
             $decoded = [];
         }
         $failedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('c');
 
         $this->dispatchSafely($events, new JobPermanentlyFailed(
-            jobName: $decoded['displayName'] ?? $decoded['job'] ?? 'Unknown',
+            jobName: Narrow::string($decoded['displayName'] ?? $decoded['job'] ?? null, 'Unknown'),
             queue: $queueName,
             payload: $message['payload'],
             exceptionClass: $exception::class,
@@ -3287,7 +3292,7 @@ LUA;
             return $declared > 0 ? $declared : null;
         }
 
-        return max(1, (int) ($streamConfig['max_retries'] ?? 3));
+        return max(1, Narrow::int($streamConfig['max_retries'] ?? null, 3));
     }
 
     /**
@@ -3304,7 +3309,7 @@ LUA;
             $declared = $job->backoff();
 
             if ($declared !== null) {
-                return self::backoffStep(explode(',', is_array($declared) ? implode(',', $declared) : (string) $declared), $attempts);
+                return self::backoffStep(explode(',', (string) $declared), $attempts);
             }
 
             $steps = self::streamBackoffSteps($streamConfig['backoff'] ?? null);
@@ -3327,7 +3332,7 @@ LUA;
      */
     private static function backoffStep(array $steps, int $attempts): int
     {
-        return max(0, (int) ($steps[$attempts - 1] ?? $steps[array_key_last($steps)]));
+        return max(0, Narrow::int($steps[$attempts - 1] ?? $steps[array_key_last($steps)]));
     }
 
     /**
@@ -3378,14 +3383,14 @@ LUA;
             return null;
         }
 
-        $timeout = (int) ($job->timeout() ?? $streamConfig['timeout'] ?? 0);
+        $timeout = Narrow::int($job->timeout() ?? $streamConfig['timeout'] ?? null);
 
         return $timeout > 0 ? $timeout : null;
     }
 
     private function timeoutsEnabled(): bool
     {
-        return (bool) ($this->config['timeouts']['enabled'] ?? true);
+        return Narrow::bool(Narrow::map($this->config['timeouts'] ?? null)['enabled'] ?? null, true);
     }
 
     /**
@@ -3462,8 +3467,8 @@ LUA;
         }
 
         foreach ($streams as $name => $stream) {
-            $timeout = (int) ($stream['timeout'] ?? 0);
-            $retryAfter = (int) ($stream['retry_after'] ?? 60);
+            $timeout = Narrow::int($stream['timeout'] ?? null);
+            $retryAfter = Narrow::int($stream['retry_after'] ?? null, 60);
 
             if ($timeout >= $retryAfter && $timeout > 0) {
                 fwrite(STDERR, "[torque:worker] WARN stream {$name}: timeout {$timeout} is not below retry_after {$retryAfter}, so another worker can steal a job that is still running\n");
@@ -3495,7 +3500,7 @@ LUA;
 
         if ($this->enforcesStrictAttempts()) {
             foreach ($streams as $name => $stream) {
-                if ((int) ($stream['max_retries'] ?? 3) <= 1) {
+                if (Narrow::int($stream['max_retries'] ?? null, 3) <= 1) {
                     fwrite(STDERR, "[torque:worker] WARN stream {$name}: strict_attempts is on and max_retries is 1, so a worker death dead-letters a job that does not declare its own \$tries (redelivery_limit) with no re-run. Raise max_retries or set TORQUE_STRICT_ATTEMPTS=false\n");
                 }
             }
@@ -3533,14 +3538,14 @@ LUA;
      */
     private function migrateDelayedJobs(RedisPool $redisPool, array $queues, \Closure $buildStreamKey): void
     {
-        $redisPool->use(function (mixed $redis) use ($queues, $buildStreamKey) {
+        $redisPool->use(function (mixed $connection) use ($queues, $buildStreamKey) {
+            $redis = self::pooledClient($connection);
             $now = (string) time();
 
             foreach ($queues as $queue) {
                 $streamKey = $buildStreamKey($queue);
                 $delayedKey = $streamKey.':delayed';
 
-                /** @var int|null $migrated */
                 $migrated = $redis->execute(
                     'EVAL',
                     self::LUA_MIGRATE_DELAYED,
@@ -3584,7 +3589,7 @@ LUA;
                 return true;
             }
 
-            return ($active[$queue] ?? 0) < (int) $cap;
+            return ($active[$queue] ?? 0) < Narrow::int($cap);
         }));
     }
 

@@ -15,6 +15,7 @@ use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\LegacyConfig;
 use Webpatser\Torque\Support\LongWaitGate;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
@@ -208,6 +209,26 @@ LUA;
     }
 
     /**
+     * A section of the Torque config (`redis`, `metrics`, ...), empty when unset.
+     *
+     * @return array<string, mixed>
+     */
+    private function configSection(string $key): array
+    {
+        return Narrow::map($this->config[$key] ?? null);
+    }
+
+    private function redisUri(): string
+    {
+        return Narrow::string($this->configSection('redis')['uri'] ?? null, 'redis://127.0.0.1:6379');
+    }
+
+    private function redisPrefix(): string
+    {
+        return Narrow::string($this->configSection('redis')['prefix'] ?? null, 'torque:');
+    }
+
+    /**
      * Fork worker processes and enter the monitoring loop.
      *
      * Returns the process exit code (0 for clean shutdown).
@@ -271,7 +292,7 @@ LUA;
         $this->prepareHeartbeatDirectory();
         $this->warnIfCacheCanStall();
 
-        $numWorkers = (int) ($this->config['workers'] ?? 4);
+        $numWorkers = Narrow::int($this->config['workers'] ?? null, 4);
 
         ($this->logger)("Starting {$numWorkers} worker processes...");
 
@@ -299,37 +320,38 @@ LUA;
 
         // The aggregate metrics publisher runs for every master when metrics
         // are enabled; autoscale additionally builds its scaler on top of it.
-        if ($this->config['metrics']['enabled'] ?? true) {
+        if ($this->configSection('metrics')['enabled'] ?? true) {
             $this->metricsPublisher = new MetricsPublisher(
-                redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-                prefix: $this->config['redis']['prefix'] ?? 'torque:',
-                settings: $this->config['metrics'] ?? [],
+                redisUri: $this->redisUri(),
+                prefix: $this->redisPrefix(),
+                settings: $this->configSection('metrics'),
             );
         }
 
-        if ($this->config['autoscale']['enabled'] ?? false) {
-            $autoscaleConfig = $this->config['autoscale'];
-            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+        $autoscaleConfig = $this->configSection('autoscale');
+
+        if ($autoscaleConfig['enabled'] ?? false) {
+            $redisUri = $this->redisUri();
 
             $this->autoScaler = new AutoScaler(
                 redisUri: $redisUri,
-                minWorkers: (int) ($autoscaleConfig['min_workers'] ?? 2),
-                maxWorkers: (int) ($autoscaleConfig['max_workers'] ?? 8),
-                scaleUpThreshold: (float) ($autoscaleConfig['scale_up_threshold'] ?? 0.85),
-                scaleDownThreshold: (float) ($autoscaleConfig['scale_down_threshold'] ?? 0.20),
-                cooldownSeconds: (int) ($autoscaleConfig['cooldown'] ?? 30),
+                minWorkers: Narrow::int($autoscaleConfig['min_workers'] ?? null, 2),
+                maxWorkers: Narrow::int($autoscaleConfig['max_workers'] ?? null, 8),
+                scaleUpThreshold: Narrow::float($autoscaleConfig['scale_up_threshold'] ?? null, 0.85),
+                scaleDownThreshold: Narrow::float($autoscaleConfig['scale_down_threshold'] ?? null, 0.20),
+                cooldownSeconds: Narrow::int($autoscaleConfig['cooldown'] ?? null, 30),
             );
 
             // Autoscale reads worker metrics, so it needs the publisher even
             // when the aggregate publishing itself was disabled.
             $this->metricsPublisher ??= new MetricsPublisher(
                 redisUri: $redisUri,
-                prefix: $this->config['redis']['prefix'] ?? 'torque:',
-                settings: $this->config['metrics'] ?? [],
+                prefix: $this->redisPrefix(),
+                settings: $this->configSection('metrics'),
             );
 
             ($this->logger)('Autoscaling enabled ('
-                .$autoscaleConfig['min_workers'].'-'.$autoscaleConfig['max_workers']
+                .Narrow::string($autoscaleConfig['min_workers'] ?? null).'-'.Narrow::string($autoscaleConfig['max_workers'] ?? null)
                 .' workers)');
         }
 
@@ -364,8 +386,8 @@ LUA;
         if ($pid === 0) {
             // Child: immediately replace process image with a fresh PHP process.
             // This avoids inheriting any Fiber/Revolt/Redis state from the parent.
-            $queues = implode(',', (array) ($this->config['queues'] ?? ['default']));
-            $concurrency = (string) (int) ($this->config['slots_per_worker'] ?? 50);
+            $queues = implode(',', array_map(Narrow::string(...), (array) ($this->config['queues'] ?? ['default'])));
+            $concurrency = (string) Narrow::int($this->config['slots_per_worker'] ?? null, 50);
 
             pcntl_exec(PHP_BINARY, [
                 $this->artisanPath,
@@ -445,6 +467,8 @@ LUA;
             // Reap every exited child (SIGCHLD coalesces — one delivery may
             // cover multiple exits).
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
+                $status = Narrow::int($status);
+
                 if (isset($this->longWaitAlerts[$pid])) {
                     $this->forgetLongWaitAlert($pid, $status);
 
@@ -651,13 +675,14 @@ LUA;
      */
     public static function cacheStallWarning(array $cache, array $database, int $limit, int $socketTimeout): ?string
     {
-        $name = (string) ($cache['default'] ?? '');
-        $store = (array) ($cache['stores'][$name] ?? []);
-        $driver = (string) ($store['driver'] ?? '');
+        $name = Narrow::string($cache['default'] ?? null);
+        $store = Narrow::map(Narrow::map($cache['stores'] ?? null)[$name] ?? null);
+        $driver = Narrow::string($store['driver'] ?? null);
 
         if ($driver === 'database') {
-            $connection = (string) ($store['connection'] ?? $database['default'] ?? '');
-            $connectionDriver = (string) ($database['connections'][$connection]['driver'] ?? '');
+            $connection = Narrow::string($store['connection'] ?? $database['default'] ?? null);
+            $connections = Narrow::map($database['connections'] ?? null);
+            $connectionDriver = Narrow::string(Narrow::map($connections[$connection] ?? null)['driver'] ?? null);
 
             if ($connectionDriver === 'sqlite' || str_starts_with($connectionDriver, 'fledge-')) {
                 return null;
@@ -667,7 +692,7 @@ LUA;
         }
 
         $seconds = match ($driver) {
-            'redis' => self::redisStoreTimeout($store, (array) ($database['redis'] ?? []), $socketTimeout),
+            'redis' => self::redisStoreTimeout($store, Narrow::map($database['redis'] ?? null), $socketTimeout),
             'memcached' => self::memcachedStoreTimeout($store),
             default => null,
         };
@@ -698,14 +723,14 @@ LUA;
      */
     private static function redisStoreTimeout(array $store, array $redis, int $socketTimeout): ?float
     {
-        $connection = $redis[(string) ($store['connection'] ?? 'default')] ?? null;
+        $connection = $redis[Narrow::string($store['connection'] ?? null, 'default')] ?? null;
 
         if (! is_array($connection)) {
             return null;
         }
 
         try {
-            $connection = (new ConfigurationUrlParser)->parseConfiguration($connection);
+            $connection = (new ConfigurationUrlParser)->parseConfiguration(Narrow::map($connection));
         } catch (\InvalidArgumentException) {
             return null;
         }
@@ -714,12 +739,12 @@ LUA;
 
         if (($redis['client'] ?? 'phpredis') === 'predis') {
             $read = $connection['read_write_timeout'] ?? null;
-            $read = $read === null ? $fallback : ((float) $read > 0 ? (float) $read : null);
-            $connect = (float) ($connection['timeout'] ?? 5.0);
+            $read = $read === null ? $fallback : (Narrow::float($read) > 0 ? Narrow::float($read) : null);
+            $connect = Narrow::float($connection['timeout'] ?? null, 5.0);
         } else {
-            $read = (float) ($connection['read_timeout'] ?? 0.0);
+            $read = Narrow::float($connection['read_timeout'] ?? null);
             $read = $read < 0 ? null : ($read > 0 ? $read : $fallback);
-            $connect = (float) ($connection['timeout'] ?? 0.0);
+            $connect = Narrow::float($connection['timeout'] ?? null);
             $connect = $connect > 0 ? $connect : $fallback;
         }
 
@@ -738,7 +763,7 @@ LUA;
         $connect = $options[self::MEMCACHED_OPT_CONNECT_TIMEOUT] ?? null;
         $poll = $options[self::MEMCACHED_OPT_POLL_TIMEOUT] ?? null;
 
-        return $connect === null || $poll === null ? null : max((float) $connect, (float) $poll) / 1000;
+        return $connect === null || $poll === null ? null : max(Narrow::float($connect), Narrow::float($poll)) / 1000;
     }
 
     /**
@@ -769,7 +794,7 @@ LUA;
         $streams = is_array($config['streams'] ?? null) ? $config['streams'] : [];
 
         $retryAfter = array_map(
-            static fn (mixed $stream): int => (is_array($stream) ? max(0, (int) ($stream['retry_after'] ?? 0)) : 0) ?: 60,
+            static fn (mixed $stream): int => (is_array($stream) ? max(0, Narrow::int($stream['retry_after'] ?? null)) : 0) ?: 60,
             $streams,
         );
 
@@ -884,8 +909,8 @@ LUA;
         }
 
         $warning = self::cacheStallWarning(
-            (array) config('cache'),
-            (array) config('database'),
+            Narrow::map(config('cache')),
+            Narrow::map(config('database')),
             $limit,
             (int) ini_get('default_socket_timeout'),
         );
@@ -1120,7 +1145,7 @@ LUA;
      */
     public function handleHousekeepingTick(): void
     {
-        $interval = (int) ($this->config['dead_letter']['prune_interval'] ?? 300);
+        $interval = Narrow::int($this->configSection('dead_letter')['prune_interval'] ?? null, 300);
 
         if ($interval <= 0) {
             return;
@@ -1151,7 +1176,7 @@ LUA;
             // A live worker touches its consumer on every poll, so anything
             // idle for longer than a full worker lifetime belongs to a
             // process that is gone.
-            $idleSeconds = max(3600, (int) ($this->config['max_worker_lifetime'] ?? 3600));
+            $idleSeconds = max(3600, Narrow::int($this->config['max_worker_lifetime'] ?? null, 3600));
             $removed = array_sum($housekeeper->pruneConsumers(
                 $idleSeconds,
                 redeliveryFieldLimit: StreamHousekeeper::REDELIVERY_FIELDS_PER_SWEEP,
@@ -1202,12 +1227,12 @@ LUA;
 
         try {
             $queue = new StreamQueue(
-                redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+                redisUri: $this->redisUri(),
                 default: 'default',
-                prefix: $this->config['redis']['prefix'] ?? 'torque:',
-                consumerGroup: $this->config['consumer_group'] ?? 'torque',
-                cluster: (bool) ($this->config['redis']['cluster'] ?? false),
-                serializer: (string) ($this->config['serializer'] ?? 'json'),
+                prefix: $this->redisPrefix(),
+                consumerGroup: Narrow::string($this->config['consumer_group'] ?? null, 'torque'),
+                cluster: (bool) ($this->configSection('redis')['cluster'] ?? false),
+                serializer: Narrow::string($this->config['serializer'] ?? null, 'json'),
             );
 
             foreach ($thresholds as $name => $threshold) {
@@ -1254,7 +1279,7 @@ LUA;
             return false;
         }
 
-        $limit = max(1, (int) ($this->config['long_wait_alert_seconds'] ?? self::LONG_WAIT_ALERT_SECONDS));
+        $limit = max(1, Narrow::int($this->config['long_wait_alert_seconds'] ?? null, self::LONG_WAIT_ALERT_SECONDS));
         $pid = pcntl_fork();
 
         if ($pid === -1) {
@@ -1304,7 +1329,7 @@ LUA;
             $reaped = pcntl_waitpid($pid, $status, WNOHANG);
 
             if ($reaped === $pid) {
-                $this->forgetLongWaitAlert($pid, $status);
+                $this->forgetLongWaitAlert($pid, Narrow::int($status));
             } elseif ($reaped === -1) {
                 unset($this->longWaitAlerts[$pid]);
             } elseif (! $alert['killed'] && hrtime(true) >= $alert['killAt']) {
@@ -1367,8 +1392,8 @@ LUA;
         }
 
         try {
-            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-            $prefix = $this->config['redis']['prefix'] ?? 'torque:';
+            $redisUri = $this->redisUri();
+            $prefix = $this->redisPrefix();
 
             $value = createRedisClient($redisUri)->execute('GET', $prefix.'paused');
 
@@ -1376,7 +1401,7 @@ LUA;
                 return;
             }
 
-            $ownerPid = DrainPause::ownerPid((string) $value);
+            $ownerPid = DrainPause::ownerPid(Narrow::string($value));
 
             $reason = $ownerPid === null
                 ? 'deliberate `torque:pause`'
@@ -1421,12 +1446,12 @@ LUA;
         $isMasterAlive ??= ProcessInspector::isTorqueMaster(...);
 
         try {
-            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-            $prefix = $this->config['redis']['prefix'] ?? 'torque:';
+            $redisUri = $this->redisUri();
+            $prefix = $this->redisPrefix();
 
             $redis = createRedisClient($redisUri);
             $value = $redis->execute('GET', $prefix.'paused');
-            $value = $value === null ? null : (string) $value;
+            $value = $value === null ? null : Narrow::string($value);
 
             $selfPid = getmypid();
 
@@ -1434,13 +1459,13 @@ LUA;
                 return false;
             }
 
-            $deleted = (int) $redis->execute(
+            $deleted = Narrow::int($redis->execute(
                 'EVAL',
                 self::LUA_DELETE_IF_EQUAL,
                 '1',
                 $prefix.'paused',
                 (string) $value,
-            );
+            ));
 
             if ($deleted === 0) {
                 return false;
@@ -1520,8 +1545,8 @@ LUA;
     private function beginDrain(): void
     {
         try {
-            $redisUri = $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-            $prefix = $this->config['redis']['prefix'] ?? 'torque:';
+            $redisUri = $this->redisUri();
+            $prefix = $this->redisPrefix();
 
             // The value scopes the pause to THIS master's fleet: workers
             // compare the embedded PID against their own parent and ignore a
@@ -1672,13 +1697,13 @@ LUA;
      */
     private function waitForOwnFleetReady(): bool
     {
-        $timeout = (float) ($this->config['takeover_ready_timeout_seconds'] ?? 30.0);
+        $timeout = Narrow::float($this->config['takeover_ready_timeout_seconds'] ?? null, 30.0);
         $deadline = microtime(true) + $timeout;
 
         $publisher = new MetricsPublisher(
-            redisUri: $this->config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
-            prefix: $this->config['redis']['prefix'] ?? 'torque:',
-            settings: $this->config['metrics'] ?? [],
+            redisUri: $this->redisUri(),
+            prefix: $this->redisPrefix(),
+            settings: $this->configSection('metrics'),
         );
 
         while (microtime(true) < $deadline && ! $this->shouldStop) {
@@ -1751,11 +1776,11 @@ LUA;
      */
     private function publishAggregateMetrics(): void
     {
-        if ($this->metricsPublisher === null || ! ($this->config['metrics']['enabled'] ?? true)) {
+        if ($this->metricsPublisher === null || ! ($this->configSection('metrics')['enabled'] ?? true)) {
             return;
         }
 
-        $interval = max(1, (int) ($this->config['metrics']['publish_interval'] ?? 1));
+        $interval = max(1, Narrow::int($this->configSection('metrics')['publish_interval'] ?? null, 1));
         $now = microtime(true);
 
         if ($this->lastAggregateAt !== null && ($now - $this->lastAggregateAt) < $interval) {
@@ -1766,10 +1791,10 @@ LUA;
             $workers = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
             $aggregate = $this->metricsPublisher->aggregateFromWorkers($workers);
 
-            $jobsFailed = (int) $aggregate['jobs_failed'];
-            $jobsTotal = (int) $aggregate['jobs_processed'] + $jobsFailed;
-            $perQueue = is_array($aggregate['per_queue'] ?? null) ? $aggregate['per_queue'] : [];
-            $perJob = is_array($aggregate['per_job'] ?? null) ? $aggregate['per_job'] : [];
+            $jobsFailed = Narrow::int($aggregate['jobs_failed'] ?? null);
+            $jobsTotal = Narrow::int($aggregate['jobs_processed'] ?? null) + $jobsFailed;
+            $perQueue = self::queueCounters($aggregate['per_queue'] ?? null);
+            $perJob = self::jobCounters($aggregate['per_job'] ?? null);
 
             if ($this->lastAggregateJobsTotal !== null && $this->lastAggregateAt !== null && $now > $this->lastAggregateAt) {
                 $delta = $jobsTotal - $this->lastAggregateJobsTotal;
@@ -1816,6 +1841,46 @@ LUA;
         } catch (\Throwable) {
             // Metrics must never take the master down.
         }
+    }
+
+    /**
+     * The aggregate's `per_queue` counters. A row that is no array reads as zeros,
+     * as destructuring it did.
+     *
+     * @return array<string, array{0: int, 1: int}>
+     */
+    private static function queueCounters(mixed $value): array
+    {
+        $counters = [];
+
+        foreach (Narrow::map($value) as $queue => $row) {
+            $row = is_array($row) ? $row : [];
+            $counters[$queue] = [Narrow::int($row[0] ?? null), Narrow::int($row[1] ?? null)];
+        }
+
+        return $counters;
+    }
+
+    /**
+     * The aggregate's `per_job` counters, read like {@see queueCounters()}.
+     *
+     * @return array<string, array{0: int, 1: int, 2: float, 3: float}>
+     */
+    private static function jobCounters(mixed $value): array
+    {
+        $counters = [];
+
+        foreach (Narrow::map($value) as $class => $row) {
+            $row = is_array($row) ? $row : [];
+            $counters[$class] = [
+                Narrow::int($row[0] ?? null),
+                Narrow::int($row[1] ?? null),
+                Narrow::float($row[2] ?? null),
+                Narrow::float($row[3] ?? null),
+            ];
+        }
+
+        return $counters;
     }
 
     /**
@@ -1883,7 +1948,7 @@ LUA;
      */
     private static function hostOf(string $workerId, array $worker): string
     {
-        $host = trim((string) ($worker['host'] ?? ''));
+        $host = trim(Narrow::string($worker['host'] ?? null));
 
         return $host !== '' ? $host : WorkerId::parse($workerId)->host;
     }
@@ -1910,8 +1975,8 @@ LUA;
 
         foreach ($workers as $workerId => $worker) {
             $workerId = (string) $workerId;
-            $processed = (int) ($worker['jobs_processed'] ?? 0);
-            $failed = (int) ($worker['jobs_failed'] ?? 0);
+            $processed = Narrow::int($worker['jobs_processed'] ?? null);
+            $failed = Narrow::int($worker['jobs_failed'] ?? null);
 
             // Rebuilt from this tick's ids only, so a rotated worker's id falls
             // out and the map stays bounded by the live fleet.
@@ -1971,7 +2036,7 @@ LUA;
                 continue;
             }
 
-            $memoryMb = ((float) ($worker['memory_bytes'] ?? 0)) / 1_048_576;
+            $memoryMb = Narrow::float($worker['memory_bytes'] ?? null) / 1_048_576;
 
             $sample = $hosts[$host] ?? [
                 MetricsPublisher::GAUGE_HOST_BUSY_SLOTS => 0.0,
@@ -1981,8 +2046,8 @@ LUA;
                 MetricsPublisher::GAUGE_HOST_WORKERS => 0.0,
             ];
 
-            $sample[MetricsPublisher::GAUGE_HOST_BUSY_SLOTS] += (float) ($worker['active_slots'] ?? 0);
-            $sample[MetricsPublisher::GAUGE_HOST_TOTAL_SLOTS] += (float) ($worker['total_slots'] ?? 0);
+            $sample[MetricsPublisher::GAUGE_HOST_BUSY_SLOTS] += Narrow::float($worker['active_slots'] ?? null);
+            $sample[MetricsPublisher::GAUGE_HOST_TOTAL_SLOTS] += Narrow::float($worker['total_slots'] ?? null);
             $sample[MetricsPublisher::GAUGE_HOST_MEMORY] += $memoryMb;
             // Slots and memory sum across the box; the peak is the largest
             // single worker, which is the number a recycle threshold is set on.
@@ -2025,10 +2090,10 @@ LUA;
         }
 
         return [
-            MetricsPublisher::GAUGE_LATENCY => (float) ($aggregate['avg_latency'] ?? 0),
-            MetricsPublisher::GAUGE_CONCURRENT => (float) ($aggregate['concurrent'] ?? 0),
-            MetricsPublisher::GAUGE_MEMORY => (float) ($aggregate['memory_mb'] ?? 0),
-            MetricsPublisher::GAUGE_WORKER_MEMORY_PEAK => (float) ($aggregate['memory_peak_mb'] ?? 0),
+            MetricsPublisher::GAUGE_LATENCY => Narrow::float($aggregate['avg_latency'] ?? null),
+            MetricsPublisher::GAUGE_CONCURRENT => Narrow::float($aggregate['concurrent'] ?? null),
+            MetricsPublisher::GAUGE_MEMORY => Narrow::float($aggregate['memory_mb'] ?? null),
+            MetricsPublisher::GAUGE_WORKER_MEMORY_PEAK => Narrow::float($aggregate['memory_peak_mb'] ?? null),
             MetricsPublisher::GAUGE_PENDING => (float) $pending,
             MetricsPublisher::GAUGE_DELAYED => (float) $delayed,
         ];

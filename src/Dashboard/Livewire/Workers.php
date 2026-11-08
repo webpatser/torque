@@ -10,6 +10,7 @@ use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\OverviewData;
 use Webpatser\Torque\Dashboard\Data\WorkersData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Workers screen: slot pressure, throughput and memory per host.
@@ -29,7 +30,7 @@ final class Workers extends Component
         $window = $this->range();
         $hosts = rescue(fn (): array => app(WorkersData::class)->get($window->key)['hosts'], [], false);
         $totals = rescue(
-            fn (): array => app(OverviewData::class)->get($window->key)['totals'],
+            fn (): array => Narrow::map(app(OverviewData::class)->get($window->key)['totals']),
             ['slots' => 0, 'busy' => 0, 'pending' => 0, 'delayed' => 0, 'rpm' => 0, 'util' => 0],
             false,
         );

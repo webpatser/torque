@@ -9,6 +9,7 @@ use Webpatser\Torque\Dashboard\Http\Middleware\Authorize;
 use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Shared dashboard chrome state for the full-page Livewire screens.
@@ -68,7 +69,7 @@ trait WithDashboardChrome
 
             $this->pollInterval = is_int($remembered) && $this->isAllowedPollInterval($remembered)
                 ? $remembered
-                : (int) config('torque.dashboard.default_poll_interval', 2000);
+                : Narrow::int(config('torque.dashboard.default_poll_interval', 2000), 2000);
         }
 
         if ($this->range === null) {
@@ -76,7 +77,7 @@ trait WithDashboardChrome
 
             $this->range = is_string($remembered) && Range::isValid($remembered)
                 ? $remembered
-                : (string) config('torque.dashboard.default_range', Range::DEFAULT);
+                : Narrow::string(config('torque.dashboard.default_range', Range::DEFAULT), Range::DEFAULT);
         }
     }
 
@@ -113,7 +114,7 @@ trait WithDashboardChrome
         $interval = max(0, $interval);
 
         if (! $this->isAllowedPollInterval($interval)) {
-            $interval = (int) config('torque.dashboard.default_poll_interval', 2000);
+            $interval = Narrow::int(config('torque.dashboard.default_poll_interval', 2000), 2000);
         }
 
         $this->pollInterval = $interval;
@@ -124,7 +125,7 @@ trait WithDashboardChrome
     {
         $allowed = config('torque.dashboard.poll_intervals', [0, 1000, 2000, 5000, 10000, 30000]);
 
-        return in_array($interval, array_map(intval(...), (array) $allowed), true);
+        return in_array($interval, array_map(static fn (mixed $value): int => Narrow::int($value), Narrow::list($allowed)), true);
     }
 
     /**

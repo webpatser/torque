@@ -23,16 +23,16 @@ final class StreamQueueResolver
      */
     public static function make(): StreamQueue
     {
-        /** @var array<string, mixed> $config */
-        $config = config('torque', []);
+        $config = Narrow::map(config('torque', []));
+        $redis = Narrow::map($config['redis'] ?? null);
 
         return new StreamQueue(
-            redisUri: $config['redis']['uri'] ?? 'redis://127.0.0.1:6379',
+            redisUri: Narrow::string($redis['uri'] ?? null, 'redis://127.0.0.1:6379'),
             default: 'default',
-            prefix: $config['redis']['prefix'] ?? 'torque:',
-            consumerGroup: $config['consumer_group'] ?? 'torque',
-            cluster: (bool) ($config['redis']['cluster'] ?? false),
-            serializer: (string) ($config['serializer'] ?? 'json'),
+            prefix: Narrow::string($redis['prefix'] ?? null, 'torque:'),
+            consumerGroup: Narrow::string($config['consumer_group'] ?? null, 'torque'),
+            cluster: Narrow::bool($redis['cluster'] ?? null),
+            serializer: Narrow::string($config['serializer'] ?? null, 'json'),
         );
     }
 }

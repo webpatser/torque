@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\StreamQueueResolver;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -53,9 +54,10 @@ final class TorqueMonitorCommand extends Command
         $this->startedAt = time();
 
         $publisher = app(MetricsPublisher::class);
-        $config = config('torque');
-        $prefix = $config['redis']['prefix'] ?? 'torque:';
-        $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+        $config = Narrow::map(config('torque'));
+        $redisConfig = Narrow::map($config['redis'] ?? null);
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
 
         // Switch to alternate screen buffer (like htop/vim) and hide cursor.
         $this->output->write("\033[?1049h\033[?25l");
@@ -133,9 +135,9 @@ final class TorqueMonitorCommand extends Command
      */
     private function renderHeader(array $metrics, ?int $masterPid, bool $paused): void
     {
-        $workerCount = (int) ($metrics['workers'] ?? 0);
-        $totalSlots = (int) ($metrics['total_slots'] ?? 0);
-        $updatedAt = (int) ($metrics['updated_at'] ?? 0);
+        $workerCount = Narrow::int($metrics['workers'] ?? null);
+        $totalSlots = Narrow::int($metrics['total_slots'] ?? null);
+        $updatedAt = Narrow::int($metrics['updated_at'] ?? null);
         $age = $updatedAt > 0 ? time() - $updatedAt : 0;
 
         $status = match (true) {
@@ -155,14 +157,14 @@ final class TorqueMonitorCommand extends Command
      */
     private function renderMetrics(array $m): void
     {
-        $throughput = round((float) ($m['throughput'] ?? 0), 1);
-        $concurrent = (int) ($m['concurrent'] ?? 0);
-        $totalSlots = (int) ($m['total_slots'] ?? 0);
+        $throughput = round(Narrow::float($m['throughput'] ?? null), 1);
+        $concurrent = Narrow::int($m['concurrent'] ?? null);
+        $totalSlots = Narrow::int($m['total_slots'] ?? null);
         $pct = $totalSlots > 0 ? round($concurrent / $totalSlots * 100) : 0;
-        $latency = round((float) ($m['avg_latency'] ?? 0), 1);
-        $memory = round((float) ($m['memory_mb'] ?? 0), 1);
-        $processed = number_format((int) ($m['jobs_processed'] ?? 0));
-        $failed = number_format((int) ($m['jobs_failed'] ?? 0));
+        $latency = round(Narrow::float($m['avg_latency'] ?? null), 1);
+        $memory = round(Narrow::float($m['memory_mb'] ?? null), 1);
+        $processed = number_format(Narrow::int($m['jobs_processed'] ?? null));
+        $failed = number_format(Narrow::int($m['jobs_failed'] ?? null));
 
         $pctColor = match (true) {
             $pct >= 85 => "\033[31m",
@@ -176,7 +178,7 @@ final class TorqueMonitorCommand extends Command
             default => "\033[32m",
         };
 
-        $failedColor = ((int) ($m['jobs_failed'] ?? 0)) > 0 ? "\033[31m" : "\033[32m";
+        $failedColor = Narrow::int($m['jobs_failed'] ?? null) > 0 ? "\033[31m" : "\033[32m";
 
         $this->bufferLine();
         $this->bufferLine(sprintf(
@@ -266,7 +268,7 @@ final class TorqueMonitorCommand extends Command
      */
     private function renderQueues(array $config): void
     {
-        $streams = $config['streams'] ?? [];
+        $streams = Narrow::map($config['streams'] ?? null);
         if ($streams === []) {
             return;
         }
@@ -311,7 +313,7 @@ final class TorqueMonitorCommand extends Command
         $this->bufferLine();
 
         $pausedStr = $paused ? "\033[33mYes\033[0m" : "\033[32mNo\033[0m";
-        $failedCount = (int) ($metrics['jobs_failed'] ?? 0);
+        $failedCount = Narrow::int($metrics['jobs_failed'] ?? null);
         $failedStr = $failedCount > 0 ? "\033[31m{$failedCount}\033[0m" : "\033[32m0\033[0m";
 
         $uptime = $this->formatUptime();

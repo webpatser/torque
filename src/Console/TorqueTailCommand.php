@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
 use Webpatser\Torque\Stream\JobStream;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Tail a job's event stream in real-time.
@@ -25,9 +26,9 @@ final class TorqueTailCommand extends Command
 
     public function handle(): int
     {
-        $config = config('torque');
-        $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
-        $prefix = $config['redis']['prefix'] ?? 'torque:';
+        $redisConfig = Narrow::map(Narrow::map(config('torque'))['redis'] ?? null);
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
 
         $stream = new JobStream(redisUri: $redisUri, prefix: $prefix);
 
@@ -113,21 +114,23 @@ final class TorqueTailCommand extends Command
             $latestTime = 0;
 
             do {
-                $result = $redis->execute('SCAN', $cursor, 'MATCH', $prefix.'job:*', 'COUNT', '100');
-                $cursor = (string) ($result[0] ?? '0');
-                $keys = is_array($result[1] ?? null) ? $result[1] : [];
+                $result = Narrow::list($redis->execute('SCAN', $cursor, 'MATCH', $prefix.'job:*', 'COUNT', '100'));
+                $cursor = Narrow::string($result[0] ?? null, '0');
+                $keys = Narrow::list($result[1] ?? null);
 
                 foreach ($keys as $key) {
-                    // Read the first entry to get its timestamp.
-                    $entries = $redis->execute('XRANGE', (string) $key, '-', '+', 'COUNT', '1');
+                    $key = Narrow::string($key);
 
-                    if (is_array($entries) && $entries !== []) {
-                        $id = (string) $entries[0][0];
+                    // Read the first entry to get its timestamp.
+                    $entries = Narrow::entries($redis->execute('XRANGE', $key, '-', '+', 'COUNT', '1'));
+
+                    if ($entries !== []) {
+                        $id = $entries[0]['id'];
                         $ts = (int) explode('-', $id)[0];
 
                         if ($ts > $latestTime) {
                             $latestTime = $ts;
-                            $latest = str_replace($prefix.'job:', '', (string) $key);
+                            $latest = str_replace($prefix.'job:', '', $key);
                         }
                     }
                 }

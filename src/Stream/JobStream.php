@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Stream;
 
 use Fledge\Async\Redis\RedisClient;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -64,13 +65,13 @@ final class JobStream
                 continue;
             }
 
-            $streamData = $result[0] ?? null;
+            $rawEntries = Narrow::list($result[0] ?? null)[1] ?? null;
 
-            if ($streamData === null || ! is_array($streamData[1] ?? null) || $streamData[1] === []) {
+            if (! is_array($rawEntries) || $rawEntries === []) {
                 continue;
             }
 
-            $entries = $this->parseEntries($streamData[1]);
+            $entries = $this->parseEntries($rawEntries);
 
             foreach ($entries as $entry) {
                 $lastId = $entry['id'];
@@ -109,7 +110,7 @@ final class JobStream
         $active = [];
 
         foreach ($uuids as $uuid) {
-            $uuid = (string) $uuid;
+            $uuid = Narrow::string($uuid);
             $key = $this->prefix.'job:'.$uuid;
             $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
 
@@ -185,7 +186,7 @@ final class JobStream
             // The SCAN fallback is for installs whose recorder never wrote the
             // index; it knows nothing about the window, so an empty *ranged*
             // read must only fall through when the index really is empty.
-            if ($since !== null && (int) $redis->execute('ZCARD', $indexKey) > 0) {
+            if ($since !== null && Narrow::int($redis->execute('ZCARD', $indexKey)) > 0) {
                 return [];
             }
 
@@ -196,7 +197,7 @@ final class JobStream
         $jobs = [];
 
         foreach ($uuids as $uuid) {
-            $uuid = (string) $uuid;
+            $uuid = Narrow::string($uuid);
             $key = $this->prefix.'job:'.$uuid;
 
             $first = $redis->execute('XRANGE', $key, '-', '+', 'COUNT', '1');
@@ -277,11 +278,11 @@ final class JobStream
                 break;
             }
 
-            $cursor = (string) $result[0];
-            $keys = is_array($result[1]) ? $result[1] : [];
+            $cursor = Narrow::string($result[0] ?? null);
+            $keys = Narrow::list($result[1] ?? null);
 
             foreach ($keys as $key) {
-                $key = (string) $key;
+                $key = Narrow::string($key);
                 $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
 
                 if (! is_array($last) || $last === []) {
@@ -335,11 +336,11 @@ final class JobStream
                 break;
             }
 
-            $cursor = (string) $result[0];
-            $keys = is_array($result[1]) ? $result[1] : [];
+            $cursor = Narrow::string($result[0] ?? null);
+            $keys = Narrow::list($result[1] ?? null);
 
             foreach ($keys as $key) {
-                $key = (string) $key;
+                $key = Narrow::string($key);
 
                 $first = $redis->execute('XRANGE', $key, '-', '+', 'COUNT', '1');
                 $last = $redis->execute('XREVRANGE', $key, '+', '-', 'COUNT', '1');
@@ -396,17 +397,11 @@ final class JobStream
     {
         $entries = [];
 
-        foreach ($rawEntries as $entry) {
-            $id = (string) $entry[0];
-            $fields = $entry[1];
-            $data = [];
-
-            for ($i = 0, $count = count($fields); $i < $count; $i += 2) {
-                $data[(string) $fields[$i]] = (string) $fields[$i + 1];
-            }
+        foreach (Narrow::entries($rawEntries) as $entry) {
+            $data = array_map(Narrow::string(...), $entry['fields']);
 
             $entries[] = [
-                'id' => $id,
+                'id' => $entry['id'],
                 'type' => $data['type'] ?? 'unknown',
                 'data' => $data,
             ];

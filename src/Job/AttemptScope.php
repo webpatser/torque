@@ -92,7 +92,11 @@ final class AttemptScope
 
         FiberContext::register(
             self::HOOK,
-            static fn (): ?self => CoroutineContext::get(self::CONTEXT_KEY),
+            static function (): ?self {
+                $scope = CoroutineContext::get(self::CONTEXT_KEY);
+
+                return $scope instanceof self ? $scope : null;
+            },
             static function (mixed $scope): ?Closure {
                 if (! $scope instanceof self) {
                     return null;
@@ -158,7 +162,9 @@ final class AttemptScope
      */
     public static function current(): self
     {
-        return CoroutineContext::get(self::CONTEXT_KEY) ?? self::ambient();
+        $scope = CoroutineContext::get(self::CONTEXT_KEY);
+
+        return $scope instanceof self ? $scope : self::ambient();
     }
 
     public static function ambient(): self

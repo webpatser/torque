@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Console;
 use Composer\InstalledVersions;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -114,8 +115,7 @@ final class TorqueStartCommand extends Command
             usleep(200_000);
         }
 
-        /** @var array<string, mixed> $config */
-        $config = config('torque');
+        $config = Narrow::map(config('torque'));
 
         // Apply CLI overrides.
         if ($this->option('workers') !== null) {
@@ -143,20 +143,20 @@ final class TorqueStartCommand extends Command
             $config['queues'] = ['default'];
         }
 
-        $workers = (int) ($config['workers'] ?? 4);
-        $concurrency = (int) ($config['slots_per_worker'] ?? 50);
+        $workers = Narrow::int($config['workers'] ?? null, 4);
+        $concurrency = Narrow::int($config['slots_per_worker'] ?? null, 50);
         $queues = implode(', ', $config['queues']);
 
         $version = InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev';
         $this->components->info("Torque {$version} starting with {$workers} workers x {$concurrency} coroutines");
         $this->components->info("Queues: {$queues}");
-        $redisUri = $config['redis']['uri'] ?? 'redis://127.0.0.1:6379';
+        $redisUri = Narrow::string(Narrow::map($config['redis'] ?? null)['uri'] ?? null, 'redis://127.0.0.1:6379');
         $this->components->info('Redis: '.preg_replace('/:([^@]+)@/', ':***@', $redisUri));
 
         // Serializer detection: hard error when igbinary is configured but the
         // extension is missing, gentle nudge when ext is missing under json,
         // confirmation when ext is present and configured.
-        $serializer = (string) ($config['serializer'] ?? 'json');
+        $serializer = Narrow::string($config['serializer'] ?? null, 'json');
         $hasIgbinary = extension_loaded('igbinary');
 
         if ($serializer === 'igbinary' && ! $hasIgbinary) {

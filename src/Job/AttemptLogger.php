@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Job;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Log\Logger;
 use Psr\Log\LoggerInterface;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * A log channel whose context belongs to the attempt writing to it, in a worker
@@ -47,10 +48,10 @@ final class AttemptLogger extends Logger
     {
         $ambient = AttemptScope::ambient();
 
-        $ambient->logContext[$channel] = array_merge(
-            array_diff_key($logger->context, $callersSharedContext),
+        $ambient->logContext[$channel] = Narrow::map(array_merge(
+            array_diff_key(Narrow::map($logger->context), $callersSharedContext),
             $ambient->logSharedContext ?? [],
-        );
+        ));
 
         return new self($channel, $logger->getLogger(), $logger->getEventDispatcher());
     }
@@ -64,7 +65,7 @@ final class AttemptLogger extends Logger
 
             $scope->logContext[$this->channel] = $scope === $ambient
                 ? []
-                : array_merge($ambient->logContext[$this->channel] ?? [], $scope->logSharedContext ?? []);
+                : Narrow::map(array_merge($ambient->logContext[$this->channel] ?? [], $scope->logSharedContext ?? []));
         }
 
         return $scope->logContext[$this->channel];
@@ -72,6 +73,6 @@ final class AttemptLogger extends Logger
 
     public function __set(string $name, mixed $value): void
     {
-        AttemptScope::current()->logContext[$this->channel] = $value;
+        AttemptScope::current()->logContext[$this->channel] = Narrow::map($value);
     }
 }

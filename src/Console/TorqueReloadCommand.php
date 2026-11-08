@@ -8,6 +8,7 @@ use Illuminate\Console\Command;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\DrainSettings;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -211,9 +212,9 @@ final class TorqueReloadCommand extends Command
             return self::FAILURE;
         }
 
-        $worstCase = DrainSettings::drainWorstCaseSeconds((array) config('torque'));
+        $worstCase = DrainSettings::drainWorstCaseSeconds(Narrow::map(config('torque')));
 
-        $signalSlack = max(0, (int) config('torque.intervals.reload_signal_slack_seconds', self::SIGNAL_SLACK_SECONDS));
+        $signalSlack = max(0, Narrow::int(config('torque.intervals.reload_signal_slack_seconds', self::SIGNAL_SLACK_SECONDS)));
         $window = $timeout === null ? $worstCase : $timeout + $signalSlack;
         $deadline = microtime(true) + $window;
 

@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Job;
 
 use Illuminate\Cache\MemoizedStore;
 use Illuminate\Contracts\Container\Container;
+use Webpatser\Torque\Support\Narrow;
 
 /**
  * Gives Cache::memo() one memo per attempt in a worker running concurrent jobs in
@@ -31,17 +32,26 @@ final class AttemptMemoizedCache
 
         AttemptScope::ambient()->memoizedCaches = [];
 
-        /** @var array<string, mixed> $stores */
-        $stores = $container->make('config')->get('cache.stores', []);
+        $stores = Narrow::map($container->make('config')->get('cache.stores', []));
 
         foreach (array_keys($stores) as $store) {
-            $container->bind(self::BINDING_PREFIX.$store, static function ($app) use ($store): mixed {
+            $container->bind(self::BINDING_PREFIX.$store, static function (Container $app) use ($store): mixed {
                 $scope = AttemptScope::current();
 
-                return $scope->memoizedCaches[$store] ??= $app['cache']->repository(
-                    new MemoizedStore($store, $app['cache']->store($store)),
-                    ['events' => false],
-                );
+                if (! isset($scope->memoizedCaches[$store])) {
+                    $cache = $app->make('cache');
+
+                    $scope->memoizedCaches[$store] = $cache->repository(
+                        // store() is typed as the Repository contract while MemoizedStore's
+                        // docblock asks for the concrete class. Passed as the framework's own
+                        // memo() passes it, so a contract-only store behaves as it always did.
+                        // @phpstan-ignore argument.type
+                        new MemoizedStore($store, $cache->store($store)),
+                        ['events' => false],
+                    );
+                }
+
+                return $scope->memoizedCaches[$store];
             });
         }
     }

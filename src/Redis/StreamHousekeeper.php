@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Redis;
 use Fledge\Async\Redis\RedisClient;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -94,30 +95,33 @@ final class StreamHousekeeper
         ?DeadLetterHandler $deadLetters = null,
         ?int $maxEntries = null,
     ): self {
-        $redisUri = (string) ($config['redis']['uri'] ?? 'redis://127.0.0.1:6379');
-        $prefix = (string) ($config['redis']['prefix'] ?? 'torque:');
-        $deadLetterConfig = (array) ($config['dead_letter'] ?? []);
-        $cap = $maxEntries ?? (int) ($deadLetterConfig['max_entries'] ?? 100000);
+        $redisConfig = Narrow::map($config['redis'] ?? null);
+        $redisUri = Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379');
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
+        $deadLetterConfig = Narrow::map($config['dead_letter'] ?? null);
+        $cap = $maxEntries ?? Narrow::int($deadLetterConfig['max_entries'] ?? null, 100000);
 
-        /** @var list<string> $queues */
-        $queues = array_keys((array) ($config['streams'] ?? ['default' => []]));
+        $queues = array_map(strval(...), array_keys(Narrow::map($config['streams'] ?? ['default' => []])));
 
         return new self(
             redisUri: $redisUri,
             prefix: $prefix,
-            consumerGroup: (string) ($config['consumer_group'] ?? 'torque'),
+            consumerGroup: Narrow::string($config['consumer_group'] ?? null, 'torque'),
             queues: $queues === [] ? ['default'] : $queues,
             deadLetters: $deadLetters ?? new DeadLetterHandler(
                 redisUri: $redisUri,
-                ttl: (int) ($deadLetterConfig['ttl'] ?? 604800),
+                ttl: Narrow::int($deadLetterConfig['ttl'] ?? null, 604800),
                 prefix: $prefix,
                 allowedQueues: $queues,
-                maxEntries: (int) ($deadLetterConfig['max_entries'] ?? 100000),
+                maxEntries: Narrow::int($deadLetterConfig['max_entries'] ?? null, 100000),
             ),
             maxEntries: $cap,
-            cluster: (bool) ($config['redis']['cluster'] ?? false),
-            jobStreamTtl: (int) ($config['job_events']['ttl'] ?? 300),
-            dailyRetentionDays: (int) ($config['metrics']['rollups']['daily_days'] ?? 730),
+            cluster: Narrow::bool($redisConfig['cluster'] ?? null),
+            jobStreamTtl: Narrow::int(Narrow::map($config['job_events'] ?? null)['ttl'] ?? null, 300),
+            dailyRetentionDays: Narrow::int(
+                Narrow::map(Narrow::map($config['metrics'] ?? null)['rollups'] ?? null)['daily_days'] ?? null,
+                730,
+            ),
         );
     }
 
@@ -152,7 +156,7 @@ final class StreamHousekeeper
     public function pruneDeadLetter(bool $dryRun = false): array
     {
         $key = $this->deadLetters->streamKey();
-        $before = (int) $this->redis()->execute('XLEN', $key);
+        $before = Narrow::int($this->redis()->execute('XLEN', $key));
 
         if ($dryRun) {
             return ['before' => $before, 'after' => $before];
@@ -166,7 +170,7 @@ final class StreamHousekeeper
             $this->redis()->execute('XTRIM', $key, 'MAXLEN', '~', (string) $this->maxEntries);
         }
 
-        return ['before' => $before, 'after' => (int) $this->redis()->execute('XLEN', $key)];
+        return ['before' => $before, 'after' => Narrow::int($this->redis()->execute('XLEN', $key))];
     }
 
     /**
@@ -209,19 +213,19 @@ final class StreamHousekeeper
                 continue;
             }
 
-            foreach ($consumers as $consumer) {
+            foreach (Narrow::list($consumers) as $consumer) {
                 if (! is_array($consumer)) {
                     continue;
                 }
 
-                $info = self::normalise($consumer);
+                $info = Narrow::pairs($consumer);
 
-                if ((int) ($info['pending'] ?? 1) !== 0 || (int) ($info['idle'] ?? 0) < $idleMs) {
+                if (Narrow::int($info['pending'] ?? null, 1) !== 0 || Narrow::int($info['idle'] ?? null) < $idleMs) {
                     continue;
                 }
 
                 if (! $dryRun) {
-                    $this->redis()->execute('XGROUP', 'DELCONSUMER', $streamKey, $this->consumerGroup, (string) $info['name']);
+                    $this->redis()->execute('XGROUP', 'DELCONSUMER', $streamKey, $this->consumerGroup, Narrow::string($info['name'] ?? null));
                 }
 
                 $removed[$queue]++;
@@ -259,14 +263,14 @@ final class StreamHousekeeper
                     return;
                 }
 
-                $cursor = (string) $result[0];
+                $cursor = Narrow::string($result[0] ?? null);
                 $this->redeliveryCursors[$streamKey] = $cursor;
-                $pairs = (array) ($result[1] ?? []);
+                $pairs = Narrow::list($result[1] ?? null);
                 $gone = [];
 
                 // A flat [field, value, field, value, ...] list.
                 for ($i = 0, $count = count($pairs); $i < $count; $i += 2) {
-                    $id = (string) $pairs[$i];
+                    $id = Narrow::string($pairs[$i]);
 
                     if ($this->redis()->execute('XRANGE', $streamKey, $id, $id) === []) {
                         $gone[] = $id;
@@ -375,7 +379,7 @@ final class StreamHousekeeper
                 // -1 is "no expiry": only streams from older versions. Streams
                 // with a TTL (the 7-day safety TTL set on `started`, or a
                 // terminal event's EXPIRE) expire on their own.
-                if ((int) $this->redis()->execute('TTL', $key) !== -1) {
+                if (Narrow::int($this->redis()->execute('TTL', $key)) !== -1) {
                     continue;
                 }
 
@@ -388,7 +392,8 @@ final class StreamHousekeeper
                 continue;
             }
 
-            $lastMs = (int) strtok((string) ($last[0][0] ?? '0'), '-');
+            $lastEntry = Narrow::list(Narrow::list($last)[0] ?? null);
+            $lastMs = (int) strtok(Narrow::string($lastEntry[0] ?? null, '0'), '-');
 
             if ($lastMs >= $cutoffMs) {
                 continue;
@@ -426,7 +431,7 @@ final class StreamHousekeeper
             // can hold a very large number of uuids, and the whole point of
             // this sweep is to survive that case.
             foreach ($this->scanSortedSet($indexKey) as $uuid) {
-                if ((int) $this->redis()->execute('EXISTS', $this->prefix.'job:'.$uuid) === 1) {
+                if (Narrow::int($this->redis()->execute('EXISTS', $this->prefix.'job:'.$uuid)) === 1) {
                     continue;
                 }
 
@@ -458,7 +463,7 @@ final class StreamHousekeeper
 
         foreach ($this->scan($this->prefix.'worker:*') as $key) {
             try {
-                $heartbeat = (int) $this->redis()->execute('HGET', $key, 'last_heartbeat');
+                $heartbeat = Narrow::int($this->redis()->execute('HGET', $key, 'last_heartbeat'));
             } catch (\Throwable) {
                 continue;
             }
@@ -505,12 +510,12 @@ final class StreamHousekeeper
                 return;
             }
 
-            $cursor = (string) $result[0];
-            $pairs = (array) ($result[1] ?? []);
+            $cursor = Narrow::string($result[0] ?? null);
+            $pairs = Narrow::list($result[1] ?? null);
 
             // ZSCAN replies are a flat [member, score, member, score, ...] list.
             for ($i = 0, $count = count($pairs); $i < $count; $i += 2) {
-                yield (string) $pairs[$i];
+                yield Narrow::string($pairs[$i]);
             }
         } while ($cursor !== '0');
     }
@@ -534,10 +539,10 @@ final class StreamHousekeeper
                 return;
             }
 
-            $cursor = (string) $result[0];
+            $cursor = Narrow::string($result[0] ?? null);
 
-            foreach ((array) ($result[1] ?? []) as $key) {
-                yield (string) $key;
+            foreach (Narrow::list($result[1] ?? null) as $key) {
+                yield Narrow::string($key);
             }
         } while ($cursor !== '0');
     }
@@ -587,26 +592,5 @@ final class StreamHousekeeper
     private function redis(): RedisClient
     {
         return $this->redis ??= createRedisClient($this->redisUri);
-    }
-
-    /**
-     * XINFO replies arrive as a RESP3 map (assoc) or a RESP2 flat key/value list.
-     *
-     * @param  array<int|string, mixed>  $entry
-     * @return array<int|string, mixed>
-     */
-    private static function normalise(array $entry): array
-    {
-        if (array_is_list($entry)) {
-            $assoc = [];
-
-            for ($i = 0, $n = count($entry) - 1; $i < $n; $i += 2) {
-                $assoc[(string) $entry[$i]] = $entry[$i + 1];
-            }
-
-            return $assoc;
-        }
-
-        return $entry;
     }
 }

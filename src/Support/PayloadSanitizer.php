@@ -177,7 +177,8 @@ final class PayloadSanitizer
                     : self::sanitizeMessage($rawPayload, null);
             }
 
-            $events[$index]['data'] = $data;
+            $event['data'] = $data;
+            $events[$index] = $event;
         }
 
         return $events;

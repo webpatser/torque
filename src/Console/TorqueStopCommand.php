@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
 use Webpatser\Torque\Support\DrainSettings;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -147,7 +148,7 @@ final class TorqueStopCommand extends Command
             return max(0, (int) $option);
         }
 
-        return DrainSettings::drainWorstCaseSeconds((array) config('torque'));
+        return DrainSettings::drainWorstCaseSeconds(Narrow::map(config('torque')));
     }
 
     /**

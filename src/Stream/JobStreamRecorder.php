@@ -10,6 +10,7 @@ use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Webpatser\Torque\Contracts\Silenced;
+use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
 
@@ -140,14 +141,16 @@ LUA;
      *
      * @return array{tags: list<string>, silenced: bool, failed: bool}
      */
-    private function inspect(mixed $job): array
+    private function inspect(object $job): array
     {
         $tags = [];
         $name = '';
 
         try {
-            $payload = $job->payload();
-            $name = (string) ($payload['data']['commandName'] ?? $payload['displayName'] ?? '');
+            $payload = Narrow::map(method_exists($job, 'payload')
+                ? $job->payload()
+                : throw new \BadMethodCallException('Job has no payload().'));
+            $name = Narrow::string(Narrow::map($payload['data'] ?? null)['commandName'] ?? $payload['displayName'] ?? null);
             $tags = JobTagExtractor::fromPayload($payload);
         } catch (\Throwable $e) {
             try {
@@ -158,10 +161,12 @@ LUA;
         }
 
         try {
+            $silencedTags = array_map(Narrow::string(...), Narrow::list(config('torque.silenced_tags', [])));
+
             $silenced = ($name !== '' && (
                 is_subclass_of($name, Silenced::class)
-                || in_array($name, (array) config('torque.silenced', []), true)
-            )) || array_intersect($tags, (array) config('torque.silenced_tags', [])) !== [];
+                || in_array($name, Narrow::list(config('torque.silenced', [])), true)
+            )) || array_intersect($tags, $silencedTags) !== [];
         } catch (\Throwable) {
             $silenced = false;
         }
@@ -350,8 +355,8 @@ LUA;
             ];
 
             foreach ($data as $field => $value) {
-                $args[] = $field;
-                $args[] = $value;
+                $args[] = (string) $field;
+                $args[] = Narrow::string($value);
             }
 
             $redis->execute(...$args);
@@ -389,14 +394,18 @@ LUA;
             return null;
         }
 
-        if (method_exists($job, 'uuid') && $job->uuid() !== '') {
-            return $job->uuid();
+        if (method_exists($job, 'uuid')) {
+            $uuid = $job->uuid();
+
+            if ($uuid !== '') {
+                return Narrow::nullableString($uuid);
+            }
         }
 
         if (method_exists($job, 'getJobId')) {
             $id = $job->getJobId();
 
-            return $id !== '' && $id !== null ? $id : null;
+            return $id === '' ? null : Narrow::nullableString($id);
         }
 
         return null;
