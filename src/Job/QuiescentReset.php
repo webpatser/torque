@@ -145,9 +145,11 @@ final class QuiescentReset
      * Bindings of a deferred provider that has not loaded and classes marked
      * `#[Scoped]` that nothing has resolved yet cannot be known at boot.
      *
+     * @param  list<string>  $shareable  Bindings the application declares safe to share
+     *                                   (`shared_scoped_bindings`), left out of the list.
      * @return list<string>
      */
-    public static function userScopedBindings(Container $container): array
+    public static function userScopedBindings(Container $container, array $shareable = []): array
     {
         /** @var list<string|Closure> $scoped */
         $scoped = (new ReflectionProperty(Container::class, 'scopedInstances'))->getValue($container);
@@ -156,7 +158,7 @@ final class QuiescentReset
 
         foreach ($scoped as $binding) {
             foreach ($binding instanceof Closure ? self::returnTypes($binding) : [$binding] as $name) {
-                if (! self::isFrameworkBinding($name)) {
+                if (! self::isFrameworkBinding($name) && ! in_array($name, $shareable, true)) {
                     $names[] = $name;
                 }
             }

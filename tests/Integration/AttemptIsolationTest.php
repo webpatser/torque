@@ -65,7 +65,7 @@ use function Fledge\Async\delay;
  * @param  bool  $slowReset  Whether the worker's reset closure suspends.
  * @return array{rows: list<array<string, mixed>>, children: array<string, array<string, mixed>>, output: string, records: list<array<string, mixed>>}
  */
-function torque_run_isolation_worker(array $jobs, int $concurrency, ?int $maxJobs = null, bool $slowReset = false): array
+function torque_run_isolation_worker(array $jobs, int $concurrency, ?int $maxJobs = null, bool $slowReset = false, string $sharedScopedBindings = ''): array
 {
     $redis = torqueRedis();
     $token = bin2hex(random_bytes(4));
@@ -94,7 +94,7 @@ function torque_run_isolation_worker(array $jobs, int $concurrency, ?int $maxJob
 
     try {
         $process = proc_open(
-            [PHP_BINARY, dirname(__DIR__).'/Fixtures/attempt-isolation-worker.php', torqueRedisUri(), $prefix, $group, $queueName, $logFile, (string) ($maxJobs ?? count($jobs)), (string) $concurrency, $slowReset ? '1' : '0'],
+            [PHP_BINARY, dirname(__DIR__).'/Fixtures/attempt-isolation-worker.php', torqueRedisUri(), $prefix, $group, $queueName, $logFile, (string) ($maxJobs ?? count($jobs)), (string) $concurrency, $slowReset ? '1' : '0', $sharedScopedBindings],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', $outputFile, 'a'], 2 => ['file', $outputFile, 'a']],
             $pipes,
         );
@@ -894,6 +894,21 @@ it('names the user scoped bindings in a boot WARN when slots share them', functi
         ->and($warning)->not->toContain('Illuminate\\');
 });
 
+it('leaves bindings listed in shared_scoped_bindings out of the boot WARN', function () {
+    ['output' => $output] = torque_run_isolation_worker([new ResetProbeJob('only')], concurrency: 2, sharedScopedBindings: ' isolation.named-binding ,');
+
+    $warning = collect(explode("\n", $output))->first(static fn (string $line): bool => str_contains($line, 'WARN') && str_contains($line, 'scoped bindings'));
+
+    expect($warning)->toContain(ScopedProbe::class)
+        ->and($warning)->not->toContain('isolation.named-binding');
+});
+
+it('drops the boot WARN when every user scoped binding is declared shareable', function () {
+    ['output' => $output] = torque_run_isolation_worker([new ResetProbeJob('only')], concurrency: 2, sharedScopedBindings: ScopedProbe::class.',isolation.named-binding');
+
+    expect($output)->not->toContain('scoped bindings are shared');
+});
+
 it('stays silent about scoped bindings at one slot', function () {
     ['output' => $output] = torque_sequential_reset_run();
 
@@ -915,6 +930,15 @@ it('lists only non-framework scoped bindings', function () {
         'app.report-builder',
         ResetProbeJob::class,
     ]);
+});
+
+it('leaves bindings declared shareable out of the user scoped bindings', function () {
+    $container = new Container;
+
+    $container->scoped(ScopedProbe::class);
+    $container->scoped('app.report-builder');
+
+    expect(QuiescentReset::userScopedBindings($container, ['app.report-builder']))->toBe([ScopedProbe::class]);
 });
 
 it('hydrates Context from the environment into ambient at a reset, never into a later attempt', function () {

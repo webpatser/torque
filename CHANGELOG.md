@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-09
+
+Two boot warnings can now be silenced where an app knows better.
+
+### Added
+- **`shared_scoped_bindings`** (`TORQUE_SHARED_SCOPED_BINDINGS`, comma-separated, default empty) lists scoped bindings that are safe to share between concurrent slots. They are left out of the boot WARN about shared scoped bindings; sharing and resets are unchanged. A published config without the key behaves as before.
+- **Per-stream `warn_strict_attempts`** (default true). `false` silences the `strict_attempts` WARN about a low `max_retries` on a stream whose jobs all declare their own `$tries`.
+
+### Fixed
+- The `strict_attempts` boot WARN said `max_retries is 1` for any value of 1 or lower; it now prints the configured value.
+
 ## [2.1.0] - 2026-11-08
 
 Supervisor configs now survive Deployer releases, and a low `max_retries` under `strict_attempts` is flagged at boot.

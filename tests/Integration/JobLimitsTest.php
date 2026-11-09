@@ -490,6 +490,20 @@ describe('strict_attempts', function () {
             ->and($three['output'])->not->toContain('a worker death dead-letters a job');
     });
 
+    it('on: names the actual max_retries in the boot WARN', function () {
+        $zero = torque_run_limits_worker(new JobLimitsProbeJob(tries: 1), ['max_retries' => 0], maxJobs: 1, options: ['strict_attempts' => true]);
+
+        expect($zero['output'])->toContain('strict_attempts is on and max_retries is 0,')
+            ->and($zero['output'])->not->toContain('max_retries is 1,');
+    });
+
+    it('on: a stream with warn_strict_attempts false stays quiet at max_retries 1', function () {
+        $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 1), ['max_retries' => 1, 'warn_strict_attempts' => false], maxJobs: 1, options: ['strict_attempts' => true]);
+
+        expect($run['output'])->not->toContain('a worker death dead-letters a job')
+            ->and($run['attempts'])->toBe([1]);
+    });
+
     it('on: fails a job past retryUntil without running it', function () {
         $run = torque_run_limits_worker(new JobLimitsProbeJob(tries: 5, retryUntil: time() - 10), ['max_retries' => 3], maxJobs: 1, options: ['strict_attempts' => true]);
 

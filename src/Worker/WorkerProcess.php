@@ -421,8 +421,8 @@ LUA;
             }
         });
 
-        if ($concurrency > 1 && ($shared = QuiescentReset::userScopedBindings(app())) !== []) {
-            fwrite(STDERR, "[torque:worker] WARN slots_per_worker={$concurrency}: these scoped bindings are shared by concurrent jobs and reset only when no job is in flight, which may never happen under sustained load: ".implode(', ', $shared)."\n");
+        if ($concurrency > 1 && ($shared = QuiescentReset::userScopedBindings(app(), $this->shareableScopedBindings())) !== []) {
+            fwrite(STDERR, "[torque:worker] WARN slots_per_worker={$concurrency}: these scoped bindings are shared by concurrent jobs and reset only when no job is in flight, which may never happen under sustained load: ".implode(', ', $shared).". List the ones that are safe to share in shared_scoped_bindings (TORQUE_SHARED_SCOPED_BINDINGS)\n");
         }
 
         $this->announceLimitSettings($streams);
@@ -3477,6 +3477,23 @@ LUA;
     }
 
     /**
+     * Scoped bindings the application declares safe to share between concurrent
+     * slots (`shared_scoped_bindings`), as a list or a comma-separated string.
+     *
+     * @return list<string>
+     */
+    private function shareableScopedBindings(): array
+    {
+        $value = $this->config['shared_scoped_bindings'] ?? [];
+        $names = is_string($value) ? explode(',', $value) : (is_array($value) ? $value : []);
+
+        return array_values(array_filter(
+            array_map(static fn (mixed $name): string => is_string($name) ? trim($name) : '', $names),
+            static fn (string $name): bool => $name !== '',
+        ));
+    }
+
+    /**
      * Say at boot what the limit settings leave out. Which jobs a worker will see
      * is unknown here, so this cannot name the jobs that would behave differently.
      *
@@ -3500,8 +3517,10 @@ LUA;
 
         if ($this->enforcesStrictAttempts()) {
             foreach ($streams as $name => $stream) {
-                if (Narrow::int($stream['max_retries'] ?? null, 3) <= 1) {
-                    fwrite(STDERR, "[torque:worker] WARN stream {$name}: strict_attempts is on and max_retries is 1, so a worker death dead-letters a job that does not declare its own \$tries (redelivery_limit) with no re-run. Raise max_retries or set TORQUE_STRICT_ATTEMPTS=false\n");
+                $maxRetries = Narrow::int($stream['max_retries'] ?? null, 3);
+
+                if ($maxRetries <= 1 && ($stream['warn_strict_attempts'] ?? true) !== false) {
+                    fwrite(STDERR, "[torque:worker] WARN stream {$name}: strict_attempts is on and max_retries is {$maxRetries}, so a worker death dead-letters a job that does not declare its own \$tries (redelivery_limit) with no re-run. Raise max_retries, set TORQUE_STRICT_ATTEMPTS=false, or set the stream's warn_strict_attempts to false when all its jobs declare \$tries\n");
                 }
             }
         } else {

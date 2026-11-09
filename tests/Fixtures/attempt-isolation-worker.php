@@ -32,6 +32,7 @@ use function Fledge\Async\delay;
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 
 [, $redisUri, $prefix, $group, $queue, $logFile, $maxJobs, $concurrency, $slowReset] = $argv;
+$sharedScopedBindings = $argv[9] ?? '';
 
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
@@ -101,6 +102,7 @@ if ($slowReset === '1') {
     'queues' => [$queue],
     'streams' => [$queue => ['max_retries' => 1, 'retry_after' => 90]],
     'slots_per_worker' => (int) $concurrency,
+    'shared_scoped_bindings' => $sharedScopedBindings,
     'poll_interval_ms' => 100,
     'max_jobs_per_worker' => (int) $maxJobs,
     'max_worker_lifetime' => 60,

@@ -209,7 +209,7 @@ One gap: `Auth::setUser()` from a raw Fiber, an `EventLoop::delay()` callback, o
 
 - The locale (`app()->setLocale()`), `config()->set()` and the default DB connection.
 - Transactions on a shared connection: a `DB::beginTransaction()` in one job is visible to every job using that connection. Use a pool per job (`MysqlPool`) or keep transactions out of async handlers.
-- User scoped bindings. The stock reset closure that drops scoped instances runs when a job starts and nothing else is in flight. At one slot that is every job; at more than one it happens only in quiet moments and may never happen under sustained load. At more than one slot the worker logs a boot WARN naming the scoped bindings that stay shared. Resolve per-job state inside the job instead of at boot.
+- User scoped bindings. The stock reset closure that drops scoped instances runs when a job starts and nothing else is in flight. At one slot that is every job; at more than one it happens only in quiet moments and may never happen under sustained load. At more than one slot the worker logs a boot WARN naming the scoped bindings that stay shared. Resolve per-job state inside the job instead of at boot. Bindings you know are safe to share (stateless services) go in `shared_scoped_bindings` (`TORQUE_SHARED_SCOPED_BINDINGS`, comma-separated) and are left out of that WARN; they are still shared.
 - Services that captured the log manager, the auth manager or a guard during boot (mail log transports, for example), and objects nested inside a custom guard.
 - `Cache::memo()` for a store added after boot, and the `image` binding.
 - `Auth::shouldUse()`.
@@ -241,7 +241,7 @@ Timeouts are on by default (`timeouts.enabled`, `TORQUE_TIMEOUTS`). They only li
 
 ### Strict attempts and redelivery counting
 
-With `strict_attempts` (`TORQUE_STRICT_ATTEMPTS`, on by default) a job is checked against its tries and `retryUntil` before it runs, and a delivery after the first counts against `$tries` or the stream's `max_retries`. A job that keeps killing its worker then reaches the dead-letter stream with `reason=redelivery_limit` instead of looping.
+With `strict_attempts` (`TORQUE_STRICT_ATTEMPTS`, on by default) a job is checked against its tries and `retryUntil` before it runs, and a delivery after the first counts against `$tries` or the stream's `max_retries`. A job that keeps killing its worker then reaches the dead-letter stream with `reason=redelivery_limit` instead of looping. A worker logs a boot WARN for every stream whose `max_retries` is 1 or lower under `strict_attempts`, since a worker death then dead-letters a job that does not declare its own `$tries`. Set `'warn_strict_attempts' => false` on a stream whose jobs all declare `$tries` to silence it.
 
 Counted as a redelivery:
 
@@ -393,6 +393,7 @@ All options are in `config/torque.php`. Key settings:
 | `force` | false | Keep processing during `artisan down`, like `queue:work --force`. Off, slots stop polling and claiming while the app is down; in-flight jobs finish and jobs wait in the stream |
 | `honour_job_limits` | true | `true`: a job's `retryUntil`, `$tries`, `maxExceptions` and `$backoff` win over the stream's `max_retries` and `backoff`. `false`: kill switch, only `max_retries` and 2**attempts count, for every job, with no release limit (`TORQUE_HONOUR_JOB_LIMITS`; the old `TORQUE_JOB_LIMITS=stream` still maps to false) |
 | `strict_attempts` | true | Also check tries and `retryUntil` before a job runs, as `queue:work` does, and count redeliveries (`TORQUE_STRICT_ATTEMPTS`). Self-releases from `RateLimited`, `WithoutOverlapping` or `release()` do not use up tries; they count against `release_limit_seconds` |
+| `shared_scoped_bindings` | `[]` | Scoped bindings that are safe to share between concurrent slots, left out of the boot WARN about shared scoped bindings (`TORQUE_SHARED_SCOPED_BINDINGS`, comma-separated). Sharing and resets are unchanged |
 | `release_limit_seconds` | 86400 | Seconds a job may keep calling `release()`, from its first release; past it the job dead-letters with reason `release_limit`. `0` is off; a stream can override it; `retryUntil` replaces it and `$tries = 0` opts out (`TORQUE_RELEASE_LIMIT`) |
 | `timeouts.enabled` | true | Enforce `$job->timeout() ?? stream timeout` for jobs that declare one (`TORQUE_TIMEOUTS`). A timeout rotates the whole worker; see Timeouts |
 | `timeouts.release_delay_seconds` | 10 | Minimum delay when a timed-out job is released |

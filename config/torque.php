@@ -234,6 +234,11 @@ return [
     | `timeout` is the seconds a job that declares none may run (see `timeouts`
     | below). Keep it below `retry_after`, or another worker can steal the job
     | while it still runs. The worker logs a WARN at boot if it is not.
+    |
+    | Optional per-stream `warn_strict_attempts` (default true): false silences
+    | the boot WARN about `max_retries` 1 or lower under `strict_attempts`. Set
+    | it only on a stream whose jobs all declare their own `$tries`, since the
+    | worker cannot see a stream's job classes at boot.
     */
     'streams' => [
         env('TORQUE_QUEUE', 'default') => [
@@ -282,6 +287,20 @@ return [
     | in `max_retries` or turn strict attempts off.
     */
     'strict_attempts' => (bool) env('TORQUE_STRICT_ATTEMPTS', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Shared scoped bindings
+    |--------------------------------------------------------------------------
+    | With more than one slot per worker, scoped bindings of the application
+    | and its packages are shared by concurrent jobs and reset only when no job
+    | is in flight, and each worker logs a boot WARN naming them. List here the
+    | bindings (abstract names or class names) that are safe to share, such as
+    | stateless services, to leave them out of that WARN. Nothing else changes:
+    | they are still shared and reset as before. The env var takes a
+    | comma-separated list.
+    */
+    'shared_scoped_bindings' => array_values(array_filter(array_map('trim', explode(',', (string) env('TORQUE_SHARED_SCOPED_BINDINGS', ''))))),
 
     /*
     |--------------------------------------------------------------------------
