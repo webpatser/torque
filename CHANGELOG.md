@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-11
+
 ### Parity
 - Reviewed Horizon v5.51.0 and the unreleased 5.x branch through 2026-11-11; nothing to port (security policy, dashboard asset and dependency floor bumps). Framework v13.42.0 BeanstalkdJob change is docblock only.
 
@@ -828,7 +830,9 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/webpatser/torque/compare/v2.2.0...v2.2.1
+[2.2.0]: https://github.com/webpatser/torque/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/webpatser/torque/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/webpatser/torque/compare/v1.4.1...v2.0.0
 [1.4.1]: https://github.com/webpatser/torque/compare/v1.4.0...v1.4.1
