@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Parity
+- Reviewed Horizon v5.51.0 and the unreleased 5.x branch through 2026-11-11; nothing to port (security policy, dashboard asset and dependency floor bumps). Framework v13.42.0 BeanstalkdJob change is docblock only.
+
 ## [2.2.0] - 2026-11-09
 
 Two boot warnings can now be silenced where an app knows better.
