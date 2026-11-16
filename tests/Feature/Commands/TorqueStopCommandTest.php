@@ -2,7 +2,12 @@
 
 declare(strict_types=1);
 
+use Webpatser\Torque\Console\TorqueStopCommand;
+use Webpatser\Torque\Support\ProcessInspector;
+
 afterEach(function () {
+    TorqueStopCommand::$commandLineReader = null;
+
     // Clean up any PID files created during tests.
     $pidFile = storage_path('torque.pid');
 
@@ -70,6 +75,104 @@ it('cleans up PID file with non-numeric content', function () {
         ->assertSuccessful();
 
     expect(file_exists($pidFile))->toBeFalse();
+});
+
+/*
+ * A stale PID file whose number was recycled by an unrelated live process
+ * must never lead to a group signal. The test process itself stands in for
+ * that unrelated process: before the fix the command would SIGTERM the test
+ * runner's own process group.
+ */
+
+it('refuses to signal a live PID that is not a Torque master', function () {
+    // If this runner's own argv mentions torque:start (a --filter value, for
+    // instance) the command would rightly treat it as a master and SIGKILL
+    // the test process group.
+    if (str_contains((string) ProcessInspector::commandLine(getmypid()), 'torque:start')) {
+        $this->markTestSkipped('The test process command line contains torque:start.');
+    }
+
+    $pidFile = storage_path('torque.pid');
+    file_put_contents($pidFile, (string) getmypid());
+
+    $this->artisan('torque:stop', ['--force' => true])
+        ->assertFailed()
+        ->expectsOutputToContain('is not a Torque master');
+
+    // Reaching this line at all means no SIGKILL hit our group; the file
+    // is left for its owner, as readers never unlink a live entry.
+    expect(file_exists($pidFile))->toBeTrue()
+        ->and((int) file_get_contents($pidFile))->toBe(getmypid());
+});
+
+/*
+ * An unreadable command line (a transient ps fork/exec failure, say) on a
+ * live process is not proof of anything: it must neither allow a signal nor
+ * count as "the master exited". The deaf master ignores SIGTERM, so it is
+ * still alive when the reader starts failing after the two pre-signal checks.
+ */
+
+it('does not report a live but unreadable master as stopped', function () {
+    $pid = spawnDeafTorqueMaster(60, [SIGTERM]);
+    $pidFile = storage_path('torque.pid');
+    file_put_contents($pidFile, (string) $pid);
+
+    $calls = 0;
+    TorqueStopCommand::$commandLineReader = function (int $target) use (&$calls): ?string {
+        return ++$calls <= 2 ? ProcessInspector::commandLine($target) : null;
+    };
+
+    try {
+        $this->artisan('torque:stop', ['--timeout' => 1])
+            ->assertFailed()
+            ->doesntExpectOutputToContain('stopped')
+            ->expectsOutputToContain('could not be read');
+
+        expect(ProcessInspector::isAlive($pid))->toBeTrue()
+            ->and(file_exists($pidFile))->toBeTrue()
+            ->and((int) file_get_contents($pidFile))->toBe($pid);
+    } finally {
+        posix_kill($pid, SIGKILL);
+        pcntl_waitpid($pid, $status);
+    }
+});
+
+it('refuses to signal a live PID whose command line cannot be read', function () {
+    $pid = spawnDeafTorqueMaster(60, [SIGTERM]);
+    $pidFile = storage_path('torque.pid');
+    file_put_contents($pidFile, (string) $pid);
+
+    TorqueStopCommand::$commandLineReader = fn (int $target): ?string => null;
+
+    try {
+        $this->artisan('torque:stop', ['--force' => true])
+            ->assertFailed()
+            ->expectsOutputToContain('could not be read');
+
+        expect(ProcessInspector::isAlive($pid))->toBeTrue()
+            ->and(file_exists($pidFile))->toBeTrue();
+    } finally {
+        posix_kill($pid, SIGKILL);
+        pcntl_waitpid($pid, $status);
+    }
+});
+
+it('refuses to follow a symlinked PID file', function () {
+    $pidFile = storage_path('torque.pid');
+    $target = tempnam(sys_get_temp_dir(), 'torque-pid-target-');
+    file_put_contents($target, (string) getmypid());
+    symlink($target, $pidFile);
+
+    try {
+        $this->artisan('torque:stop')
+            ->assertFailed()
+            ->expectsOutputToContain('symlink');
+
+        expect(is_link($pidFile))->toBeTrue();
+    } finally {
+        @unlink($pidFile);
+        @unlink($target);
+    }
 });
 
 /*

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
@@ -33,10 +34,34 @@ final class TorqueStopCommand extends Command
      */
     private const int POLL_INTERVAL = 100_000;
 
+    private const int MASTER = 1;
+
+    private const int NOT_MASTER = 2;
+
+    private const int UNIDENTIFIED = 3;
+
+    /**
+     * Test seam: replaces ProcessInspector::commandLine() for the master
+     * check, so a test can simulate a transient read failure.
+     *
+     * @internal
+     *
+     * @var (\Closure(int): ?string)|null
+     */
+    public static ?\Closure $commandLineReader = null;
+
     public function handle(): int
     {
-        $pidFile = storage_path('torque.pid');
+        $pidFile = MasterProcess::pidFilePath();
         $pid = null;
+
+        if (is_link($pidFile)) {
+            // Same guard as MasterProcess::readPid(): a symlinked PID file is
+            // not ours to trust or to delete.
+            $this->components->error("PID file {$pidFile} is a symlink. Refusing to read or signal it.");
+
+            return self::FAILURE;
+        }
 
         if (file_exists($pidFile)) {
             $pid = (int) trim((string) file_get_contents($pidFile));
@@ -45,10 +70,30 @@ final class TorqueStopCommand extends Command
                 $this->components->warn('PID file exists but contains an invalid PID. Cleaning up.');
                 $this->removePidFile($pidFile);
                 $pid = null;
-            } elseif (! posix_kill($pid, 0)) {
+            } elseif (! ProcessInspector::isAlive($pid)) {
                 $this->components->warn("Process {$pid} is not running. Cleaning up stale PID file and orphans.");
-                $this->removePidFile($pidFile);
+                $this->removePidFile($pidFile, $pid);
                 $pid = null;
+            } else {
+                $state = $this->masterState($pid);
+
+                if ($state === self::NOT_MASTER) {
+                    // A live PID that is not a Torque master is a recycled number
+                    // (stale file after a crash or container restart). Signalling
+                    // its group would hit an unrelated process; unlinking the file
+                    // could race a new master's rename during a takeover.
+                    $this->components->error(
+                        "Process {$pid} from the PID file is alive but is not a Torque master. Not signalling it and leaving the PID file in place.",
+                    );
+
+                    return self::FAILURE;
+                }
+
+                if ($state === self::UNIDENTIFIED) {
+                    $this->reportUnidentified($pid);
+
+                    return self::FAILURE;
+                }
             }
         }
 
@@ -69,12 +114,24 @@ final class TorqueStopCommand extends Command
         if ($this->option('force')) {
             $this->components->info("Sending SIGKILL to Torque process group (PID {$pid})...");
 
-            // Kill the entire process group in one shot — master + all forked workers.
+            // Kill the entire process group in one shot: master + all forked workers.
             // Must kill the group BEFORE the leader, otherwise -pid may fail.
-            $this->killProcessGroup($pid);
+            $state = $this->killProcessGroup($pid);
+
+            if ($state === self::UNIDENTIFIED) {
+                $this->reportUnidentified($pid);
+
+                return self::FAILURE;
+            }
+
+            if ($state === self::NOT_MASTER) {
+                $this->components->warn("Process {$pid} is no longer a Torque master. Nothing signalled.");
+
+                return self::SUCCESS;
+            }
 
             usleep(self::POLL_INTERVAL);
-            $this->removePidFile($pidFile);
+            $this->removePidFile($pidFile, $pid);
             $this->components->info('Torque master and workers killed.');
 
             return self::SUCCESS;
@@ -83,7 +140,22 @@ final class TorqueStopCommand extends Command
         $this->components->info("Sending SIGTERM to Torque process group (PID {$pid})...");
 
         // Send SIGTERM to the entire process group so both master and workers
-        // begin graceful shutdown simultaneously.
+        // begin graceful shutdown simultaneously. Re-verify first: the master
+        // may have exited (and its PID been reused) since the check above.
+        $state = $this->masterState($pid);
+
+        if ($state === self::UNIDENTIFIED) {
+            $this->reportUnidentified($pid);
+
+            return self::FAILURE;
+        }
+
+        if ($state === self::NOT_MASTER) {
+            $this->components->warn("Process {$pid} is no longer a Torque master. Nothing signalled.");
+
+            return self::SUCCESS;
+        }
+
         if (! posix_kill(-$pid, SIGTERM)) {
             // Fallback: if process group kill fails, try the master directly.
             if (! posix_kill($pid, SIGTERM)) {
@@ -107,9 +179,12 @@ final class TorqueStopCommand extends Command
         $maxWait = $gracefulTimeout * 1_000_000;
 
         while ($waited < $maxWait) {
-            // posix_kill with signal 0 returns false when the process no longer exists.
-            if (! ProcessInspector::isAlive($pid)) {
-                $this->removePidFile($pidFile);
+            // Gone, or the PID now belongs to something else: either way the
+            // master we signalled has exited. A live process whose command
+            // line cannot be read right now (e.g. a transient ps failure) is
+            // not proof of exit, so keep waiting.
+            if ($this->masterState($pid) === self::NOT_MASTER) {
+                $this->removePidFile($pidFile, $pid);
                 $this->components->info('Torque master stopped gracefully.');
 
                 return self::SUCCESS;
@@ -124,12 +199,62 @@ final class TorqueStopCommand extends Command
             "Graceful shutdown timed out after {$gracefulTimeout} seconds. Sending SIGKILL...",
         );
 
-        $this->killProcessGroup($pid);
+        $state = $this->killProcessGroup($pid);
+
+        if ($state === self::UNIDENTIFIED) {
+            $this->reportUnidentified($pid);
+
+            return self::FAILURE;
+        }
+
+        if ($state === self::NOT_MASTER) {
+            $this->removePidFile($pidFile, $pid);
+            $this->components->info('Torque master stopped before the deadline check.');
+
+            return self::SUCCESS;
+        }
+
         usleep(self::POLL_INTERVAL);
-        $this->removePidFile($pidFile);
+        $this->removePidFile($pidFile, $pid);
         $this->components->info('Torque master and workers killed.');
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Classify the PID: verified master, verified not a master (or dead), or
+     * alive but unidentifiable.
+     *
+     * Stricter than ProcessInspector::isTorqueMaster(), which treats an
+     * unreadable command line as a master so liveness callers stay
+     * conservative. Here an unreadable command line is its own state: it
+     * never allows a group SIGTERM/SIGKILL, and it never counts as proof
+     * that the master exited.
+     *
+     * @return self::MASTER|self::NOT_MASTER|self::UNIDENTIFIED
+     */
+    private function masterState(int $pid): int
+    {
+        if (! ProcessInspector::isAlive($pid)) {
+            return self::NOT_MASTER;
+        }
+
+        $cmdline = self::$commandLineReader !== null
+            ? (self::$commandLineReader)($pid)
+            : ProcessInspector::commandLine($pid);
+
+        if ($cmdline === null) {
+            return self::UNIDENTIFIED;
+        }
+
+        return str_contains($cmdline, 'torque:start') ? self::MASTER : self::NOT_MASTER;
+    }
+
+    private function reportUnidentified(int $pid): void
+    {
+        $this->components->error(
+            "Process {$pid} is alive but its command line could not be read. Not signalling it and leaving the PID file in place.",
+        );
     }
 
     /**
@@ -153,12 +278,22 @@ final class TorqueStopCommand extends Command
 
     /**
      * Remove the PID file from storage.
+     *
+     * With an expected PID, the file is only removed while it still holds
+     * that PID, so a replacement master that renamed its own PID file into
+     * place during a takeover keeps its entry.
      */
-    private function removePidFile(string $path): void
+    private function removePidFile(string $path, ?int $expectedPid = null): void
     {
-        if (file_exists($path)) {
-            unlink($path);
+        if (! file_exists($path) || is_link($path)) {
+            return;
         }
+
+        if ($expectedPid !== null && (int) trim((string) @file_get_contents($path)) !== $expectedPid) {
+            return;
+        }
+
+        @unlink($path);
     }
 
     /**
@@ -193,11 +328,21 @@ final class TorqueStopCommand extends Command
      * Kill the process group led by the given PID.
      *
      * Workers forked from the master share its PGID, so killing the
-     * group ensures no orphans survive after a force-kill.
+     * group ensures no orphans survive after a force-kill. Re-verifies the
+     * PID immediately before signalling and only sends when it is a
+     * verified master. Returns the state it observed.
+     *
+     * @return self::MASTER|self::NOT_MASTER|self::UNIDENTIFIED
      */
-    private function killProcessGroup(int $pid): void
+    private function killProcessGroup(int $pid): int
     {
-        // Negative PID = send signal to entire process group.
-        posix_kill(-$pid, SIGKILL);
+        $state = $this->masterState($pid);
+
+        if ($state === self::MASTER) {
+            // Negative PID = send signal to entire process group.
+            posix_kill(-$pid, SIGKILL);
+        }
+
+        return $state;
     }
 }
