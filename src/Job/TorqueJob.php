@@ -31,7 +31,9 @@ use Webpatser\Torque\Pool\RedisPool;
  *         public function __construct(
  *             private readonly string $url,
  *             private readonly string $payload,
- *         ) {}
+ *         ) {
+ *             parent::__construct();
+ *         }
  *
  *         public function handle(HttpPool $http, RedisPool $redis): void
  *         {
@@ -43,6 +45,10 @@ use Webpatser\Torque\Pool\RedisPool;
  *             ));
  *         }
  *     }
+ *
+ * Subclasses that declare their own constructor must call
+ * `parent::__construct()` (or `$this->onConnection('torque')`) so the
+ * default connection is kept.
  *
  * Available pools (registered as singletons by TorqueServiceProvider):
  *
@@ -58,10 +64,14 @@ abstract class TorqueJob implements ShouldQueue
     use SerializesModels;
 
     /**
-     * The queue connection this job should be dispatched to.
+     * Default the queue connection to "torque" so the job is handled by the
+     * Torque worker with its fiber-based concurrency and async pool injection.
      *
-     * Defaults to "torque" so the job is handled by the Torque worker
-     * with its fiber-based concurrency and async pool injection.
+     * The Queueable trait declares an untyped $connection, so the default is
+     * applied here instead of through a typed property override.
      */
-    public string $connection = 'torque';
+    public function __construct()
+    {
+        $this->onConnection('torque');
+    }
 }
