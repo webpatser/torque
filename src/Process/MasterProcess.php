@@ -384,6 +384,16 @@ LUA;
         }
 
         if ($pid === 0) {
+            // The signal mask and ignored dispositions survive fork and exec. The master
+            // blocks SIGTERM/SIGINT/SIGUSR2/SIGCHLD for sigtimedwait, so clear them or the
+            // worker never sees a stop signal. Reset the handlers first: a signal pending
+            // while the mask is cleared would otherwise reach the master's PHP handler and
+            // be lost at exec.
+            foreach ([SIGTERM, SIGINT, SIGUSR2, SIGCHLD] as $signal) {
+                pcntl_signal($signal, SIG_DFL);
+            }
+            pcntl_sigprocmask(SIG_SETMASK, []);
+
             // Child: immediately replace process image with a fresh PHP process.
             // This avoids inheriting any Fiber/Revolt/Redis state from the parent.
             $queues = implode(',', array_map(Narrow::string(...), (array) ($this->config['queues'] ?? ['default'])));
