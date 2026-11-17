@@ -129,6 +129,8 @@ class IndexDocument extends TorqueJob
 }
 ```
 
+The `torque` connection comes from a `#[Connection]` attribute on `TorqueJob`, so a subclass declares its own constructor like any Laravel job, with no `parent::__construct()` call. An explicit `onConnection()` still wins.
+
 ### Working with databases (avoid the Eloquent trap)
 
 > [!WARNING]
@@ -350,7 +352,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | Command | Description |
 |---------|-------------|
 | `torque:start` | Start the master + worker processes |
-| `torque:stop` | Graceful shutdown (SIGTERM). Use `--force` for SIGKILL |
+| `torque:stop` | Graceful shutdown (SIGTERM). Use `--force` for SIGKILL. Like Horizon's `horizon:terminate`, it exits 0 when no master is running, also on a stale PID file whose number now belongs to an unrelated process (warned, not signalled, file left in place, orphaned workers swept). Exits 1 on a symlinked PID file or a live process whose command line cannot be read, or when SIGTERM cannot be sent |
 | `torque:status` | Show worker metrics, throughput, and queue depths |
 | `torque:monitor` | Live htop-style terminal dashboard |
 | `torque:tail` | Tail a job's event stream in real-time |
@@ -753,7 +755,7 @@ Mutual exclusion between masters is a lifetime `flock` on `storage/torque.lock` 
 
 ### Containerized deployment
 
-When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master, via `/proc/<pid>/cmdline` on Linux, `ps` elsewhere, so a stale PID file left by a previous container reads as "not running", even when its number has since been recycled by an unrelated process. Readers never delete the file (that would race a takeover's atomic rename); the next master simply overwrites it at boot. No manual `rm storage/torque.pid` is needed between restarts.
+When `storage/` is a bind mount or persistent volume, `storage/torque.pid` outlives the container. `torque:start` verifies the recorded PID actually belongs to a running Torque master, via `/proc/<pid>/cmdline` on Linux, `ps` elsewhere, so a stale PID file left by a previous container reads as "not running", even when its number has since been recycled by an unrelated process. Readers never delete the file (that would race a takeover's atomic rename); the next master simply overwrites it at boot. No manual `rm storage/torque.pid` is needed between restarts. `torque:stop` treats such a file the same way: it warns, signals nothing, keeps the file, sweeps orphaned `torque:worker` processes and exits 0, so a deploy script does not fail on a stale PID file.
 
 ## Performance
 

@@ -8,9 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- `TorqueJob` no longer fatals on load: the typed `$connection` property clashed with `Queueable`. The `torque` connection is now set in the constructor; subclasses with their own constructor must call `parent::__construct()`.
+- `TorqueJob` no longer fatals on load: the typed `$connection` property clashed with `Queueable`. The `torque` connection now comes from a `#[Connection]` class attribute, so subclasses declare their own constructor without calling `parent::__construct()`; an explicit `onConnection()` still wins.
 - Workers forked by the master start with an empty signal mask and default handlers, so respawned and scaled-up workers react to SIGTERM, SIGINT and SIGUSR2 again.
 - `torque:stop` verifies that the PID in the PID file is a Torque master before every signal. A live non-master PID, a symlinked PID file or an unreadable process is reported and left alone, and the PID file is only removed when it still holds the stopped PID.
+- `torque:stop` on a stale PID file whose number now belongs to a live non-master process warns, keeps the file, sweeps orphaned workers and exits 0 instead of 1, like `horizon:terminate` when nothing runs. A symlinked PID file or an unreadable process still exits 1.
 
 ## [2.2.1] - 2026-11-11
 

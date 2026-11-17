@@ -191,7 +191,7 @@ Concepts and commands, from Laravel's Horizon documentation:
 | `horizon` | `torque:start` |
 | `horizon:status` | `torque:status`, `torque:monitor` for a live view |
 | `horizon:pause` / `horizon:continue` | `torque:pause` / `torque:pause continue` |
-| `horizon:terminate` | `torque:stop` (graceful), `torque:reload` (zero-downtime takeover) |
+| `horizon:terminate` | `torque:stop` (graceful), `torque:reload` (zero-downtime takeover). Like `horizon:terminate`, `torque:stop` exits 0 when no master runs, including a stale PID file whose number was recycled by another process |
 | `horizon:forget {id} --all` | `torque:forget {id?} {--all} {--queue=} {--force}` |
 | `horizon:clear` | `queue:clear` |
 | `horizon:supervisor` | None; one master runs the whole fleet. `torque:supervisor` generates a Supervisor config for the master |
@@ -205,7 +205,7 @@ Concepts and commands, from Laravel's Horizon documentation:
 | Tags, `silenced`, long-wait `waits` | Tags, `silenced`, `silenced_tags` and `waits`, since 1.4.0 |
 | Environments | `env()` in `config/torque.php` and `prefix`; see "Not planned" in the README |
 
-Jobs need no change. Torque is a queue connection (`QUEUE_CONNECTION=torque`), so dispatching, batches and chains work as before. Blocking calls in a handler stall every job on that worker: see the README's section on databases.
+Jobs need no change. Torque is a queue connection (`QUEUE_CONNECTION=torque`), so dispatching, batches and chains work as before. A job that extends `TorqueJob` for the async pools keeps its own constructor as written: the `torque` connection comes from a `#[Connection]` attribute, so no `parent::__construct()` call is needed. Blocking calls in a handler stall every job on that worker: see the README's section on databases.
 
 ## 0.18.x to 1.0.0
 
