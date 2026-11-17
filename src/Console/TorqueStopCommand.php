@@ -50,6 +50,16 @@ final class TorqueStopCommand extends Command
      */
     public static ?\Closure $commandLineReader = null;
 
+    /**
+     * Test seam: replaces the pgrep scan for torque:worker PIDs in the
+     * orphan sweep, so a test never signals real processes on the host.
+     *
+     * @internal
+     *
+     * @var (\Closure(): list<string>)|null
+     */
+    public static ?\Closure $workerPidLister = null;
+
     public function handle(): int
     {
         $pidFile = MasterProcess::pidFilePath();
@@ -81,12 +91,16 @@ final class TorqueStopCommand extends Command
                     // A live PID that is not a Torque master is a recycled number
                     // (stale file after a crash or container restart). Signalling
                     // its group would hit an unrelated process; unlinking the file
-                    // could race a new master's rename during a takeover.
-                    $this->components->error(
+                    // could race a new master's rename during a takeover. No
+                    // master is running, so like horizon:terminate this is a
+                    // success: a deploy must not fail on a stale file.
+                    $this->components->warn(
                         "Process {$pid} from the PID file is alive but is not a Torque master. Not signalling it and leaving the PID file in place.",
                     );
+                    $this->killOrphanWorkers();
+                    $this->components->info('No running Torque master found.');
 
-                    return self::FAILURE;
+                    return self::SUCCESS;
                 }
 
                 if ($state === self::UNIDENTIFIED) {
@@ -307,7 +321,12 @@ final class TorqueStopCommand extends Command
     private function killOrphanWorkers(): void
     {
         $output = [];
-        exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $output);
+
+        if (self::$workerPidLister !== null) {
+            $output = (self::$workerPidLister)();
+        } else {
+            exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $output);
+        }
 
         foreach ($output as $line) {
             $pid = (int) trim($line);

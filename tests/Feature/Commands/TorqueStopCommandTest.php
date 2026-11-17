@@ -5,8 +5,15 @@ declare(strict_types=1);
 use Webpatser\Torque\Console\TorqueStopCommand;
 use Webpatser\Torque\Support\ProcessInspector;
 
+beforeEach(function () {
+    // The orphan sweep SIGKILLs any `artisan torque:worker` whose parent is
+    // not a master, so a real pgrep scan could hit workers on this host.
+    TorqueStopCommand::$workerPidLister = fn (): array => [];
+});
+
 afterEach(function () {
     TorqueStopCommand::$commandLineReader = null;
+    TorqueStopCommand::$workerPidLister = null;
 
     // Clean up any PID files created during tests.
     $pidFile = storage_path('torque.pid');
@@ -95,14 +102,26 @@ it('refuses to signal a live PID that is not a Torque master', function () {
     $pidFile = storage_path('torque.pid');
     file_put_contents($pidFile, (string) getmypid());
 
+    $swept = false;
+    TorqueStopCommand::$workerPidLister = function () use (&$swept): array {
+        $swept = true;
+
+        return [];
+    };
+
+    // No master is running, so like horizon:terminate this is a success:
+    // a deploy must not fail on a stale PID file.
     $this->artisan('torque:stop', ['--force' => true])
-        ->assertFailed()
-        ->expectsOutputToContain('is not a Torque master');
+        ->assertSuccessful()
+        ->expectsOutputToContain('is not a Torque master')
+        ->expectsOutputToContain('No running Torque master found');
 
     // Reaching this line at all means no SIGKILL hit our group; the file
-    // is left for its owner, as readers never unlink a live entry.
+    // is left for its owner, as readers never unlink a live entry. The
+    // orphan sweep still ran.
     expect(file_exists($pidFile))->toBeTrue()
-        ->and((int) file_get_contents($pidFile))->toBe(getmypid());
+        ->and((int) file_get_contents($pidFile))->toBe(getmypid())
+        ->and($swept)->toBeTrue();
 });
 
 /*
