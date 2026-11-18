@@ -170,6 +170,14 @@ LUA;
     private array $countedRedeliveries = [];
 
     /**
+     * The payload array of the job push() is creating, so its queued event
+     * reads the array instead of decoding the encoded string again.
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $createdPayload = null;
+
+    /**
      * Lua script reading the depths of one queue in a single round trip.
      *
      * KEYS[1] = stream key, KEYS[2] = delayed sorted set key
@@ -439,15 +447,42 @@ LUA;
     #[\Override]
     public function push($job, $data = '', $queue = null): ?string
     {
+        $this->createdPayload = null;
+        $payload = $this->createPayload($job, $this->getQueue($queue), $data);
+
+        // Read straight after createPayload, before anything can suspend, so the
+        // payload is this job's and the queued event needs no decode.
+        $created = $this->createdPayload;
+        $this->createdPayload = null;
+
         return Narrow::nullableString($this->enqueueUsing(
             $job,
-            $this->createPayload($job, $this->getQueue($queue), $data),
+            $payload,
             // Laravel's own RedisQueue passes the raw (possibly enum) queue
             // here too; only enqueueUsing()'s PHPDoc still says string|null.
             $queue, // @phpstan-ignore argument.type
             null,
-            fn (string $payload, \UnitEnum|string|null $queue) => $this->pushRaw($payload, $queue),
+            fn (string $payload, \UnitEnum|string|null $queue) => $this->pushPayload($payload, $queue, $created),
         ));
+    }
+
+    /**
+     * Keep the payload array push() is building, for its queued event.
+     *
+     * @param  object|string  $job
+     * @param  string  $queue
+     * @param  mixed  $data
+     * @return array<string, mixed>
+     */
+    #[\Override]
+    protected function createPayloadArray($job, $queue, $data = '')
+    {
+        /** @var array<string, mixed> $payload */
+        $payload = parent::createPayloadArray($job, $queue, $data);
+
+        $this->createdPayload = $payload;
+
+        return $payload;
     }
 
     /**
@@ -460,6 +495,16 @@ LUA;
      */
     #[\Override]
     public function pushRaw($payload, $queue = null, array $options = []): string
+    {
+        return $this->pushPayload($payload, $queue, null);
+    }
+
+    /**
+     * XADD a payload and record its queued event.
+     *
+     * @param  array<string, mixed>|null  $decoded  The payload as an array when the caller has it, null to decode.
+     */
+    private function pushPayload(string $payload, \UnitEnum|string|null $queue, ?array $decoded): string
     {
         // Laravel's Queue::createPayload always emits JSON. When the configured
         // serializer is igbinary we transcode here so the on-the-wire format
@@ -474,18 +519,20 @@ LUA;
             $payload,
         );
 
-        $this->recordQueued($payload, $queue);
+        $this->recordQueued($payload, $queue, $decoded);
 
         return Narrow::string($messageId);
     }
 
     /**
      * Record the "queued" event to the per-job stream.
+     *
+     * @param  array<string, mixed>|null  $decoded  The payload as an array, null to decode it from `$payload`.
      */
-    private function recordQueued(string $payload, \UnitEnum|string|null $queue): void
+    private function recordQueued(string $payload, \UnitEnum|string|null $queue, ?array $decoded = null): void
     {
         try {
-            $decoded = self::decodePayload($payload, $this->serializer);
+            $decoded ??= self::decodePayload($payload, $this->serializer);
 
             $uuid = $decoded['uuid'] ?? null;
 
@@ -1181,7 +1228,7 @@ LUA;
         unset($this->countedRedeliveries[$streamKey.'|'.$job->messageId]);
 
         if ($delay <= 0) {
-            $this->recordQueued($newPayload, $queue);
+            $this->recordQueued($newPayload, $queue, $payload);
         }
     }
 

@@ -76,6 +76,7 @@ final class TorqueServiceProvider extends ServiceProvider
                 ttl: Narrow::int($jobStreams['ttl'] ?? null, 300),
                 maxEvents: Narrow::int($jobStreams['max_events'] ?? null, 1000),
                 enabled: Narrow::bool($jobStreams['enabled'] ?? null, true),
+                cluster: Narrow::bool($redis['cluster'] ?? null, false),
             );
         });
 

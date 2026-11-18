@@ -12,6 +12,8 @@ use Illuminate\Queue\Events\JobProcessing;
 use Webpatser\Torque\Contracts\Silenced;
 use Webpatser\Torque\Support\Narrow;
 
+use function Fledge\Async\async;
+use function Fledge\Async\Future\await;
 use function Fledge\Async\Redis\createRedisClient;
 
 /**
@@ -35,8 +37,12 @@ final class JobStreamRecorder
 
     /**
      * Lua script writing one event and its expiry, so nothing can land between them
-     * and the key cannot exist without a TTL. It touches only the job's own key, so
-     * it is safe on a cluster.
+     * and the key cannot exist without a TTL.
+     *
+     * On a single node it also gets the two index sets as KEYS[2] and KEYS[3] and
+     * updates them in the same call, so an event costs one round trip. On a cluster
+     * those sets live in other slots than the job's key: the script then gets only
+     * KEYS[1] and the index commands are pipelined next to it.
      *
      * - `terminal`: the short TTL.
      * - `queued`: the short TTL, but only on the stream's first event. The push writes
@@ -47,15 +53,32 @@ final class JobStreamRecorder
      *   because NX needs Redis 7 and this reads the same on every version). A finished
      *   job's short TTL stays.
      *
-     * ARGV: expiry mode, short TTL, safety TTL, stream cap, then the event's fields.
+     * KEYS: the job's stream, then optionally jobs:recent and jobs:active.
+     * ARGV: expiry mode, short TTL, safety TTL, stream cap, index score, uuid, trim
+     * cutoff ('' for no trim), then the event's fields.
      */
     private const string LUA_RECORD = <<<'LUA'
-local id = redis.call('XADD', KEYS[1], 'MAXLEN', '~', ARGV[4], '*', unpack(ARGV, 5))
+local id = redis.call('XADD', KEYS[1], 'MAXLEN', '~', ARGV[4], '*', unpack(ARGV, 8))
 
 if ARGV[1] == 'terminal' or (ARGV[1] == 'queued' and redis.call('XLEN', KEYS[1]) == 1) then
     redis.call('EXPIRE', KEYS[1], ARGV[2])
 elseif ARGV[1] == 'started' or redis.call('TTL', KEYS[1]) == -1 then
     redis.call('EXPIRE', KEYS[1], ARGV[3])
+end
+
+if #KEYS == 3 then
+    redis.call('ZADD', KEYS[2], ARGV[5], ARGV[6])
+
+    if ARGV[1] == 'terminal' then
+        redis.call('ZREM', KEYS[3], ARGV[6])
+    else
+        redis.call('ZADD', KEYS[3], ARGV[5], ARGV[6])
+    end
+
+    if ARGV[7] ~= '' then
+        redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', '(' .. ARGV[7])
+        redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', '(' .. ARGV[7])
+    end
 end
 
 return id
@@ -78,9 +101,21 @@ LUA;
         private readonly int $ttl = 300,
         private readonly int $maxEvents = 1000,
         private readonly bool $enabled = true,
+        private bool $cluster = false,
+        ?\Closure $trimDue = null,
     ) {
         $this->attempts = new \WeakMap;
+        $this->trimDue = $trimDue ?? static fn (): bool => random_int(0, 99) === 0;
     }
+
+    /**
+     * Decides per write whether the indexes are trimmed: about one write in a hundred.
+     *
+     * @var \Closure(): bool
+     */
+    private readonly \Closure $trimDue;
+
+    private bool $warnedCrossSlot = false;
 
     /**
      * Record a "queued" event when a job enters the stream.
@@ -331,6 +366,12 @@ LUA;
      * Both sets are trimmed opportunistically to drop entries older than the
      * per-job stream TTL.
      *
+     * One round trip per event: on a single node one script writes the event,
+     * its expiry and both indexes as one unit. On a cluster the script covers the
+     * job's key only and the index commands go out pipelined beside it, as
+     * separate commands as they always were. The script is sent by its SHA, with
+     * a plain EVAL after a NOSCRIPT.
+     *
      * @param  array<string, mixed>  $data  Extra stream fields; values must be Redis-encodable scalars.
      */
     public function record(string $uuid, string $type, array $data, bool $terminal = false): void
@@ -342,14 +383,22 @@ LUA;
         try {
             $redis = $this->getRedis();
             $key = $this->prefix.'job:'.$uuid;
-            $now = time();
+            $recentKey = $this->prefix.'jobs:recent';
+            $activeKey = $this->prefix.'jobs:active';
+            $now = (string) time();
+
+            // Opportunistic trim (~1/100 writes) so the indexes don't grow
+            // unbounded when many short-lived jobs run.
+            $cutoff = ($this->trimDue)() ? (string) ((int) $now - $this->ttl) : '';
 
             $args = [
-                'EVAL', self::LUA_RECORD, '1', $key,
                 $terminal ? 'terminal' : ($type === 'queued' || $type === 'started' ? $type : 'other'),
                 (string) $this->ttl,
                 (string) self::SAFETY_TTL,
                 (string) $this->maxEvents,
+                $now,
+                $uuid,
+                $cutoff,
                 'type', $type,
                 'timestamp', (string) hrtime(true),
             ];
@@ -359,30 +408,92 @@ LUA;
                 $args[] = Narrow::string($value);
             }
 
-            $redis->execute(...$args);
+            if (! $this->cluster) {
+                try {
+                    $redis->eval(self::LUA_RECORD, [$key, $recentKey, $activeKey], $args);
 
-            // Indexes: all recent jobs, and active (non-terminal) jobs.
-            $recentKey = $this->prefix.'jobs:recent';
-            $activeKey = $this->prefix.'jobs:active';
+                    return;
+                } catch (\Throwable $e) {
+                    if (! self::isCrossSlot($e)) {
+                        throw $e;
+                    }
 
-            $redis->execute('ZADD', $recentKey, (string) $now, $uuid);
-
-            if ($terminal) {
-                $redis->execute('ZREM', $activeKey, $uuid);
-            } else {
-                $redis->execute('ZADD', $activeKey, (string) $now, $uuid);
+                    // A real cluster reached without the cluster flag. The server
+                    // refused the script before running it, so nothing was written:
+                    // record this event and every later one the cluster way.
+                    $this->cluster = true;
+                    $this->warnCrossSlot();
+                }
             }
 
-            // Opportunistic trim (~1/100 writes) so the indexes don't grow
-            // unbounded when many short-lived jobs run.
-            if (random_int(0, 99) === 0) {
-                $cutoff = (string) ($now - $this->ttl);
-                $redis->execute('ZREMRANGEBYSCORE', $recentKey, '-inf', '('.$cutoff);
-                $redis->execute('ZREMRANGEBYSCORE', $activeKey, '-inf', '('.$cutoff);
+            $commands = [
+                static fn () => $redis->eval(self::LUA_RECORD, [$key], $args),
+                static fn () => $redis->execute('ZADD', $recentKey, $now, $uuid),
+                $terminal
+                    ? static fn () => $redis->execute('ZREM', $activeKey, $uuid)
+                    : static fn () => $redis->execute('ZADD', $activeKey, $now, $uuid),
+            ];
+
+            if ($cutoff !== '') {
+                $commands[] = static fn () => $redis->execute('ZREMRANGEBYSCORE', $recentKey, '-inf', '('.$cutoff);
+                $commands[] = static fn () => $redis->execute('ZREMRANGEBYSCORE', $activeKey, '-inf', '('.$cutoff);
             }
+
+            self::pipeline($commands);
         } catch (\Throwable) {
             // Never let stream recording break job processing.
         }
+    }
+
+    /**
+     * Did the server refuse a script because its keys span several slots?
+     */
+    private static function isCrossSlot(\Throwable $e): bool
+    {
+        $message = $e->getMessage();
+
+        return str_starts_with($message, 'CROSSSLOT') || str_contains($message, 'hash to the same slot');
+    }
+
+    /**
+     * Warn once per recorder, also when several fibers hit CROSSSLOT at once.
+     */
+    private function warnCrossSlot(): void
+    {
+        if ($this->warnedCrossSlot) {
+            return;
+        }
+
+        $this->warnedCrossSlot = true;
+
+        try {
+            logger()->warning('Torque job events: Redis answered CROSSSLOT, so this server is a cluster. '
+                .'Set torque.redis.cluster (TORQUE_CLUSTER=true); events are recorded the cluster way until then.');
+        } catch (\Throwable) {
+            // Logging must not break the job either.
+        }
+    }
+
+    /**
+     * Send commands without waiting for each reply, then wait for all of them.
+     *
+     * The connection queues them in order, so they share one round trip. Every
+     * fiber swallows its own error: a future nobody awaits must never fail.
+     *
+     * @param  list<\Closure(): mixed>  $commands
+     */
+    private static function pipeline(array $commands): void
+    {
+        await(array_map(
+            static fn (\Closure $command) => async(static function () use ($command): void {
+                try {
+                    $command();
+                } catch (\Throwable) {
+                    // Never let stream recording break job processing.
+                }
+            }),
+            $commands,
+        ));
     }
 
     /**
