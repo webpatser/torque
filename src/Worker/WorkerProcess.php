@@ -121,6 +121,13 @@ LUA;
     /** Seconds a stopping worker spends handing back entries it never started. */
     private const float RETURN_UNSTARTED_TIMEOUT = 1.0;
 
+    /**
+     * Seconds a prefetched entry for a queue that is not paused may wait for a
+     * slot before it is handed back (a quarter of retry_after when that is less).
+     * Longer than a brief max_concurrency cap, so such a cap costs no hand-back.
+     */
+    private const float PREFETCH_HOLD_SECONDS = 5.0;
+
     public private(set) bool $isRunning = false;
 
     public private(set) int $jobsProcessed = 0;
@@ -164,6 +171,29 @@ LUA;
      * @var list<array{stream: string, id: string, payload: string}>
      */
     private array $prefetched = [];
+
+    /**
+     * When each entry in $prefetched was buffered, in monotonic seconds, keyed
+     * `{stream}|{id}`. Its idle time in the PEL runs from the same moment, so
+     * this tells when another worker may steal it. 0.0 marks an entry whose
+     * ownership is uncertain (a hand-back that failed): it is checked before it runs.
+     *
+     * @var array<string, float>
+     */
+    private array $prefetchedAt = [];
+
+    /** Pending reads (own PEL and steals) started so far; orders them against hand-backs. */
+    private int $pendingReadSequence = 0;
+
+    /** Hand-backs whose script may still be on its way to Redis. */
+    private int $handBacksRunning = 0;
+
+    /**
+     * Each queue's retry_after in seconds, as the steal reads it.
+     *
+     * @var array<string, int>
+     */
+    private array $retryAfterSeconds = [];
 
     /**
      * Messages a slot of this worker is processing right now, keyed
@@ -225,11 +255,17 @@ LUA;
     private array $quarantineFailed = [];
 
     /**
-     * Entries a stopping worker handed back, keyed `{stream}|{id}`. A reply built
+     * Entries this worker handed back, keyed `{stream}|{id}`. A reply built
      * before the hand-back can still list one, and running it would run it twice:
      * it now exists under a new id, for another worker.
      *
-     * @var array<string, true>
+     * The value is the last pending read sequence that may have been answered
+     * before the script ran (PHP_INT_MAX while it is on its way). A pending read
+     * started later skips nothing: what it gets was delivered to this consumer
+     * again, such as an entry the script left alone that a claim brought back.
+     * Emptied whenever no pending read and no hand-back is outstanding.
+     *
+     * @var array<string, int>
      */
     private array $handedBack = [];
 
@@ -388,6 +424,10 @@ LUA;
             $queues,
         )));
         $streams = self::bareStreamConfigs($streams, $cluster);
+
+        foreach ($queues as $queue) {
+            $this->retryAfterSeconds[$queue] = Narrow::int($streams[$queue]['retry_after'] ?? null, 60);
+        }
 
         $streamQueue = new StreamQueue(
             redisUri: $redisUri,
@@ -583,7 +623,7 @@ LUA;
 
         $masterPidForPause = posix_getppid();
         $pauseFetchFailed = false;
-        EventLoop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, &$pauseFetchFailed) {
+        EventLoop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, $streamQueue, $cluster, &$pauseFetchFailed) {
             // Framework pause state (queue:pause / queue:pause --all) lives in
             // the cache store, read synchronously outside the pool callback so
             // pool-connection hold time is unchanged. On a failed read we keep
@@ -639,6 +679,12 @@ LUA;
                     $primaryQueue,
                 );
             });
+
+            // With the pause state just updated: hand back what the buffer holds
+            // for queues this worker may not run now, so it does not age in the PEL.
+            if ($this->prefetched !== []) {
+                $this->handBackHeldPrefetched($streamQueue, $pauseState->pausedQueues, $pauseState->paused || $this->down, $prefix, $cluster);
+            }
         });
 
         // Parent-death watchdog: the master exec'd this process, so at boot the
@@ -1457,17 +1503,20 @@ LUA;
 
         // First, so no slot can take one of these while the script is on its way.
         $this->prefetched = [];
+        $this->prefetchedAt = [];
         $this->neverStarted = [];
 
         foreach ($byStream as $streamKey => $ids) {
             foreach ($ids as $id) {
-                $this->handedBack[$streamKey.'|'.$id] = true;
+                $this->handedBack[$streamKey.'|'.$id] = PHP_INT_MAX;
             }
         }
 
         if ($byStream === []) {
             return;
         }
+
+        $this->handBacksRunning++;
 
         try {
             async(function () use ($byStream, $streamQueue): void {
@@ -1482,7 +1531,145 @@ LUA;
             })->await(new TimeoutCancellation(self::RETURN_UNSTARTED_TIMEOUT));
         } catch (\Throwable $e) {
             fwrite(STDERR, "[torque:worker] WARN could not hand back entries that never started: {$e->getMessage()}\n");
+        } finally {
+            // A script cut off by the timeout may still run: keep these skipped
+            // by every read until then, as the stopping worker reads no more.
+            $this->handBacksRunning--;
         }
+    }
+
+    /**
+     * Hand back prefetched entries this worker may not run soon: their queue is
+     * paused (or its circuit breaker open), the whole worker is paused, or they
+     * waited longer than the hold limit (max_concurrency, a popUsing callback
+     * that never names the queue, every slot busy). In the PEL they would age
+     * toward a steal by another worker while still buffered here, and a flush
+     * would leave them to run; handed back they are new, unclaimed entries.
+     *
+     * Costs a round trip per stream only when something is handed back: a paused
+     * queue is not read, so its entries are handed back once per pause. Returns
+     * how many entries were taken out of the buffer.
+     *
+     * @param  list<string>  $pausedQueues
+     */
+    private function handBackHeldPrefetched(StreamQueue $streamQueue, array $pausedQueues, bool $allPaused, string $prefix, bool $cluster): int
+    {
+        $now = self::monotonicSeconds();
+        $held = [];
+        $keep = [];
+
+        foreach ($this->prefetched as $message) {
+            $queue = self::queueNameFromStreamKey($message['stream'], $prefix, $cluster);
+            $since = $this->prefetchedAt[$message['stream'].'|'.$message['id']] ?? $now;
+
+            if ($allPaused || in_array($queue, $pausedQueues, true) || $now - $since >= $this->prefetchHoldLimit($queue)) {
+                $held[] = $message;
+            } else {
+                $keep[] = $message;
+            }
+        }
+
+        if ($held === []) {
+            return 0;
+        }
+
+        // First, so no slot can take one of these while the script is on its way.
+        $this->prefetched = $keep;
+        $byStream = [];
+
+        foreach ($held as $message) {
+            $byStream[$message['stream']][] = $message['id'];
+            $this->handedBack[$message['stream'].'|'.$message['id']] = PHP_INT_MAX;
+        }
+
+        $failed = [];
+        $this->handBacksRunning++;
+
+        try {
+            foreach ($byStream as $streamKey => $ids) {
+                try {
+                    $streamQueue->returnUnstarted($streamKey, $this->consumerId, $ids);
+                } catch (\Throwable $e) {
+                    fwrite(STDERR, "[torque:worker] WARN could not hand back prefetched entries of {$streamKey}: {$e->getMessage()}\n");
+                    $failed[$streamKey] = true;
+                }
+            }
+        } finally {
+            $this->handBacksRunning--;
+        }
+
+        $handed = 0;
+
+        foreach ($held as $message) {
+            $key = $message['stream'].'|'.$message['id'];
+
+            if (isset($failed[$message['stream']])) {
+                // The script may have run with its reply lost: Redis may hold a
+                // copy under a new id already. Buffered again under 0.0, so the
+                // ownership check decides before it runs, and the next check
+                // hands it back again (a no-op if the first script ran).
+                unset($this->handedBack[$key]);
+                $this->prefetched[] = $message;
+                $this->prefetchedAt[$key] = 0.0;
+
+                continue;
+            }
+
+            unset($this->prefetchedAt[$key]);
+            $handed++;
+
+            // Pending reads started from here on get replies built after the
+            // script ran, which cannot list the old id.
+            $this->handedBack[$key] = $this->pendingReadSequence;
+        }
+
+        $this->forgetHandedBackWhenQuiet();
+
+        return $handed;
+    }
+
+    /**
+     * Empty $handedBack once no pending read and no hand-back is outstanding:
+     * every reply that could list a handed-back id has been seen by then. A
+     * stopping worker's entries stay, as its script may still run after the timeout.
+     */
+    private function forgetHandedBackWhenQuiet(): void
+    {
+        if ($this->pendingReads === 0 && $this->handBacksRunning === 0 && $this->handedBack !== []) {
+            $this->handedBack = array_filter($this->handedBack, static fn (int $sequence): bool => $sequence === PHP_INT_MAX);
+        }
+    }
+
+    /**
+     * The handed-back entries a pending read started at $sequence must skip:
+     * those whose script it may have been answered before.
+     *
+     * @return array<string, true>
+     */
+    private function handedBackFor(int $sequence): array
+    {
+        $skip = [];
+
+        foreach ($this->handedBack as $key => $lastBefore) {
+            if ($lastBefore >= $sequence) {
+                $skip[$key] = true;
+            }
+        }
+
+        return $skip;
+    }
+
+    private static function monotonicSeconds(): float
+    {
+        return hrtime(true) / 1e9;
+    }
+
+    /**
+     * Seconds a prefetched entry of this queue may wait for a slot.
+     */
+    private function prefetchHoldLimit(string $queue): float
+    {
+        return min(self::PREFETCH_HOLD_SECONDS, ($this->retryAfterSeconds[$queue] ?? 60) / 4);
     }
 
     /**
@@ -1557,8 +1744,11 @@ LUA;
 
         $first = array_shift($messages);
 
+        $now = self::monotonicSeconds();
+
         foreach ($messages as $message) {
             $this->prefetched[] = $message;
+            $this->prefetchedAt[$message['stream'].'|'.$message['id']] = $now;
         }
 
         return $first;
@@ -1660,6 +1850,7 @@ LUA;
         }
 
         $this->pendingReads++;
+        $sequence = ++$this->pendingReadSequence;
 
         try {
             $result = $readerRedis->execute('XREADGROUP', ...$args);
@@ -1691,10 +1882,11 @@ LUA;
             // while this one was waiting on Redis, or finished one the reply
             // still lists. The caller marks the returned message in flight
             // before its next suspension point.
-            $taken = self::takenKeys($this->inFlight, $this->finishedDuringRead, $this->prefetched, $this->handedBack);
+            $taken = self::takenKeys($this->inFlight, $this->finishedDuringRead, $this->prefetched, $this->handedBackFor($sequence));
         } finally {
             if (--$this->pendingReads === 0) {
                 $this->finishedDuringRead = [];
+                $this->forgetHandedBackWhenQuiet();
             }
         }
 
@@ -1885,6 +2077,7 @@ LUA;
                     // Counts as a pending read: this reply can also list a message
                     // a slot finishes while it is on its way.
                     $this->pendingReads++;
+                    $sequence = ++$this->pendingReadSequence;
 
                     try {
                         $result = $readerRedis->execute(
@@ -1898,10 +2091,11 @@ LUA;
                             '1',
                         );
 
-                        $taken = self::takenKeys($this->inFlight, $this->finishedDuringRead, $this->prefetched, $this->handedBack);
+                        $taken = self::takenKeys($this->inFlight, $this->finishedDuringRead, $this->prefetched, $this->handedBackFor($sequence));
                     } finally {
                         if (--$this->pendingReads === 0) {
                             $this->finishedDuringRead = [];
+                            $this->forgetHandedBackWhenQuiet();
                         }
                     }
 
@@ -2423,14 +2617,35 @@ LUA;
         string $consumerGroup,
         \Closure $buildStreamKey,
     ): ?array {
-        if ($this->prefetched !== []) {
-            return array_shift($this->prefetched);
+        $streamKeys = array_map($buildStreamKey, $queues);
+
+        // A buffered entry goes only to a read for its own queue: $queues is
+        // what this slot may read now (max_concurrency, pause, breaker, popUsing).
+        // Entries for other queues stay buffered for a slot that may take them.
+        while (($index = self::firstPrefetchedFor($this->prefetched, $streamKeys)) !== null) {
+            $message = $this->prefetched[$index];
+            array_splice($this->prefetched, $index, 1);
+
+            $key = $message['stream'].'|'.$message['id'];
+            $since = $this->prefetchedAt[$key] ?? null;
+            unset($this->prefetchedAt[$key]);
+
+            $queue = $queues[(int) array_search($message['stream'], $streamKeys, true)];
+
+            // Held long enough that another worker may have stolen it (a failed
+            // hand-back, a stalled check): run it only if this consumer still owns it.
+            if ($since !== null && self::monotonicSeconds() - $since >= ($this->retryAfterSeconds[$queue] ?? 60) / 2
+                && ! $this->stillOwns($readerRedis, $message['stream'], $consumerGroup, $message['id'], $key)) {
+                continue;
+            }
+
+            return $message;
         }
 
         $args = ['GROUP', $consumerGroup, $this->consumerId, 'COUNT', '1', 'STREAMS'];
 
-        foreach ($queues as $queue) {
-            $args[] = $buildStreamKey($queue);
+        foreach ($streamKeys as $streamKey) {
+            $args[] = $streamKey;
         }
 
         foreach ($queues as $queue) {
@@ -2448,6 +2663,97 @@ LUA;
 
         // Nothing suspends from here to the claim, or the prefetch, of what it read.
         return $this->parseXreadgroupResponse($result);
+    }
+
+    /**
+     * The index of the first prefetched entry on one of the given streams.
+     *
+     * @param  list<array{stream: string, id: string, payload: string}>  $prefetched
+     * @param  array<array-key, string>  $streamKeys
+     */
+    private static function firstPrefetchedFor(array $prefetched, array $streamKeys): ?int
+    {
+        foreach ($prefetched as $index => $message) {
+            if (in_array($message['stream'], $streamKeys, true)) {
+                return $index;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether a buffered entry may run here, as one step: it may when it is in
+     * this consumer's PEL. Another consumer holding it means it was stolen, and
+     * no entry in the stream means it was flushed or handed back: both drop it.
+     * In nobody's PEL but still in the stream (a failover lost the PEL) it is
+     * handed back as a new entry, its redelivery count moving with it as in
+     * StreamQueue's hand-back. Returns 1 to run, 0 to drop, 2 when handed back.
+     *
+     * KEYS[1] = stream key
+     * KEYS[2] = redelivery counter hash key
+     * ARGV[1] = consumer group
+     * ARGV[2] = consumer name
+     * ARGV[3] = entry id
+     */
+    private const string LUA_CHECK_PREFETCHED = <<<'LUA'
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
+if pending[1] then
+    if pending[1][2] == ARGV[2] then
+        return 1
+    end
+    return 0
+end
+local entry = redis.call('XRANGE', KEYS[1], ARGV[3], ARGV[3])[1]
+if not entry then
+    return 0
+end
+local new = redis.call('XADD', KEYS[1], '*', unpack(entry[2]))
+local count = redis.call('HGET', KEYS[2], ARGV[3])
+if count then
+    redis.call('HSET', KEYS[2], new, count)
+    redis.call('HDEL', KEYS[2], ARGV[3])
+end
+redis.call('XDEL', KEYS[1], ARGV[3])
+return 2
+LUA;
+
+    /**
+     * Whether this consumer still owns a buffered entry (one round trip, see
+     * LUA_CHECK_PREFETCHED). Marked in flight while the reply is awaited, so a
+     * pending read cannot hand it to another slot; the caller keeps the mark
+     * when it runs the entry.
+     *
+     * A failed check runs nothing: the entry stays where it is, and if it is
+     * still in this consumer's PEL a pending read of this worker finds it later.
+     * It is remembered as never started and owing no count (a prefetched entry
+     * is a first delivery), so that read does not charge a redelivery.
+     */
+    private function stillOwns(RedisClient $readerRedis, string $streamKey, string $consumerGroup, string $id, string $key): bool
+    {
+        $this->inFlight[$key] = true;
+
+        try {
+            $verdict = Narrow::int($readerRedis->execute(
+                'EVAL',
+                self::LUA_CHECK_PREFETCHED,
+                '2',
+                $streamKey,
+                $streamKey.StreamQueue::REDELIVERIES_SUFFIX,
+                $consumerGroup,
+                $this->consumerId,
+                $id,
+            ));
+        } catch (\Throwable) {
+            $verdict = null;
+            $this->neverStarted = self::rememberUnstarted($this->neverStarted, $key, false);
+        }
+
+        if ($verdict !== 1) {
+            unset($this->inFlight[$key]);
+        }
+
+        return $verdict === 1;
     }
 
     /**
