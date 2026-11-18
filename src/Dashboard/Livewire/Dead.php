@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Dashboard\Livewire;
 
 use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Locked;
 use Livewire\Component;
 use Webpatser\Torque\Dashboard\Data\DeadLetterData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
@@ -29,6 +30,10 @@ final class Dead extends Component
     /** @var list<string> */
     public array $selected = [];
 
+    /** Why the last retry or purge did not (fully) happen, shown above the table. */
+    #[Locked]
+    public ?string $actionError = null;
+
     public function updatedSearch(): void
     {
         $this->page = 0;
@@ -45,32 +50,74 @@ final class Dead extends Component
 
     public function retryOne(string $id): void
     {
-        rescue(fn () => app(DeadLetterHandler::class)->retry($id), null, false);
+        $handler = app(DeadLetterHandler::class);
+        $this->actionError = $this->attempt(fn () => $handler->retry($id), 'Retry failed.');
         $this->selected = array_values(array_diff($this->selected, [$id]));
     }
 
     public function purgeOne(string $id): void
     {
-        rescue(fn () => app(DeadLetterHandler::class)->purge($id), null, false);
+        $handler = app(DeadLetterHandler::class);
+        $this->actionError = $this->attempt(fn () => $handler->purge($id), 'Purge failed.');
         $this->selected = array_values(array_diff($this->selected, [$id]));
     }
 
     public function retrySelected(): void
     {
         $handler = app(DeadLetterHandler::class);
-        foreach ($this->selected as $id) {
-            rescue(fn () => $handler->retry($id), null, false);
-        }
+        $this->actionError = $this->attemptAll('Retried', fn (string $id) => $handler->retry($id), 'Retry failed.');
         $this->selected = [];
     }
 
     public function purgeSelected(): void
     {
         $handler = app(DeadLetterHandler::class);
-        foreach ($this->selected as $id) {
-            rescue(fn () => $handler->purge($id), null, false);
-        }
+        $this->actionError = $this->attemptAll('Purged', fn (string $id) => $handler->purge($id), 'Purge failed.');
         $this->selected = [];
+    }
+
+    /**
+     * Run one action; null on success, otherwise why it failed. The handler's
+     * own messages are shown as they are, anything else (a Redis error) is not.
+     */
+    private function attempt(\Closure $action, string $fallback): ?string
+    {
+        try {
+            $action();
+        } catch (\Throwable $e) {
+            return $e instanceof \RuntimeException ? $e->getMessage() : $fallback;
+        }
+
+        return null;
+    }
+
+    /**
+     * Run an action on every selected id; null when all succeeded, otherwise
+     * the split and the first failure.
+     *
+     * @param  \Closure(string): mixed  $action
+     */
+    private function attemptAll(string $verb, \Closure $action, string $fallback): ?string
+    {
+        $failed = 0;
+        $first = null;
+
+        foreach ($this->selected as $id) {
+            $error = $this->attempt(fn () => $action($id), $fallback);
+
+            if ($error !== null) {
+                $failed++;
+                $first ??= $error;
+            }
+        }
+
+        if ($first === null) {
+            return null;
+        }
+
+        $total = count($this->selected);
+
+        return sprintf('%s %d of %d entries; %d failed: %s', $verb, $total - $failed, $total, $failed, $first);
     }
 
     public function render(): View

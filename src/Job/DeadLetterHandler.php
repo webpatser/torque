@@ -29,6 +29,8 @@ final class DeadLetterHandler
 
     private readonly string $deadLetterStream;
 
+    private int $scannedEntries = 0;
+
     /**
      * @param  array<int, string>  $allowedQueues  Whitelist of queue names permitted as retry targets.
      * @param  int  $maxEntries  Hard cap on stream length, enforced at write time. 0 = uncapped.
@@ -321,6 +323,56 @@ final class DeadLetterHandler
         $this->redis->execute('XDEL', $this->deadLetterStream, $deadLetterId);
 
         return ['id' => $entries[0]['id'], 'uuid' => self::payloadUuid($fields['payload'] ?? '')];
+    }
+
+    /**
+     * The dead-letter id of a job, by its uuid, or null when it is not dead-lettered.
+     *
+     * Walks the stream newest first in pages and stops at the first match, so
+     * a recent failure is found in one round trip. Only payloads that contain
+     * the uuid as bytes are decoded. A caller that knows when the job first ran
+     * passes it as `$sinceMs`, so a miss reads only the entries newer than that.
+     *
+     * @param  int|null  $sinceMs  Millisecond epoch; entries older than it are not read.
+     */
+    #[\NoDiscard]
+    public function findIdByJobUuid(string $uuid, ?int $sinceMs = null): ?string
+    {
+        $this->scannedEntries = 0;
+
+        if ($uuid === '') {
+            return null;
+        }
+
+        $from = '+';
+
+        while (true) {
+            $page = Narrow::entries($this->redis->execute('XREVRANGE', $this->deadLetterStream, $from, self::lowId($sinceMs), 'COUNT', '500'));
+            $this->scannedEntries += count($page);
+
+            foreach ($page as $entry) {
+                $payload = Narrow::string($entry['fields']['payload'] ?? null);
+
+                if (str_contains($payload, $uuid) && self::payloadUuid($payload) === $uuid) {
+                    return $entry['id'];
+                }
+            }
+
+            if (count($page) < 500) {
+                return null;
+            }
+
+            $from = '('.$page[count($page) - 1]['id'];
+        }
+    }
+
+    /**
+     * Dead-letter entries fetched from Redis by the last {@see findIdByJobUuid()} call.
+     */
+    #[\NoDiscard]
+    public function scannedEntries(): int
+    {
+        return $this->scannedEntries;
     }
 
     /**

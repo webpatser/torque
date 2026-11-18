@@ -6,6 +6,13 @@
 <x-torque::shell title="Job inspector" crumb="per-job event stream" active="inspector"
     :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval">
 
+    @if ($retryError !== null)
+        <div class="notice warn mb16" role="alert">
+            <x-torque::icon name="warn" :size="14"/>
+            <span>{{ $retryError }}</span>
+        </div>
+    @endif
+
     {{-- header --}}
     <div class="card mb16">
         <div class="card-pad" style="display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center;">

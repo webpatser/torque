@@ -8,6 +8,13 @@
 <x-torque::shell title="Dead-letter" crumb="torque:stream:dead-letter" active="dead"
     :dead-count="$deadTotal" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
+    @if ($actionError !== null)
+        <div class="notice warn mb16" role="alert">
+            <x-torque::icon name="warn" :size="14"/>
+            <span>{{ $actionError }}</span>
+        </div>
+    @endif
+
     <div class="card mb16" style="border-color: {{ $deadCount ? 'color-mix(in oklab, var(--bad) 22%, var(--border))' : 'var(--border)' }};">
         <div class="card-pad row between wrap gap16">
             <div class="row gap16">
