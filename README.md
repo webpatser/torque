@@ -359,7 +359,7 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
 | `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
 | `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
-| `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--deep` also sweeps orphaned job streams, stale index members and stale worker hashes; `--dry-run` to preview |
+| `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--dead-letter-max` defaults to `dead_letter.max_entries`; `--consumer-idle` (whole seconds, 0 or more, default 3600, also with `--deep`) sets how long a consumer without pending work must be idle before it is deleted, and each delete re-checks the pending list atomically so a job taken in between is not lost. `--deep` also sweeps orphaned job streams, stale index members and stale worker hashes; `--dry-run` to preview |
 | `torque:forget {id?} {--all} {--queue=} {--force}` | Delete a dead-letter entry by its stream id (like `1700000000000-0`, shown by the dashboard and `torque:tail`), or with `--all` every entry; uuids and `queue:failed` ids are rejected. `--queue` limits `--all` to one queue, `--force` skips the confirmation. Only `database-uuids` `failed_jobs` rows are removed with the entry; `--all` leaves rows that have no dead-letter entry. Horizon's `horizon:forget` |
 | `torque:supervisor` | Generate a Supervisor config file. `--php` sets the PHP binary (default `PHP_BINARY`), `--app-path` overrides the app path (a Deployer `releases/N` path uses the `current` symlink automatically), `--stdout` prints the config instead of writing it |
 
@@ -389,7 +389,7 @@ All options are in `config/torque.php`. Key settings:
 | `circuit_breaker.enabled` | true | Pause a stream whose jobs are failing permanently at a high rate |
 | `poll_interval_ms` | 2000 | Poll interval in ms: how often idle Fibers check for new jobs (`TORQUE_POLL_INTERVAL_MS`; the old `TORQUE_BLOCK_FOR` still works). Not the connection's `block_for` |
 | `redis.cluster` | false | Enable Redis Cluster hash tag support |
-| `redis.read_timeout_seconds` | 30 | Seconds a slot waits for a Redis reply before it gives up and reconnects (`TORQUE_REDIS_READ_TIMEOUT`) |
+| `redis.read_timeout_seconds` | 30 | Seconds a slot waits for a Redis reply before it gives up and reconnects; the master's metrics, queue depth and autoscale reads use it too (`TORQUE_REDIS_READ_TIMEOUT`). Zero or less waits forever |
 | `memory_limit` | 512 | Megabytes of real memory (`memory_get_usage(true)`) at which a worker drains and exits with status 12, like `queue:work --memory`; the master starts a replacement. Checked once a second. The drain waits for running jobs with no grace force exit, so a hung job holds that worker until a signal, `queue:restart`, the worker lifetime or `max_jobs_per_worker` ends it, and the stall watchdog only warns. Keep `timeouts.enabled` on to end a hung job. A worker logs a WARN at boot when PHP's ini `memory_limit` is below this, since PHP would fatal first. `0` is off (`TORQUE_MEMORY_LIMIT`) |
 | streams (`default`) | see file | Shipped `default` stream reads `TORQUE_QUEUE`, `TORQUE_RETRY_AFTER` (60), `TORQUE_MAX_RETRIES` (3), `TORQUE_BACKOFF` (`exponential`) and `TORQUE_STREAM_TIMEOUT` (none). A published config replaces the whole `streams` block, so the env vars apply only to the unpublished file |
 | `force` | false | Keep processing during `artisan down`, like `queue:work --force`. Off, slots stop polling and claiming while the app is down; in-flight jobs finish and jobs wait in the stream |
@@ -414,6 +414,8 @@ All options are in `config/torque.php`. Key settings:
     'cooldown' => 30,               // Seconds between scaling decisions
 ],
 ```
+
+Workers being scaled down no longer count toward the fleet. A fleet below `min_workers` (for example `workers` set lower, or workers lost to failed forks) is grown back to it, one worker per decision, whatever the load and without metrics; it is never grown past `max_workers`. A worker whose fork failed is owed and retried with a backoff (1 second, doubling to 30), counts toward the fleet, and is cancelled before a live worker is stopped on a scale-down. No worker is added while the fleet is paused with `torque:pause`; scale-down continues. `torque:status` shows a `Respawns owed` line while any are owed.
 
 ### Connection pools
 
@@ -525,7 +527,7 @@ Default: `['web', 'auth']`. Override in config:
 Jobs that exhaust all retries are moved to a dead-letter Redis Stream. You can:
 
 - View them in the dashboard
-- Retry or delete via dashboard or programmatically. A retry resets attempts, refreshes `retryUntil`, clears the `maxExceptions` counter, refuses when the job class no longer exists, and deletes the `failed_jobs` row (`database-uuids` failer only)
+- Retry or delete via dashboard or programmatically. A retry or purge that fails is reported in the dashboard (the dead-letter screen says how many of a bulk action succeeded; the inspector's Retry finds the entry by job uuid and stays on the page with the error). A retry resets attempts, refreshes `retryUntil`, clears the `maxExceptions` counter, refuses when the job class no longer exists, and deletes the `failed_jobs` row (`database-uuids` failer only)
 - Listen for the `JobPermanentlyFailed` event for custom notifications
 
 ```php
@@ -557,6 +559,8 @@ The master applies the TTL, the cap, and a sweep of consumer names left behind b
 php artisan torque:prune --dry-run        # report only
 php artisan torque:prune --dead-letter-max=50000 --consumer-idle=3600
 ```
+
+Without `--dead-letter-max` the cap is `dead_letter.max_entries`. `--consumer-idle` must be a whole number of seconds, 0 or more.
 
 ## Architecture
 

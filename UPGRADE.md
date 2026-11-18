@@ -2,6 +2,41 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so, and a stored version below the oldest release you can upgrade from (1.4.0 since 2.0.0) refuses to start. `torque:status` shows the recorded data version next to the installed one.
 
+## Unreleased: fleet metrics per host
+
+No data step and no config change. The Redis layout of the fleet aggregate and the cluster gauges changes; only tooling that reads those keys directly has to follow.
+
+`redis.read_timeout_seconds` (default 30) now also applies to the master's own Redis reads (its metrics publisher, its own client and the stream depth probe), not only to the workers'. A master whose reply is lost on a half-open socket reconnects after that many seconds instead of blocking its loop until TCP gives up; zero or less still waits forever.
+
+### Key layout
+
+- **`{prefix}metrics` is no longer written.** Each master writes its own host's aggregate to `{prefix}metrics:live:{host}` (a hash with the same fields as before, 30 second TTL) and adds the host to the sorted set `{prefix}metrics:live`, scored by the publish epoch. `{host}` is the machine's hostname as `MetricsPublisher::normaliseHost()` cleans it.
+- **Cluster gauges** in `{prefix}metrics:gauge:{tier}` are written per host for `avg_latency_ms`, `concurrent`, `memory_mb` and `worker_memory_peak_mb`: field `{bucket}:{host}:{metric}` instead of `{bucket}:{metric}`. `pending` and `delayed` keep the unscoped `{bucket}:{metric}` field, because every master measures the same streams.
+- **First-seen host index.** `{prefix}metrics:hosts:first` is a sorted set with the same members as `{prefix}metrics:hosts`, scored by the epoch a host was first seen rather than last. The gauge read uses both to ask each host only for the buckets between its first and last sighting; a host missing from it is read from the start of the range. It is pruned with the host index.
+- **Prune claims.** The rollup and gauge prune now takes a `SET NX` claim, `{prefix}metrics:prune:{key without prefix}:{bucket}`, that lives one bucket width, so one master prunes each shared hash per bucket.
+
+### External tooling that reads these keys
+
+- Instead of `HGETALL {prefix}metrics`: `ZRANGEBYSCORE {prefix}metrics:live <now - 30> +inf`, then `HGETALL {prefix}metrics:live:{host}` for each member, skipping empty replies. Add up `concurrent`, `total_slots`, `jobs_processed`, `jobs_failed`, `workers`, `throughput` and `memory_mb`; weight `avg_latency` by each host's `jobs_processed`; take `throughput_1m`, `throughput_5m`, `throughput_smoothed` and `jobs_last_hour` from the host with the newest `updated_at`. The first, second and fourth are cluster figures every master computes from the shared minute rollup, so the hosts agree on them. `throughput_smoothed` is close but not identical: each host steps its own EMA of the cluster rate and re-seeds it from `throughput_5m` when its hash had expired (a new host, or a master down for longer than the 30 second TTL), so the copies converge over a few ticks rather than match. In PHP, `MetricsPublisher::readAggregate($redis, $prefix)` does exactly this.
+- Gauge readers sum the per-host fields of a bucket for `concurrent` and `memory_mb`, take the largest host for `worker_memory_peak_mb`, and weight `avg_latency_ms` by the host's jobs in that bucket (`{prefix}metrics:rollup:{tier}:host`, field `{bucket}:{host}`). A bucket with no per-host field falls back to `{bucket}:{metric}`, which is where all history from before this release lives.
+
+### Rolling deploy
+
+- **New reader, old and new masters side by side:** only the upgraded hosts' aggregates are summed and the old shared hash is ignored, so the overview undercounts until the last host is upgraded; it never double counts. Gauge buckets that any upgraded host wrote show only the upgraded hosts for the same reason.
+- **New reader, only old masters:** no live host aggregate exists, so the old `{prefix}metrics` hash is read as before; gauges read the unscoped fields as before.
+- **Old reader, new masters:** `{prefix}metrics` expires 30 seconds after the last old master stops writing it. The old dashboard and `torque:status` then fall back to aggregating the worker hashes (fleet totals, no throughput), and their `concurrent`, `memory_mb`, `worker_memory_peak_mb` and `avg_latency_ms` sparklines stay at zero for buckets written only per host. `pending` and `delayed` keep the unscoped field and read as before.
+- **Hosts that go away** drop out of the aggregate sums 30 seconds after their last publish. Their gauge samples stay in the buckets they wrote, as history.
+- During a reload takeover two masters on one box write the same `{prefix}metrics:live:{host}` hash in turn, each with its own half of the fleet, so that host's figures can read low for the few seconds the takeover lasts.
+
+## Unreleased: prune, flush and autoscaler behaviour
+
+No data step and no config change. Three behaviours differ from before, and a script or schedule that relied on the old ones can notice.
+
+- **`torque:prune --deep` keeps recent consumers.** Without `--consumer-idle` it now deletes only consumers without pending work that have been idle for 3600 seconds, as the routine pass does; it used to take 0 and delete every consumer without pending work. Pass `--consumer-idle=0` for the old sweep. The option must be a whole number of seconds, 0 or more; anything else exits with an error.
+- **`torque:prune` follows `dead_letter.max_entries`.** `--dead-letter-max` no longer defaults to 100000: without it the configured cap applies. Pass the option to override it.
+- **`torque:flush` is scoped to the queues it flushes.** It no longer scans and deletes every `{prefix}job:*` key. It removes the job event streams of the selected queues' unclaimed and delayed jobs only; keys of claimed and dead-lettered jobs, and orphans, are left to their TTL and `torque:prune --deep`. An empty or invalid `--queues` value exits with an error instead of flushing the default queue.
+- **The autoscaler grows the fleet to `min_workers`.** With autoscale enabled and `workers` (or a fleet shrunk by failed forks) below `autoscale.min_workers`, the master now adds workers one per decision, subject to the cooldown, until it reaches `min_workers`. Set `workers` to at least `min_workers` if you did not intend that.
+
 ## 1.4.x to 2.0.0
 
 No data step, but not a drop-in upgrade either. 2.0.0 refuses to start on data older than 1.4.0, changes when jobs fail for every install, and changes defaults that reach you only in part, depending on your published `config/torque.php`. Read "Before you upgrade" and "Changed defaults" first. Consumer code needs no change unless it uses the classes listed under API changes.

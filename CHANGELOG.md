@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `torque:prune --deep` without `--consumer-idle` now uses the same 3600 seconds as the routine pass (it was 0, which deleted every consumer without pending work).
+- `torque:prune --dead-letter-max` defaults to the configured `dead_letter.max_entries` (it was a fixed 100000).
+- `torque:prune --consumer-idle` rejects values that are not whole numbers of seconds, 0 or more.
+- `torque:flush` no longer sweeps every `job:*` key; orphaned keys are left to their TTL and `torque:prune --deep`.
+- `torque:status` shows a `Respawns owed` line when any master owes worker forks.
+- With `workers` below `autoscale.min_workers` the fleet now grows to `min_workers` (when autoscale is enabled).
+- A message handed back to the stream gets a new id at the tail and loses its place in order.
+- **Fleet metrics are published per host.** Each master writes `{prefix}metrics:live:{host}` (30 second TTL) and the `{prefix}metrics:live` index instead of the shared `{prefix}metrics` hash, and records `avg_latency_ms`, `concurrent`, `memory_mb` and `worker_memory_peak_mb` gauges under `{bucket}:{host}:{metric}`. The dashboard overview and `torque:status` combine the hosts at read time and fall back to the old layout when no host has published in the new one. A new `{prefix}metrics:hosts:first` index records each host's first sighting, so the gauge read asks a host only for the buckets it was live in and its cost follows the hosts live in the range, not every host the index still lists. Tooling that reads these keys directly must follow; see `UPGRADE.md`.
+- `MetricsPublisher::publishAggregate()`, `publishAggregatedMetrics()` and `recordGauges()` take an optional host; new static `readAggregate()`, `combineAggregates()` and `localHost()`, and `fieldsRequested()`, the hash fields an instance has read in range reads.
+- Pruning of the shared rollup and gauge hashes is claimed per key and bucket with `SET NX`, so one master prunes each bucket instead of every master, and walks the hash with `HSCAN` instead of `HKEYS`.
+
 ### Fixed
+- Master: a failed fork while respawning or scaling up no longer ends the master. It is logged and retried from the monitor tick with a backoff that starts at 1 second and doubles up to 30 seconds, and owed respawns keep the loop alive. The monitor loop survives Redis errors in the autoscale pass (logged at most every 5 minutes while it lasts) and always removes its PID file on exit.
+- Master: its Redis clients for metrics, the depth probe, the long-wait check and its own reads use `redis.read_timeout_seconds` instead of waiting forever; after a timeout the client is rebuilt on the next tick.
+- Autoscaler: workers being scaled down no longer count toward the fleet; a fleet below `min_workers` is grown to it; a scale-down cancels an owed respawn before it stops a live worker; no scale-up while the fleet is paused with `torque:pause`.
+- Worker: a prefetched message is only handed to a read for its own queue, so pause, max concurrency, the circuit breaker and `popUsing` filters hold for buffered messages. A buffered message of a paused queue (or any message while the worker is paused) is handed back to the stream, as is one held longer than the lesser of 5 seconds and a quarter of the queue's `retry_after`; one held for half of `retry_after` or more is checked for ownership in one Lua step before it runs, and dropped when another consumer holds it.
+- `torque:prune`: consumer deletes are atomic (the pending list is checked again in the same Lua step), so a job taken between the check and the delete is not lost.
+- `torque:flush`: only the selected queues' keys and the job keys of their unclaimed and delayed jobs are removed (claimed and dead-lettered jobs keep theirs); the command works in pages of 500 with batched deletes; an empty or invalid `--queues` value stops the command with an error.
+- Dashboard: the inspector's Retry finds the dead-letter entry by job uuid and shows an error when a retry fails; the dead-letter screen reports failed retries and purges, including how many of a bulk action succeeded.
+- Metrics: host name normalisation is idempotent; the workers screen groups a host under its normalised name.
+- On a multi-host fleet the overview showed per-host means as fleet figures: busy slots, memory, workers, slots, throughput and job counts from whichever master published last, and gauge sparklines averaged across hosts. They are now summed across live hosts; the largest worker memory is the largest anywhere, latency is weighted by jobs, and queue depth is no longer averaged in with them. Single-host installs show the same numbers as before.
 - `TorqueJob` no longer fatals on load: the typed `$connection` property clashed with `Queueable`. The `torque` connection now comes from a `#[Connection]` class attribute, so subclasses declare their own constructor without calling `parent::__construct()`; an explicit `onConnection()` still wins.
 - Workers forked by the master start with an empty signal mask and default handlers, so respawned and scaled-up workers react to SIGTERM, SIGINT and SIGUSR2 again.
 - `torque:stop` verifies that the PID in the PID file is a Torque master before every signal. A live non-master PID, a symlinked PID file or an unreadable process is reported and left alone, and the PID file is only removed when it still holds the stopped PID.
