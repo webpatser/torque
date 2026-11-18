@@ -66,6 +66,9 @@ final class TorqueFlushCommand extends Command
     /** @var array<string, true>|null Uuids of the dead-lettered jobs, read once on first use. */
     private ?array $deadLetters = null;
 
+    /** Removed stream entries that a worker had claimed (in flight) at the time. */
+    private int $claimedRemoved = 0;
+
     /**
      * Run against the given client instead of one opened from the config.
      */
@@ -155,6 +158,14 @@ final class TorqueFlushCommand extends Command
         }
 
         $this->newLine();
+
+        if ($this->claimedRemoved > 0) {
+            $this->components->warn(
+                "{$this->claimedRemoved} claimed jobs were in flight. They finish normally, but their stream entries are gone: "
+                .'a worker that dies while running one leaves nothing to reclaim.',
+            );
+        }
+
         $this->components->info("Flushed {$totalStream} queued, {$totalDelayed} delayed, {$jobsDeleted} job keys.");
 
         return self::SUCCESS;
@@ -205,7 +216,13 @@ final class TorqueFlushCommand extends Command
             $uuids = [];
 
             foreach ($page as $entry) {
-                $uuid = isset($claimed[$entry['id']]) ? null : self::payloadUuid($entry['fields']['payload'] ?? null);
+                if (isset($claimed[$entry['id']])) {
+                    $this->claimedRemoved++;
+
+                    continue;
+                }
+
+                $uuid = self::payloadUuid($entry['fields']['payload'] ?? null);
 
                 if ($uuid !== null) {
                     $uuids[] = $uuid;

@@ -241,6 +241,42 @@ it('keeps the job key of an entry claimed while the flush reads the stream', fun
         ->and($redis->execute('ZSCORE', FLUSH_PREFIX.'jobs:active', 'e-2'))->toBeNull();
 });
 
+// B1: claimed entries are in flight; the flush says how many it removed.
+
+it('warns with the count of claimed entries it removed', function () {
+    $group = config('torque.consumer_group');
+
+    foreach (['emails', 'default'] as $queue) {
+        $stream = FLUSH_PREFIX.$queue;
+        $this->redis->execute('XGROUP', 'CREATE', $stream, $group, '$', 'MKSTREAM');
+        $this->redis->execute('XADD', $stream, '*', 'payload', flushPayload("{$queue}-inflight"));
+        $this->redis->execute('XREADGROUP', 'GROUP', $group, 'w1', 'COUNT', '1', 'STREAMS', $stream, '>');
+        $this->redis->execute('XADD', $stream, '*', 'payload', flushPayload("{$queue}-waiting"));
+    }
+
+    // w2 claims emails-waiting and emails-inflight-2: three claimed on emails,
+    // one on default, one entry still waiting on default.
+    $this->redis->execute('XADD', FLUSH_PREFIX.'emails', '*', 'payload', flushPayload('emails-inflight-2'));
+    $this->redis->execute('XREADGROUP', 'GROUP', $group, 'w2', 'COUNT', '2', 'STREAMS', FLUSH_PREFIX.'emails', '>');
+
+    [$code, $output] = flushWith(flushLink(), []);
+
+    expect($code)->toBe(0)
+        ->and($output)->toContain('4 claimed jobs were in flight')
+        ->and($output)->toContain('Flushed 5 queued');
+});
+
+it('does not warn about claimed entries when none are claimed', function () {
+    $group = config('torque.consumer_group');
+    $this->redis->execute('XGROUP', 'CREATE', FLUSH_PREFIX.'emails', $group, '$', 'MKSTREAM');
+    $this->redis->execute('XADD', FLUSH_PREFIX.'emails', '*', 'payload', flushPayload('e-1'));
+
+    [$code, $output] = flushWith(flushLink(), ['--queues' => 'emails']);
+
+    expect($code)->toBe(0)
+        ->and($output)->not->toContain('claimed');
+});
+
 /*
  * Round trips grow with the number of pages, not the number of jobs: 1100
  * waiting and 600 delayed jobs are three stream pages and two delayed pages.
