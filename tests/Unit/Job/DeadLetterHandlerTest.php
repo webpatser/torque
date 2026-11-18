@@ -308,6 +308,85 @@ it('trims by ttl and by cap', function () {
     $redis->execute('DEL', $key);
 });
 
+it('counts a wide window from the few entries outside it', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-dl-count-wide-'.bin2hex(random_bytes(4)).':';
+    $key = $prefix.'dead-letter';
+    $handler = new DeadLetterHandler(redisUri: torqueRedisUri(), prefix: $prefix, maxEntries: 0);
+
+    $sinceMs = (time() - 3600) * 1000;
+
+    for ($i = 0; $i < 3; $i++) {
+        $redis->execute('XADD', $key, ($sinceMs - 60_000 + $i).'-0', 'payload', 'old');
+    }
+
+    $newest = '';
+
+    for ($i = 0; $i < 600; $i++) {
+        $newest = (string) $redis->execute('XADD', $key, '*', 'payload', 'new', 'exception_trace', str_repeat('x', 200));
+    }
+
+    $redis->execute('XDEL', $key, $newest);
+
+    // Exact, as before, but beyond the 3 entries older than the window only
+    // the first small page inside it is read: at most 4 x 3 + 50.
+    expect($handler->countSince($sinceMs))->toBe(599)
+        ->and($handler->scannedEntries())->toBeLessThanOrEqual(62)
+        ->and($handler->countSince(0))->toBe(602)
+        ->and($handler->scannedEntries())->toBe(0);
+
+    $redis->execute('DEL', $key);
+});
+
+it('counts a narrow window from the entries inside it', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-dl-count-narrow-'.bin2hex(random_bytes(4)).':';
+    $key = $prefix.'dead-letter';
+    $handler = new DeadLetterHandler(redisUri: torqueRedisUri(), prefix: $prefix, maxEntries: 0);
+
+    $sinceMs = (time() - 3600) * 1000;
+
+    for ($i = 0; $i < 3000; $i++) {
+        $redis->execute('XADD', $key, ($sinceMs - 600_000 + $i).'-0', 'payload', 'old');
+    }
+
+    // One entry exactly on the window's edge counts as inside it.
+    $redis->execute('XADD', $key, $sinceMs.'-0', 'payload', 'edge');
+
+    for ($i = 0; $i < 2; $i++) {
+        $redis->execute('XADD', $key, '*', 'payload', 'new');
+    }
+
+    // Only the 3 entries inside the window are read, none of the 3000 before it.
+    expect($handler->countSince($sinceMs))->toBe(3)
+        ->and($handler->scannedEntries())->toBe(3)
+        ->and($handler->list(50, $sinceMs))->toHaveCount(3);
+
+    $redis->execute('DEL', $key);
+});
+
+it('counts a window that splits the stream within four times the shorter side', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-dl-count-half-'.bin2hex(random_bytes(4)).':';
+    $key = $prefix.'dead-letter';
+    $handler = new DeadLetterHandler(redisUri: torqueRedisUri(), prefix: $prefix, maxEntries: 0);
+
+    $sinceMs = (time() - 3600) * 1000;
+
+    for ($i = 0; $i < 700; $i++) {
+        $redis->execute('XADD', $key, ($sinceMs - 600_000 + $i).'-0', 'payload', 'old');
+    }
+
+    for ($i = 0; $i < 700; $i++) {
+        $redis->execute('XADD', $key, ($sinceMs + $i).'-0', 'payload', 'new');
+    }
+
+    expect($handler->countSince($sinceMs))->toBe(700)
+        ->and($handler->scannedEntries())->toBeLessThanOrEqual(4 * 700 + 50);
+
+    $redis->execute('DEL', $key);
+});
+
 it('quarantines an igbinary entry byte for byte with a serializer_mismatch reason', function () {
     try {
         $handler = new DeadLetterHandler(

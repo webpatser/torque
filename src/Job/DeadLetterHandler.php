@@ -367,7 +367,7 @@ final class DeadLetterHandler
     }
 
     /**
-     * Dead-letter entries fetched from Redis by the last {@see findIdByJobUuid()} call.
+     * Dead-letter entries fetched from Redis by the last {@see findIdByJobUuid()} or {@see countSince()} call.
      */
     #[\NoDiscard]
     public function scannedEntries(): int
@@ -464,23 +464,60 @@ final class DeadLetterHandler
     }
 
     /**
-     * Number of entries no older than a millisecond epoch.
+     * Number of entries no older than a millisecond epoch, exact.
      *
-     * `XLEN` cannot take a range, so this is an `XRANGE` with the ids only.
-     * Callers that want the whole stream should keep using {@see count()},
-     * which stays O(1).
+     * `XLEN` cannot take a range and Redis has no id-only range read: `XRANGE`
+     * always returns whole entries, payload and trace included. So the count
+     * walks both sides of the window in alternating pages, inside first, the
+     * page size doubling from 50 to 500: the entries inside it from the window's
+     * start, the entries before it from the stream's start. The side that runs
+     * out first gives the answer (directly, or as `XLEN` minus the entries
+     * before the window). Entries read stay within 4 x the shorter side + 50,
+     * so a window with a few recent failures reads just those, and a window
+     * that covers most of the stream reads only the few entries outside it.
      */
     #[\NoDiscard]
     public function countSince(int $sinceMs): int
     {
-        $entries = $this->redis->execute(
-            'XRANGE',
-            $this->deadLetterStream,
-            self::lowId($sinceMs),
-            '+',
-        );
+        $this->scannedEntries = 0;
 
-        return is_array($entries) ? count($entries) : 0;
+        if ($sinceMs <= 0) {
+            return $this->count();
+        }
+
+        $inside = 0;
+        $before = 0;
+        $insideFrom = self::lowId($sinceMs);
+        $beforeFrom = '-';
+        $size = 50;
+
+        for ($round = 1; ; $round++) {
+            $page = Narrow::entries($this->redis->execute('XRANGE', $this->deadLetterStream, $insideFrom, '+', 'COUNT', (string) $size));
+            $this->scannedEntries += count($page);
+            $inside += count($page);
+
+            if (count($page) < $size) {
+                // One XRANGE is atomic; across pages a delete or trim during
+                // the walk could leave the sum above the stream's length.
+                return $round === 1 ? $inside : min($inside, $this->count());
+            }
+
+            $insideFrom = '('.$page[count($page) - 1]['id'];
+
+            // An id of only milliseconds as the end includes every sequence.
+            $page = Narrow::entries($this->redis->execute('XRANGE', $this->deadLetterStream, $beforeFrom, (string) ($sinceMs - 1), 'COUNT', (string) $size));
+            $this->scannedEntries += count($page);
+            $before += count($page);
+
+            if (count($page) < $size) {
+                // XLEN read after the walk, so entries appended meanwhile are
+                // counted; clamped in case a delete or trim raced the walk.
+                return max(0, $this->count() - $before);
+            }
+
+            $beforeFrom = '('.$page[count($page) - 1]['id'];
+            $size = min(500, $size * 2);
+        }
     }
 
     /**
