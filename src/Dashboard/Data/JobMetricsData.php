@@ -38,11 +38,10 @@ final class JobMetricsData
     {
         $window = Range::make($range);
         $isMinuteTier = $window->tier === MetricsPublisher::TIER_MINUTE;
-        $jobs = [];
+        $active = [];
 
-        foreach ($this->metrics->jobClasses() as $class) {
-            $series = $this->metrics->jobSeries($class, $window->tier, $window->count);
-
+        // Every class in one pipelined read rather than a round trip each.
+        foreach ($this->metrics->jobSeriesMulti($this->metrics->jobClasses(), $window->tier, $window->count) as $class => $series) {
             $processed = 0;
             $failed = 0;
             $runtimeSum = 0.0;
@@ -63,11 +62,21 @@ final class JobMetricsData
                 continue;
             }
 
-            // The minute tier is already the spark's resolution, so reuse it
-            // instead of reading the same class twice.
-            $spark = $isMinuteTier
-                ? $series
-                : $this->metrics->jobSeries($class, MetricsPublisher::TIER_MINUTE, 60);
+            $active[(string) $class] = [$series, $processed, $failed, $finished, $runtimeSum, $runtimeMax];
+        }
+
+        // The minute tier is already the spark's resolution, so reuse it
+        // instead of reading the same classes twice; otherwise one more
+        // pipelined read, for the classes that made it into the table only.
+        $sparks = $isMinuteTier
+            ? array_map(static fn (array $row): array => $row[0], $active)
+            : $this->metrics->jobSeriesMulti(array_map(strval(...), array_keys($active)), MetricsPublisher::TIER_MINUTE, 60);
+
+        $jobs = [];
+
+        foreach ($active as $class => [, $processed, $failed, $finished, $runtimeSum, $runtimeMax]) {
+            $class = (string) $class;
+            $spark = $sparks[$class] ?? [];
 
             ['ns' => $ns, 'cls' => $cls] = JobPresenter::splitName($class);
 

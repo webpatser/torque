@@ -10,6 +10,8 @@ use Illuminate\Support\Arr;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\WorkerId;
 
+use function Fledge\Async\async;
+use function Fledge\Async\Future\await;
 use function Fledge\Async\Redis\createRedisClient;
 use function Fledge\Async\Redis\createRedisConnector;
 
@@ -327,11 +329,39 @@ LUA;
     ) {}
 
     /**
+     * Write a hash and set its expiry in one round trip.
+     *
+     * KEYS[1] hash   ARGV[1] TTL seconds   ARGV[2..] field, value pairs
+     */
+    private const string LUA_HSET_EXPIRE = <<<'LUA'
+redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+
+return 1
+LUA;
+
+    /**
+     * Add a member to a sorted set and set the set's expiry in one round trip.
+     *
+     * KEYS[1] sorted set   ARGV[1] score   ARGV[2] member   ARGV[3] TTL seconds
+     */
+    private const string LUA_ZADD_EXPIRE = <<<'LUA'
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+
+return 1
+LUA;
+
+    /**
      * Publish a single worker's metrics to its dedicated Redis hash.
      *
      * Key: `{prefix}worker:{workerId}`
      * A TTL is set on every publish as a heartbeat — if the worker dies, the
      * key expires and disappears from the dashboard automatically.
+     *
+     * Two round trips: the hash with its expiry, then the index entry. They
+     * stay two scripts because the keys can sit in different cluster slots,
+     * and the index goes second so a failed hash write never adds a member.
      */
     public function publishWorkerMetrics(string $workerId, WorkerSnapshot $snapshot): void
     {
@@ -339,7 +369,8 @@ LUA;
         $key = $this->prefix.'worker:'.$workerId;
         $parsed = WorkerId::parse($workerId);
 
-        $redis->execute('HSET', $key,
+        $redis->eval(self::LUA_HSET_EXPIRE, [$key], [
+            (string) self::HEARTBEAT_TTL_SECONDS,
             'pid', (string) ($parsed->pid ?? getmypid()),
             'host', $parsed->host,
             'jobs_processed', (string) $snapshot->jobsProcessed,
@@ -356,9 +387,19 @@ LUA;
             // Same trick for per-class counters: one field, whatever the number
             // of distinct job classes this worker has run.
             'per_job', json_encode($snapshot->perJob) ?: '{}',
-        );
+        ]);
 
-        $redis->execute('EXPIRE', $key, (string) self::HEARTBEAT_TTL_SECONDS);
+        // Index for getAllWorkerMetrics(), which would otherwise SCAN the whole
+        // keyspace. The hash TTL stays the liveness authority; readers drop
+        // members whose hash is gone, so no clock is compared across hosts.
+        $redis->eval(self::LUA_ZADD_EXPIRE, [$this->workerIndexKey()], [
+            (string) time(), $workerId, (string) self::HEARTBEAT_TTL_SECONDS,
+        ]);
+    }
+
+    private function workerIndexKey(): string
+    {
+        return $this->prefix.'metrics:workers';
     }
 
     /**
@@ -1243,19 +1284,45 @@ LUA;
     #[\NoDiscard]
     public function jobSeries(string $class, string $tier, int $count, ?int $now = null): array
     {
-        $seconds = self::TIER_SECONDS[$tier]
-            ?? throw new \InvalidArgumentException("Unknown metrics tier [{$tier}].");
+        return $this->jobSeriesMulti([$class], $tier, $count, $now)[$class];
+    }
 
-        $count = max(1, $count);
-        $now ??= time();
-        $current = intdiv($now, $seconds) * $seconds;
-        $oldest = $current - ($count - 1) * $seconds;
+    /**
+     * Per-bucket outcomes for several job classes, oldest first and gap-filled.
+     *
+     * Every class has a rollup key of its own, so no single command covers
+     * them. The reads go out together instead, pipelined on the one connection:
+     * one round trip for the whole jobs screen rather than one per class. Each
+     * is a single-key HMGET of the window's buckets, which keeps it valid on
+     * Redis Cluster and stops a 60 minute view from pulling back the full day
+     * of minute buckets a HGETALL would.
+     *
+     * @param  list<string>  $classes
+     * @return array<string, array<int, array{processed: int, failed: int, runtimeSumMs: float, runtimeMaxMs: float}>> Class => series.
+     */
+    #[\NoDiscard]
+    public function jobSeriesMulti(array $classes, string $tier, int $count, ?int $now = null): array
+    {
+        $buckets = self::bucketRange($tier, $count, $now);
+        $fields = array_map(strval(...), $buckets);
+        $classes = array_values(array_unique(array_map(strval(...), $classes)));
+        $raw = [];
 
-        $raw = $this->metricsEnabled() ? $this->readHash($this->jobKey($tier, $class)) : [];
+        if ($this->metricsEnabled() && $classes !== []) {
+            $raw = await(array_combine($classes, array_map(
+                fn (string $class) => async(fn (): array => $this->readFields($this->jobKey($tier, $class), $fields)),
+                $classes,
+            )));
+        }
+
         $series = [];
 
-        for ($bucket = $oldest; $bucket <= $current; $bucket += $seconds) {
-            $series[$bucket] = self::parseJobOutcome($raw[(string) $bucket] ?? null);
+        foreach ($classes as $class) {
+            $series[$class] = [];
+
+            foreach ($buckets as $bucket) {
+                $series[$class][$bucket] = self::parseJobOutcome($raw[$class][$bucket] ?? null);
+            }
         }
 
         return $series;
@@ -1424,6 +1491,7 @@ LUA;
     public function removeWorkerMetrics(string $workerId): void
     {
         $this->getRedis()->execute('DEL', $this->prefix.'worker:'.$workerId);
+        $this->getRedis()->execute('ZREM', $this->workerIndexKey(), $workerId);
     }
 
     /**
@@ -1436,6 +1504,7 @@ LUA;
     {
         $redis = $this->getRedis();
         $pattern = $this->prefix.'worker:*';
+        $prefixLen = strlen($this->prefix.'worker:');
         $cursor = '0';
 
         do {
@@ -1449,7 +1518,9 @@ LUA;
             $keys = Narrow::list($result[1] ?? null);
 
             foreach ($keys as $key) {
-                $redis->execute('DEL', Narrow::string($key));
+                $key = Narrow::string($key);
+                $redis->execute('DEL', $key);
+                $redis->execute('ZREM', $this->workerIndexKey(), substr($key, $prefixLen));
             }
         } while ($cursor !== '0');
     }
@@ -1477,7 +1548,16 @@ LUA;
     /**
      * Read metrics for all currently alive workers.
      *
-     * Uses SCAN to iterate `{prefix}worker:*` keys without blocking Redis.
+     * Reads the members of `{prefix}metrics:workers` that
+     * {@see publishWorkerMetrics()} maintains: one command plus one HGETALL
+     * per worker, however large the keyspace. Members whose hash has expired
+     * are dropped from the index.
+     *
+     * SCAN over `{prefix}worker:*` is added only when the fleet may hold
+     * workers of the release before the index, which write their hash alone:
+     * when the index is empty, or while the shared `{prefix}metrics` hash
+     * exists. Only masters of that release write it, with a 30 second TTL,
+     * so a fleet that is fully upgraded never scans.
      *
      * @return array<string, array<string, string>> Keyed by worker ID.
      */
@@ -1485,9 +1565,36 @@ LUA;
     public function getAllWorkerMetrics(): array
     {
         $redis = $this->getRedis();
+        $ids = $redis->execute('ZRANGE', $this->workerIndexKey(), '0', '-1');
+        $ids = is_array($ids) ? $ids : [];
+        $workers = [];
+
+        if ($ids !== []) {
+            $oldMasters = Narrow::int($redis->execute('EXISTS', $this->prefix.'metrics')) > 0;
+            $gone = [];
+
+            foreach ($ids as $id) {
+                $id = Narrow::string($id);
+                $data = $redis->execute('HGETALL', $this->prefix.'worker:'.$id);
+
+                if (is_array($data) && $data !== []) {
+                    $workers[$id] = $this->flatPairsToAssoc($data);
+                } else {
+                    $gone[] = $id;
+                }
+            }
+
+            if ($gone !== []) {
+                $redis->execute('ZREM', $this->workerIndexKey(), ...$gone);
+            }
+
+            if (! $oldMasters) {
+                return $workers;
+            }
+        }
+
         $pattern = $this->prefix.'worker:*';
         $prefixLen = strlen($this->prefix.'worker:');
-        $workers = [];
         $cursor = '0';
 
         do {
@@ -1502,10 +1609,15 @@ LUA;
 
             foreach ($keys as $key) {
                 $key = Narrow::string($key);
+                $workerId = substr($key, $prefixLen);
+
+                if (isset($workers[$workerId])) {
+                    continue;
+                }
+
                 $data = $redis->execute('HGETALL', $key);
 
                 if (is_array($data) && $data !== []) {
-                    $workerId = substr($key, $prefixLen);
                     $workers[$workerId] = $this->flatPairsToAssoc($data);
                 }
             }
@@ -2011,8 +2123,11 @@ LUA;
      * The per-host hashes hold a full retention window for the whole fleet, so
      * a range read names its fields instead of pulling everything back.
      *
+     * Keyed by field name, except that PHP turns a decimal field such as a
+     * bare bucket epoch into an int key, hence array-key.
+     *
      * @param  list<string>  $fields
-     * @return array<string, string>
+     * @return array<array-key, string>
      */
     private function readFields(string $key, array $fields): array
     {

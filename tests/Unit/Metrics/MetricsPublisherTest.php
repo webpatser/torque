@@ -2,10 +2,17 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
+use Fledge\Async\Redis\Connection\RedisLink;
 use Fledge\Async\Redis\Connection\RedisTimeoutException;
+use Fledge\Async\Redis\Protocol\RedisResponse;
+use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
+use Webpatser\Torque\Dashboard\Data\JobMetricsData;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
+
+use function Fledge\Async\Redis\createRedisConnector;
 
 /**
  * Helper to create a MetricsPublisher pointed at the test Redis database.
@@ -31,8 +38,34 @@ function cleanupRedisKeys(MetricsPublisher $publisher, string $prefix, array $wo
         $redis->execute('DEL', $prefix.'worker:'.$id);
     }
 
-    $redis->execute('DEL', $prefix.'metrics', $prefix.'metrics:live');
+    $redis->execute('DEL', $prefix.'metrics', $prefix.'metrics:live', $prefix.'metrics:workers');
     deleteKeysMatching($redis, $prefix.'metrics:live:*');
+}
+
+/**
+ * Point a publisher at a client on the real test Redis that records the name
+ * of every command it sends, and return that record.
+ *
+ * @return ArrayObject<int, string>
+ */
+function recordPublisherCommands(MetricsPublisher $publisher): ArrayObject
+{
+    $commands = new ArrayObject;
+    $link = new ReconnectingRedisLink(createRedisConnector(env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15')));
+
+    (new ReflectionProperty(MetricsPublisher::class, 'redis'))->setValue($publisher, new RedisClient(new class($link, $commands) implements RedisLink
+    {
+        public function __construct(private readonly RedisLink $link, private readonly ArrayObject $commands) {}
+
+        public function execute(string $command, array $parameters): RedisResponse
+        {
+            $this->commands[] = strtoupper($command);
+
+            return $this->link->execute($command, $parameters);
+        }
+    }));
+
+    return $commands;
 }
 
 /**
@@ -177,6 +210,166 @@ it('returns all worker metrics', function () {
         cleanupRedisKeys($publisher, $prefix, ['w1', 'w2', 'w3']);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+/**
+ * The master calls this every tick. A SCAN MATCH walks the whole database in
+ * pages of 100 whatever the number of workers, so the command count has to
+ * follow the workers and not the keyspace.
+ */
+it('reads all workers from the index without walking the keyspace', function () {
+    $prefix = 'torque-index-test:';
+    $publisher = createPublisher($prefix);
+    $ids = ['w1', 'w2', 'w3'];
+    $filler = array_map(static fn (int $i): string => $prefix.'job:filler-'.$i, range(1, 1000));
+
+    try {
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+        cleanupRedisKeys($publisher, $prefix, $ids);
+
+        foreach ($ids as $i => $id) {
+            $publisher->publishWorkerMetrics($id, makeSnapshot(jobsProcessed: 10 * ($i + 1)));
+        }
+
+        foreach (array_chunk($filler, 250) as $chunk) {
+            $redis->execute('MSET', ...array_merge(...array_map(static fn (string $key): array => [$key, '1'], $chunk)));
+        }
+
+        $commands = recordPublisherCommands($publisher);
+        $all = $publisher->getAllWorkerMetrics();
+
+        expect(array_map(static fn (array $w): string => $w['jobs_processed'], $all))
+            ->toEqualCanonicalizing(['w1' => '10', 'w2' => '20', 'w3' => '30'])
+            ->and($commands->getArrayCopy())->not->toContain('SCAN')
+            // The index, the old-master check, one hash per worker.
+            ->and($commands->getArrayCopy())->toBe(['ZRANGE', 'EXISTS', ...array_fill(0, count($ids), 'HGETALL')]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupRedisKeys($publisher, $prefix, $ids);
+        $redis->execute('DEL', ...$filler);
+    }
+});
+
+it('drops a worker from the index once its hash is gone', function () {
+    $prefix = 'torque-index-stale-test:';
+    $publisher = createPublisher($prefix);
+    $ids = ['w1', 'w2', 'w3'];
+
+    try {
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+        cleanupRedisKeys($publisher, $prefix, $ids);
+
+        foreach ($ids as $id) {
+            $publisher->publishWorkerMetrics($id, makeSnapshot());
+        }
+
+        // w2 left gracefully, w3's hash expired (a crash): neither is listed,
+        // and neither stays in the index.
+        $publisher->removeWorkerMetrics('w2');
+        $redis->execute('DEL', $prefix.'worker:w3');
+
+        expect(array_keys($publisher->getAllWorkerMetrics()))->toBe(['w1'])
+            ->and($redis->execute('ZRANGE', $prefix.'metrics:workers', '0', '-1'))->toBe(['w1'])
+            ->and((int) $redis->execute('TTL', $prefix.'metrics:workers'))->toBeGreaterThan(0);
+
+        $publisher->removeAllWorkerMetrics();
+
+        expect($publisher->getAllWorkerMetrics())->toBe([])
+            ->and($redis->execute('EXISTS', $prefix.'metrics:workers'))->toBe(0);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupRedisKeys($publisher, $prefix, $ids);
+    }
+});
+
+it('still finds workers that publish without the index, as during a deploy', function () {
+    $prefix = 'torque-index-legacy-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+        cleanupRedisKeys($publisher, $prefix, ['old-1']);
+
+        // A worker on the previous release writes its hash and nothing else.
+        $redis->execute('HSET', $prefix.'worker:old-1', 'host', 'web-01', 'jobs_processed', '7');
+        $redis->execute('EXPIRE', $prefix.'worker:old-1', '60');
+
+        expect($publisher->getAllWorkerMetrics())->toBe(['old-1' => ['host' => 'web-01', 'jobs_processed' => '7']]);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupRedisKeys($publisher, $prefix, ['old-1']);
+    }
+});
+
+/**
+ * A rolling deploy: web-02 already runs this release and fills the index,
+ * web-01 still runs the previous one, whose workers write only their hash and
+ * whose master writes the shared `{prefix}metrics` hash (30 second TTL). While
+ * that hash exists the reader adds a SCAN; once it is gone nothing scans.
+ */
+it('lists workers of hosts still on the previous release while an old master is alive', function () {
+    $prefix = 'torque-index-mixed-test:';
+    $publisher = createPublisher($prefix);
+    $ids = ['web-02-2-bbbbbbbb', 'old-1'];
+
+    try {
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+        cleanupRedisKeys($publisher, $prefix, $ids);
+
+        $publisher->publishWorkerMetrics('web-02-2-bbbbbbbb', makeSnapshot(jobsProcessed: 20));
+        $redis->execute('HSET', $prefix.'worker:old-1', 'host', 'web-01', 'jobs_processed', '7');
+        $redis->execute('EXPIRE', $prefix.'worker:old-1', '60');
+        $redis->execute('HSET', $prefix.'metrics', 'workers', '1');
+        $redis->execute('EXPIRE', $prefix.'metrics', '30');
+
+        $mixed = $publisher->getAllWorkerMetrics();
+
+        expect(array_keys($mixed))->toEqualCanonicalizing($ids)
+            ->and($mixed['old-1']['jobs_processed'])->toBe('7')
+            ->and($mixed['web-02-2-bbbbbbbb']['jobs_processed'])->toBe('20');
+
+        // The last old master stopped: its hash expired, the index alone is read.
+        $redis->execute('DEL', $prefix.'metrics');
+        $commands = recordPublisherCommands($publisher);
+
+        expect(array_keys($publisher->getAllWorkerMetrics()))->toBe(['web-02-2-bbbbbbbb'])
+            ->and($commands->getArrayCopy())->not->toContain('SCAN');
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupRedisKeys($publisher, $prefix, $ids);
+    }
+});
+
+it('publishes a worker hash and its index entry in two round trips', function () {
+    $prefix = 'torque-index-publish-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        cleanupRedisKeys($publisher, $prefix, ['w1']);
+
+        $commands = recordPublisherCommands($publisher);
+
+        // The first publish may load the scripts; count a steady one.
+        $publisher->publishWorkerMetrics('w1', makeSnapshot());
+        $commands->exchangeArray([]);
+        $publisher->publishWorkerMetrics('w1', makeSnapshot(jobsProcessed: 11));
+
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+
+        expect(count($commands))->toBe(2)
+            ->and($publisher->getWorkerMetrics('w1')['jobs_processed'])->toBe('11')
+            ->and((int) $redis->execute('TTL', $prefix.'worker:w1'))->toBeGreaterThan(0)->toBeLessThanOrEqual(60)
+            ->and($redis->execute('ZRANGE', $prefix.'metrics:workers', '0', '-1'))->toBe(['w1'])
+            ->and((int) $redis->execute('TTL', $prefix.'metrics:workers'))->toBeGreaterThan(0)->toBeLessThanOrEqual(60);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupRedisKeys($publisher, $prefix, ['w1']);
     }
 });
 
@@ -766,6 +959,154 @@ it('drops job classes from the index once their daily rollup is gone', function 
         cleanupGaugesAndJobs($publisher, $prefix, [$class, 'App\\Jobs\\Active']);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+/**
+ * Point a publisher at a client on the real test Redis that records every
+ * command, the hash fields its HMGETs name, and the round trips: a round trip
+ * starts whenever a command goes out while none is in flight, so commands
+ * pipelined on the one connection count once.
+ */
+function recordPublisherRoundTrips(MetricsPublisher $publisher): stdClass
+{
+    $log = (object) ['commands' => [], 'fields' => 0, 'roundTrips' => 0, 'inFlight' => 0];
+    $link = new ReconnectingRedisLink(createRedisConnector(env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15')));
+
+    (new ReflectionProperty(MetricsPublisher::class, 'redis'))->setValue($publisher, new RedisClient(new class($link, $log) implements RedisLink
+    {
+        public function __construct(private readonly RedisLink $link, private readonly stdClass $log) {}
+
+        public function execute(string $command, array $parameters): RedisResponse
+        {
+            $command = strtoupper($command);
+
+            if ($this->log->inFlight === 0) {
+                $this->log->roundTrips++;
+            }
+
+            $this->log->inFlight++;
+            $this->log->commands[] = $command;
+
+            if ($command === 'HMGET') {
+                $this->log->fields += count($parameters) - 1;
+            }
+
+            try {
+                return $this->link->execute($command, $parameters);
+            } finally {
+                $this->log->inFlight--;
+            }
+        }
+    }));
+
+    return $log;
+}
+
+/**
+ * The jobs screen polls. Every class has a rollup key of its own, so reading
+ * them one after the other cost a round trip per class (two on the coarser
+ * ranges, for the minute spark), and each read pulled the class's whole hash:
+ * a full day of minute buckets for a 60 minute view.
+ */
+it('reads the jobs screen in one round trip per tier and only the window fields', function () {
+    $prefix = 'torque-jobscreen-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+    $active = [
+        'App\\Jobs\\Alpha' => [10, 0, 100.0, 20.0],
+        'App\\Jobs\\Bravo' => [4, 1, 50.0, 30.0],
+        'App\\Jobs\\Charlie' => [1, 0, 5.0, 5.0],
+        'App\\Jobs\\Delta' => [0, 3, 9.0, 4.0],
+    ];
+    $stale = 'App\\Jobs\\Stale';
+    $classes = [...array_keys($active), $stale];
+
+    try {
+        cleanupGaugesAndJobs($publisher, $prefix, $classes);
+
+        $publisher->recordJobOutcomes($active, $now);
+
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+
+        // In the index, no activity in any window: no row and no spark read.
+        $redis->execute('SADD', $prefix.'metrics:jobs', $stale);
+
+        // Old minute buckets the 60 minute view must not pull back.
+        $old = intdiv($now, 60) * 60 - 7200;
+        $redis->execute('HSET', $prefix.'metrics:rollup:minute:job:App\\Jobs\\Alpha',
+            ...array_merge(...array_map(static fn (int $i): array => [(string) ($old - 60 * $i), '1,0,1,1'], range(0, 499))));
+
+        $data = new JobMetricsData($publisher);
+        $rows = static fn (array $result): array => array_map(
+            static fn (array $row): array => [
+                $row['class'], $row['processed'], $row['failed'], $row['avgRuntimeMs'], $row['maxRuntimeMs'], array_sum($row['history']),
+            ],
+            $result['jobs'],
+        );
+
+        // 7 days: the hour tier for the range, the minute tier for the spark.
+        $log = recordPublisherRoundTrips($publisher);
+        $week = $data->get('7d', 'name', 'asc');
+
+        expect($rows($week))->toBe([
+            ['App\\Jobs\\Alpha', 10, 0, 10.0, 20.0, 10],
+            ['App\\Jobs\\Bravo', 4, 1, 10.0, 30.0, 4],
+            ['App\\Jobs\\Charlie', 1, 0, 5.0, 5.0, 1],
+            ['App\\Jobs\\Delta', 0, 3, 3.0, 4.0, 0],
+        ])
+            ->and($week['totals'])->toBe(['classes' => 4, 'processed' => 15, 'failed' => 4, 'slowest' => 30.0])
+            ->and($log->commands)->not->toContain('HGETALL')
+            ->and(count($log->commands))->toBe(1 + count($classes) + count($active))
+            ->and($log->roundTrips)->toBe(3)
+            ->and($log->fields)->toBe(count($classes) * 168 + count($active) * 60);
+
+        // 60 minutes: the minute tier serves the range and the spark at once.
+        $log = recordPublisherRoundTrips($publisher);
+        $hour = $data->get('1h', 'throughput', 'desc');
+
+        expect(array_column($hour['jobs'], 'class'))->toBe(['App\\Jobs\\Alpha', 'App\\Jobs\\Bravo', 'App\\Jobs\\Delta', 'App\\Jobs\\Charlie'])
+            ->and(array_column($hour['jobs'], 'throughput'))->toBe([0.17, 0.08, 0.05, 0.02])
+            ->and($log->commands)->not->toContain('HGETALL')
+            ->and(count($log->commands))->toBe(1 + count($classes))
+            ->and($log->roundTrips)->toBe(2)
+            ->and($log->fields)->toBe(count($classes) * 60);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupGaugesAndJobs($publisher, $prefix, $classes);
+    }
+});
+
+it('reads several job classes in one call with the same series as one at a time', function () {
+    $prefix = 'torque-jobmulti-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+    $classes = ['App\\Jobs\\One', 'App\\Jobs\\Two', 'App\\Jobs\\Never'];
+
+    try {
+        cleanupGaugesAndJobs($publisher, $prefix, $classes);
+
+        $publisher->recordJobOutcomes(['App\\Jobs\\One' => [2, 1, 30.0, 20.0]], $now - 60);
+        $publisher->recordJobOutcomes(['App\\Jobs\\Two' => [5, 0, 50.0, 15.0]], $now);
+
+        $multi = $publisher->jobSeriesMulti($classes, 'minute', 3, $now);
+        $bucket = intdiv($now, 60) * 60;
+
+        expect(array_keys($multi))->toBe($classes)
+            ->and($multi['App\\Jobs\\One'][$bucket - 60])->toBe(['processed' => 2, 'failed' => 1, 'runtimeSumMs' => 30.0, 'runtimeMaxMs' => 20.0])
+            ->and($multi['App\\Jobs\\Two'][$bucket]['processed'])->toBe(5)
+            ->and(array_keys($multi['App\\Jobs\\Never']))->toBe([$bucket - 120, $bucket - 60, $bucket])
+            ->and($multi['App\\Jobs\\Never'][$bucket]['processed'])->toBe(0)
+            ->and($publisher->jobSeriesMulti([], 'minute', 3, $now))->toBe([]);
+
+        foreach ($classes as $class) {
+            expect($publisher->jobSeries($class, 'minute', 3, $now))->toBe($multi[$class]);
+        }
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupGaugesAndJobs($publisher, $prefix, $classes);
     }
 });
 
