@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-11-18
+
+### Changed
+- `torque:flush` warns with the number of claimed (in-flight) stream entries it removed: those jobs still finish, but a worker that dies while running one leaves nothing to reclaim. `--force` is unchanged.
+
 ## [2.3.0] - 2026-11-18
 
 ### Changed
@@ -864,7 +869,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/webpatser/torque/compare/v2.3.0...v2.3.1
 [2.2.1]: https://github.com/webpatser/torque/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/webpatser/torque/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/webpatser/torque/compare/v2.0.0...v2.1.0
