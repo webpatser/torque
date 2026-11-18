@@ -6,6 +6,7 @@ namespace Webpatser\Torque\Queue;
 
 use DateInterval;
 use DateTimeInterface;
+use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Container\Container;
@@ -22,6 +23,7 @@ use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisConnector;
 use function Illuminate\Support\enum_value;
 
 /**
@@ -214,8 +216,14 @@ LUA;
         private readonly string $consumerGroup = 'torque',
         private readonly bool $cluster = false,
         private readonly string $serializer = 'json',
+        ?float $readTimeout = null,
     ) {
-        $this->redis = createRedisClient($this->redisUri);
+        // A read timeout is for long-lived callers outside the workers, such as
+        // the master's depth probe, where a half-open socket would block a
+        // synchronous loop until TCP gives up.
+        $this->redis = $readTimeout !== null && $readTimeout > 0
+            ? new RedisClient(new ReconnectingRedisLink(createRedisConnector($this->redisUri), readTimeout: $readTimeout))
+            : createRedisClient($this->redisUri);
         $this->consumerId = gethostname().'-'.getmypid();
     }
 

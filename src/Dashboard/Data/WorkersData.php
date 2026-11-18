@@ -57,7 +57,7 @@ final class WorkersData
 
         foreach ($names as $host) {
             $workers = $live[$host] ?? [];
-            $series = $counters[MetricsPublisher::normaliseHost($host)] ?? [];
+            $series = $counters[$host] ?? [];
 
             $processed = 0;
             $failed = 0;
@@ -70,7 +70,7 @@ final class WorkersData
             }
 
             $finished = $processed + $failed;
-            $hostGauges = $gauges[MetricsPublisher::normaliseHost($host)] ?? [];
+            $hostGauges = $gauges[$host] ?? [];
 
             $hosts[] = [
                 'host' => $host,
@@ -109,6 +109,9 @@ final class WorkersData
     /**
      * The live worker processes, grouped by the host they run on.
      *
+     * Keyed by the normalised host, the name the index and the rollups store,
+     * so a live host and its history are one row rather than two.
+     *
      * @return array<string, list<array<string, mixed>>>
      */
     private function liveByHost(): array
@@ -126,7 +129,7 @@ final class WorkersData
                 continue;
             }
 
-            $hosts[$host][] = [
+            $hosts[MetricsPublisher::normaliseHost($host)][] = [
                 'id' => (string) $id,
                 'pid' => isset($w['pid']) ? (int) $w['pid'] : $parsed->pid,
                 'slots' => (int) ($w['total_slots'] ?? 0),

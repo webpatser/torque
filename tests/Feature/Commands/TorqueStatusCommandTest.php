@@ -5,6 +5,7 @@ use Fledge\Async\Redis\RedisException;
 use Illuminate\Support\Facades\Artisan;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
+use Webpatser\Torque\Process\MasterProcess;
 
 it('is registered as an artisan command', function () {
     $commands = collect($this->app->make('Illuminate\Contracts\Console\Kernel')->all());
@@ -96,6 +97,35 @@ it('names the master a drain pause belongs to', function () {
 
     expect($output)->toContain('Queue PAUSED')
         ->toContain('drain from master PID 424242');
+});
+
+it('shows the respawns a master owes after failed forks', function () {
+    $redis = torqueRedis();
+    $prefix = (string) config('torque.redis.prefix');
+    $host = 'owed-test-host';
+    $key = $prefix.'metrics:live:'.$host;
+
+    $redis->execute('HSET', $key, 'workers', '0', MasterProcess::PENDING_RESPAWNS_FIELD, '3');
+    $redis->execute('ZADD', $prefix.'metrics:live', (string) time(), $host);
+
+    try {
+        Artisan::call('torque:status');
+        $output = Artisan::output();
+    } finally {
+        $redis->execute('DEL', $key);
+        $redis->execute('ZREM', $prefix.'metrics:live', $host);
+    }
+
+    expect($output)->toContain('Respawns owed')
+        ->toContain('3 on '.$host);
+});
+
+it('says nothing about respawns while none are owed', function () {
+    torqueRedis();
+
+    Artisan::call('torque:status');
+
+    expect(Artisan::output())->not->toContain('Respawns owed');
 });
 
 it('distinguishes a manual pause from a drain', function () {

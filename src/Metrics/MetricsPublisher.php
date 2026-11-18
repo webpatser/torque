@@ -4,19 +4,22 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Metrics;
 
+use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
 use Fledge\Async\Redis\RedisClient;
 use Illuminate\Support\Arr;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisConnector;
 
 /**
  * Publishes worker metrics to Redis hashes for dashboard consumption.
  *
  * Each worker process publishes its own metrics via {@see publishWorkerMetrics()},
- * and the master process aggregates all workers into a single summary hash via
- * {@see publishAggregatedMetrics()}.
+ * and each master aggregates its own host's workers into a per-host summary hash
+ * via {@see publishAggregate()}; readers sum the hosts with
+ * {@see getAggregatedMetrics()}.
  *
  * Keys use a configurable prefix and include a heartbeat TTL so stale worker
  * entries auto-expire if a process crashes without cleanup.
@@ -26,9 +29,11 @@ final class MetricsPublisher
     private const int HEARTBEAT_TTL_SECONDS = 60;
 
     /**
-     * TTL on the aggregated `{prefix}metrics` hash. A dead publisher must
-     * read as "no data" (dashboards and torque:status render placeholders)
-     * rather than serving stale numbers forever.
+     * TTL on each host's `{prefix}metrics:live:{host}` aggregate, and the
+     * window of the `{prefix}metrics:live` index. A dead publisher must read
+     * as "no data" (dashboards and torque:status render placeholders) rather
+     * than serving stale numbers forever, and a host that went away drops out
+     * of the cluster sums once this has passed.
      */
     private const int AGGREGATE_TTL_SECONDS = 30;
 
@@ -209,6 +214,35 @@ LUA;
     public const string GAUGE_DELAYED = 'delayed';
 
     /**
+     * Gauges every master measures for the whole cluster rather than for its
+     * own host. Queue depth comes from the shared streams, so each host's
+     * sample is the same number and a sum would multiply it by the host count;
+     * these stay in the unscoped `{bucket}:{metric}` field.
+     *
+     * @var list<string>
+     */
+    private const array CLUSTER_WIDE_GAUGES = [self::GAUGE_PENDING, self::GAUGE_DELAYED];
+
+    /**
+     * Fields of a host's live aggregate that add across hosts. Counts as
+     * integers, the rest (throughput per second, megabytes) as floats.
+     *
+     * @var list<string>
+     */
+    private const array SUMMED_INT_FIELDS = ['concurrent', 'total_slots', 'jobs_processed', 'jobs_failed', 'workers'];
+
+    /** @var list<string> */
+    private const array SUMMED_FLOAT_FIELDS = ['throughput', 'memory_mb'];
+
+    /**
+     * Fields every master computes from the cluster-wide minute rollup, so
+     * every host carries the same figure. The freshest host's copy is used.
+     *
+     * @var list<string>
+     */
+    private const array CLUSTER_WIDE_FIELDS = ['throughput_1m', 'throughput_5m', 'throughput_smoothed', 'jobs_last_hour'];
+
+    /**
      * Per-host gauges. Every host shares one hash per tier,
      * `{prefix}metrics:gauge:{tier}:host`, under field
      * `{bucket}:{host}:{metric}` holding "sum,count,max"; the host is part of
@@ -260,12 +294,36 @@ LUA;
     private ?array $lastHostIndexTouch = null;
 
     /**
+     * Hash fields the last {@see gaugeSeriesMulti()} call asked for, so a test
+     * can bound what a range read costs by count rather than by timing.
+     */
+    private int $fieldsRequested = 0;
+
+    /**
+     * Earliest epoch this instance wrote to the first-seen index, per host, so
+     * a tick does not repeat a ZADD that cannot lower the score any further.
+     *
+     * @var array<string, int>
+     */
+    private array $firstSeenWritten = [];
+
+    /**
+     * Earliest epoch per host whose first-seen write has not succeeded yet,
+     * kept so a retry after a failed ZADD still carries that epoch.
+     *
+     * @var array<string, int>
+     */
+    private array $firstSeenPending = [];
+
+    /**
      * @param  array<string, mixed>  $settings  The `torque.metrics` config block (enabled, retention, rollups).
+     * @param  float|null  $readTimeout  Seconds to wait for a reply; null or zero waits forever.
      */
     public function __construct(
         private readonly string $redisUri,
         private readonly string $prefix = 'torque:',
         private readonly array $settings = [],
+        private readonly ?float $readTimeout = null,
     ) {}
 
     /**
@@ -304,19 +362,14 @@ LUA;
     }
 
     /**
-     * Publish aggregated metrics across all workers.
+     * Publish aggregated metrics across this host's workers.
      *
-     * Key: `{prefix}metrics`
-     * Called by the master process on a timer to provide a single-key
-     * overview for the dashboard.
+     * Key: `{prefix}metrics:live:{host}`, see {@see publishAggregate()}.
      *
      * @param  WorkerSnapshot[]  $workerSnapshots
      */
-    public function publishAggregatedMetrics(array $workerSnapshots): void
+    public function publishAggregatedMetrics(array $workerSnapshots, ?string $host = null): void
     {
-        $redis = $this->getRedis();
-        $key = $this->prefix.'metrics';
-
         $totalProcessed = 0;
         $totalFailed = 0;
         $totalActive = 0;
@@ -358,7 +411,9 @@ LUA;
             $throughput = $elapsed > 0 ? $totalProcessed / $elapsed : (float) $totalProcessed;
         }
 
-        $redis->execute('HSET', $key,
+        $now = time();
+
+        $this->writeHostAggregate(self::normaliseHost($host ?? self::localHost()), $now,
             'throughput', (string) round($throughput, 2),
             'concurrent', (string) $totalActive,
             'total_slots', (string) $totalSlots,
@@ -367,24 +422,27 @@ LUA;
             'jobs_failed', (string) $totalFailed,
             'memory_mb', (string) round($totalMemory / 1_048_576, 2),
             'workers', (string) $workerCount,
-            'updated_at', (string) time(),
+            'updated_at', (string) $now,
         );
-
-        $redis->execute('EXPIRE', $key, (string) self::AGGREGATE_TTL_SECONDS);
     }
 
     /**
      * Publish an already-aggregated summary (the {@see aggregateFromWorkers()}
-     * shape) to the `{prefix}metrics` hash. Used by the master's monitor loop,
-     * which aggregates from the worker hashes and computes real throughput
-     * from jobs_processed deltas between ticks.
+     * shape) for one host. Used by the master's monitor loop, which aggregates
+     * from its own workers' hashes and computes real throughput from
+     * jobs_processed deltas between ticks.
+     *
+     * Every host has a hash of its own, `{prefix}metrics:live:{host}`, listed
+     * in the `{prefix}metrics:live` index; {@see getAggregatedMetrics()} sums
+     * them. A single shared hash would hold whichever master wrote last, which
+     * on a multi-host fleet is one host's share rather than the fleet.
      *
      * @param  array<string, mixed>  $aggregate
+     * @param  string|null  $host  The host the aggregate describes; null is this machine.
      */
-    public function publishAggregate(array $aggregate): void
+    public function publishAggregate(array $aggregate, ?string $host = null): void
     {
-        $redis = $this->getRedis();
-        $key = $this->prefix.'metrics';
+        $host = self::normaliseHost($host ?? self::localHost());
 
         // Rolling rates read off the persisted minute buckets. `throughput`
         // stays the instantaneous per-second delta for backwards compatibility,
@@ -394,9 +452,9 @@ LUA;
         $buckets = $this->minuteBuckets(60, $now);
         $perMinute5 = self::perMinuteRate($buckets, 5, $now);
         $smoothed = self::SMOOTHING_ALPHA * $perMinute5
-            + (1 - self::SMOOTHING_ALPHA) * $this->previousSmoothedThroughput($perMinute5);
+            + (1 - self::SMOOTHING_ALPHA) * $this->previousSmoothedThroughput($host, $perMinute5);
 
-        $redis->execute('HSET', $key,
+        $this->writeHostAggregate($host, $now,
             'throughput', (string) round(Narrow::float($aggregate['throughput'] ?? null), 2),
             'throughput_1m', (string) round(self::perMinuteRate($buckets, 1, $now), 2),
             'throughput_5m', (string) round($perMinute5, 2),
@@ -411,8 +469,44 @@ LUA;
             'workers', (string) Narrow::int($aggregate['workers'] ?? null),
             'updated_at', (string) $now,
         );
+    }
 
+    /**
+     * Write one host's live aggregate and list it in the index.
+     *
+     * The hash expires after {@see AGGREGATE_TTL_SECONDS}, and readers only
+     * look at index entries scored within the same window, so a host that went
+     * away drops out of the sums on its own. Every command touches one key,
+     * which keeps this valid on Redis Cluster.
+     */
+    private function writeHostAggregate(string $host, int $now, string ...$fields): void
+    {
+        $redis = $this->getRedis();
+        $key = $this->liveKey($host);
+        $index = $this->prefix.'metrics:live';
+
+        $redis->execute('HSET', $key, ...$fields);
         $redis->execute('EXPIRE', $key, (string) self::AGGREGATE_TTL_SECONDS);
+
+        $redis->execute('ZADD', $index, (string) $now, $host);
+        $redis->execute('ZREMRANGEBYSCORE', $index, '-inf', '('.($now - self::AGGREGATE_TTL_SECONDS));
+        $redis->execute('EXPIRE', $index, (string) self::AGGREGATE_TTL_SECONDS);
+    }
+
+    private function liveKey(string $host): string
+    {
+        return $this->prefix.'metrics:live:'.$host;
+    }
+
+    /**
+     * This machine's name, the same one its workers put in their ids.
+     */
+    #[\NoDiscard]
+    public static function localHost(): string
+    {
+        $host = gethostname();
+
+        return $host === false || $host === '' ? 'unknown' : $host;
     }
 
     /**
@@ -485,9 +579,17 @@ LUA;
      *
      * Costs exactly one round trip per tier, whatever the number of metrics.
      *
+     * With a host, every metric except the cluster-wide queue depths is folded
+     * under `{bucket}:{host}:{metric}`, so each master writes only its own
+     * host's sample and {@see gaugeSeriesMulti()} combines the hosts on read.
+     * Folding every master into one field would average the hosts: two boxes
+     * with 10 busy slots each read as 10 rather than 20. Without a host the
+     * samples land in the unscoped `{bucket}:{metric}` field, the layout
+     * before host scoping, which readers still use for buckets no host wrote.
+     *
      * @param  array<string, float|int>  $samples  Metric name => current value.
      */
-    public function recordGauges(array $samples, ?int $now = null): void
+    public function recordGauges(array $samples, ?int $now = null, ?string $host = null): void
     {
         if (! $this->metricsEnabled() || $samples === []) {
             return;
@@ -495,6 +597,7 @@ LUA;
 
         $now ??= time();
         $redis = $this->getRedis();
+        $host = $host === null ? null : self::normaliseHost($host);
 
         foreach (self::TIER_SECONDS as $tier => $seconds) {
             $bucket = intdiv($now, $seconds) * $seconds;
@@ -502,13 +605,18 @@ LUA;
             $args = [(string) $bucket];
 
             foreach ($samples as $metric => $value) {
-                $args[] = (string) $metric;
+                $metric = (string) $metric;
+                $args[] = $host === null || in_array($metric, self::CLUSTER_WIDE_GAUGES, true) ? $metric : $host.':'.$metric;
                 $args[] = (string) round((float) $value, 3);
             }
 
             $redis->eval(self::LUA_ADD_GAUGES, [$key], $args);
 
             $this->pruneKey($key, $tier, $bucket);
+        }
+
+        if ($host !== null) {
+            $this->touchHostIndex([$host], $now);
         }
     }
 
@@ -695,6 +803,16 @@ LUA;
     }
 
     /**
+     * Hash fields the last {@see gaugeSeriesMulti()} call requested, gauge and
+     * latency-weight reads together; reset at the start of every call.
+     */
+    #[\NoDiscard]
+    public function fieldsRequested(): int
+    {
+        return $this->fieldsRequested;
+    }
+
+    /**
      * Hosts the rollups saw at or after an epoch, with the epoch they were
      * last seen at.
      *
@@ -848,6 +966,35 @@ LUA;
 
         $this->getRedis()->execute('ZADD', $this->hostIndexKey(), 'GT', ...$args);
 
+        // First sighting, `LT` so the score only ever moves back. Range reads
+        // use it to skip the buckets before a host existed; written once per
+        // host per process, since a later epoch could never lower it. Marked
+        // written only once the ZADD succeeded: a failed write stays pending
+        // with its epoch, so the retry still carries the earliest sighting
+        // rather than letting a later process record a later one.
+        $first = [];
+        $pending = [];
+
+        foreach ($hosts as $host) {
+            $earliest = min($this->firstSeenPending[$host] ?? $now, $now);
+
+            if (($this->firstSeenWritten[$host] ?? PHP_INT_MAX) > $earliest) {
+                $this->firstSeenPending[$host] = $earliest;
+                $pending[$host] = $earliest;
+                $first[] = (string) $earliest;
+                $first[] = $host;
+            }
+        }
+
+        if ($first !== []) {
+            $this->getRedis()->execute('ZADD', $this->hostFirstSeenKey(), 'LT', ...$first);
+
+            foreach ($pending as $host => $epoch) {
+                $this->firstSeenWritten[$host] = $epoch;
+                unset($this->firstSeenPending[$host]);
+            }
+        }
+
         $this->pruneHostIndex(intdiv($now, self::TIER_SECONDS[self::TIER_DAY]) * self::TIER_SECONDS[self::TIER_DAY]);
     }
 
@@ -886,10 +1033,33 @@ LUA;
     }
 
     /**
-     * Several gauges at once, off a single read of the tier's hash.
+     * Several gauges at once, cluster-wide, off one read of the tier's hash.
      *
-     * The overview draws five of these side by side, and they all live in the
-     * same hash, so reading them one by one would be five identical HGETALLs.
+     * Hosts write their own `{bucket}:{host}:{metric}` fields (see
+     * {@see recordGauges()}); a bucket any host wrote is derived from those
+     * alone, a bucket none did falls back to the unscoped field. That keeps
+     * history from before host scoping readable, and an old master still
+     * writing the unscoped field mid-deploy is never added on top of the hosts.
+     *
+     * How hosts combine per bucket:
+     *  - concurrent, memory_mb: summed. Slots and resident memory add up across
+     *    machines. The peak is the sum of the host peaks, an upper bound, since
+     *    the hosts need not peak in the same second.
+     *  - worker_memory_peak_mb: the largest host, for both average and peak; it
+     *    is the single largest worker anywhere.
+     *  - avg_latency_ms: the hosts' averages weighted by the jobs each finished
+     *    in the bucket (the per-host rollup), plain mean when none finished
+     *    any; the peak is the largest host peak.
+     *  - pending, delayed: never host scoped; every master measures the same
+     *    streams.
+     *
+     * Reads only the fields the window covers rather than the whole hash, and
+     * asks each host only for the buckets between its first and last sighting
+     * in the host indexes. Pods that get a new hostname per deploy stay in the
+     * index for the day tier's retention, so asking every indexed host for the
+     * whole window would grow with every pod ever started; this grows with the
+     * buckets hosts were actually live in. A host without a first sighting
+     * (indexed before that index existed) is asked from the window's start.
      *
      * @param  list<string>  $metrics
      * @return array<string, array<int, array{avg: float, max: float}>>
@@ -897,27 +1067,148 @@ LUA;
     #[\NoDiscard]
     public function gaugeSeriesMulti(array $metrics, string $tier, int $count, ?int $now = null): array
     {
-        $seconds = self::TIER_SECONDS[$tier]
-            ?? throw new \InvalidArgumentException("Unknown metrics tier [{$tier}].");
+        $this->fieldsRequested = 0;
+        $buckets = self::bucketRange($tier, $count, $now);
+        $metrics = array_map(strval(...), $metrics);
+        $live = $this->metricsEnabled() ? $this->liveBuckets($tier, $buckets) : [];
+        $fields = [];
 
-        $count = max(1, $count);
-        $now ??= time();
-        $current = intdiv($now, $seconds) * $seconds;
-        $oldest = $current - ($count - 1) * $seconds;
+        foreach ($metrics as $metric) {
+            foreach ($buckets as $bucket) {
+                $fields[] = $bucket.':'.$metric;
+            }
 
-        $raw = $this->metricsEnabled() ? $this->readHash($this->gaugeKey($tier)) : [];
+            if (in_array($metric, self::CLUSTER_WIDE_GAUGES, true)) {
+                continue;
+            }
+
+            foreach ($live as $host => $hostBuckets) {
+                foreach ($hostBuckets as $bucket) {
+                    $fields[] = $bucket.':'.$host.':'.$metric;
+                }
+            }
+        }
+
+        $raw = [];
+
+        if ($this->metricsEnabled()) {
+            $raw = $this->readFields($this->gaugeKey($tier), $fields);
+            $this->fieldsRequested += count($fields);
+        }
+
+        $jobs = [];
+
+        if (in_array(self::GAUGE_LATENCY, $metrics, true) && $live !== []) {
+            $jobFields = [];
+
+            foreach ($live as $host => $hostBuckets) {
+                foreach ($hostBuckets as $bucket) {
+                    $jobFields[] = $bucket.':'.$host;
+                }
+            }
+
+            $jobs = $this->readFields($this->hostRollupKey($tier), $jobFields);
+            $this->fieldsRequested += count($jobFields);
+        }
+
         $series = [];
 
         foreach ($metrics as $metric) {
-            $metric = (string) $metric;
             $series[$metric] = [];
 
-            for ($bucket = $oldest; $bucket <= $current; $bucket += $seconds) {
-                $series[$metric][$bucket] = self::parseGauge($raw[$bucket.':'.$metric] ?? null);
+            foreach ($buckets as $bucket) {
+                $samples = [];
+                $weights = [];
+
+                foreach (array_keys($live) as $host) {
+                    $value = $raw[$bucket.':'.$host.':'.$metric] ?? null;
+
+                    if ($value !== null) {
+                        $samples[] = self::parseGauge($value);
+                        $outcome = self::parseOutcome($jobs[$bucket.':'.$host] ?? null);
+                        $weights[] = $outcome['processed'] + $outcome['failed'];
+                    }
+                }
+
+                $series[$metric][$bucket] = $samples === []
+                    ? self::parseGauge($raw[$bucket.':'.$metric] ?? null)
+                    : self::combineHostGauges($metric, $samples, $weights);
             }
         }
 
         return $series;
+    }
+
+    /**
+     * Per host seen in the window, the window's buckets it can have written.
+     *
+     * The last sighting comes from the host index, the first from the
+     * first-seen index; one ZRANGEBYSCORE and one ZMSCORE whatever the window.
+     * Both are taken at write time with the same epoch as the samples, so a
+     * bucket outside [first, last] holds nothing for that host.
+     *
+     * @param  list<int>  $buckets
+     * @return array<string, list<int>> Host => bucket start epochs, oldest first.
+     */
+    private function liveBuckets(string $tier, array $buckets): array
+    {
+        $seen = $this->hostsSeen($buckets[0]);
+
+        if ($seen === []) {
+            return [];
+        }
+
+        $hosts = array_map(strval(...), array_keys($seen));
+        $scores = $this->getRedis()->execute('ZMSCORE', $this->hostFirstSeenKey(), ...$hosts);
+        $scores = is_array($scores) ? array_values($scores) : [];
+        $seconds = self::TIER_SECONDS[$tier];
+        $live = [];
+
+        foreach ($hosts as $i => $host) {
+            $first = $scores[$i] ?? null;
+            $from = is_numeric($first) ? intdiv((int) $first, $seconds) * $seconds : null;
+            $to = intdiv($seen[$host], $seconds) * $seconds;
+
+            $hostBuckets = array_values(array_filter(
+                $buckets,
+                static fn (int $bucket): bool => ($from === null || $bucket >= $from) && $bucket <= $to,
+            ));
+
+            if ($hostBuckets !== []) {
+                $live[$host] = $hostBuckets;
+            }
+        }
+
+        return $live;
+    }
+
+    /**
+     * Combine one bucket of one gauge across hosts, per the rules on
+     * {@see gaugeSeriesMulti()}.
+     *
+     * @param  non-empty-list<array{avg: float, max: float}>  $samples
+     * @param  list<int>  $weights  Jobs each host finished in the bucket, same order.
+     * @return array{avg: float, max: float}
+     */
+    private static function combineHostGauges(string $metric, array $samples, array $weights): array
+    {
+        $averages = array_column($samples, 'avg');
+        $peaks = array_column($samples, 'max');
+
+        if ($metric === self::GAUGE_WORKER_MEMORY_PEAK) {
+            return ['avg' => max($averages), 'max' => max($peaks)];
+        }
+
+        if ($metric === self::GAUGE_LATENCY) {
+            $totalWeight = array_sum($weights);
+            $average = $totalWeight > 0
+                ? array_sum(array_map(static fn (float $avg, int $weight): float => $avg * $weight, $averages, $weights)) / $totalWeight
+                : array_sum($averages) / count($averages);
+
+            return ['avg' => round($average, 3), 'max' => max($peaks)];
+        }
+
+        return ['avg' => round(array_sum($averages), 3), 'max' => round(array_sum($peaks), 3)];
     }
 
     /**
@@ -1224,23 +1515,136 @@ LUA;
     }
 
     /**
-     * Read the aggregated metrics hash.
+     * The cluster aggregate: every live host's aggregate, combined.
      *
      * @return array<string, string> Empty array if no aggregated metrics have been published yet.
      */
     #[\NoDiscard]
     public function getAggregatedMetrics(): array
     {
-        $redis = $this->getRedis();
-        $key = $this->prefix.'metrics';
+        return self::readAggregate($this->getRedis(), $this->prefix);
+    }
 
-        $result = $redis->execute('HGETALL', $key);
+    /**
+     * Read and combine the live per-host aggregates on any client.
+     *
+     * Static so `torque:status`, which holds its own connection, reads the
+     * same figures the dashboard does.
+     *
+     * Hosts listed in `{prefix}metrics:live` within the last
+     * {@see AGGREGATE_TTL_SECONDS} are read; one whose hash already expired
+     * reads as empty and is skipped. Only when no host has a live aggregate is
+     * the shared `{prefix}metrics` hash of the layout before per-host keys
+     * read, so a fleet of old masters still shows up mid-deploy and is never
+     * added on top of upgraded ones.
+     *
+     * @return array<string, string>
+     */
+    #[\NoDiscard]
+    public static function readAggregate(RedisClient $redis, string $prefix, ?int $now = null): array
+    {
+        $now ??= time();
+        $hosts = $redis->execute('ZRANGEBYSCORE', $prefix.'metrics:live', (string) ($now - self::AGGREGATE_TTL_SECONDS), '+inf');
+        $aggregates = [];
 
-        if (! is_array($result) || $result === []) {
-            return [];
+        foreach (is_array($hosts) ? $hosts : [] as $host) {
+            $fields = $redis->execute('HGETALL', $prefix.'metrics:live:'.Narrow::string($host));
+
+            if (is_array($fields) && $fields !== []) {
+                $aggregates[] = self::flatPairsToAssoc($fields);
+            }
         }
 
-        return $this->flatPairsToAssoc($result);
+        if ($aggregates !== []) {
+            return self::combineAggregates($aggregates);
+        }
+
+        $legacy = $redis->execute('HGETALL', $prefix.'metrics');
+
+        return is_array($legacy) && $legacy !== [] ? self::flatPairsToAssoc($legacy) : [];
+    }
+
+    /**
+     * Combine per-host aggregates into the cluster figure.
+     *
+     * Counts, slots, memory and the instantaneous throughput add up. Latency is
+     * each host's average weighted by its processed jobs, the same weighting
+     * {@see aggregateFromWorkers()} applies to workers. The rolling rates are
+     * computed by every master from the shared minute rollup, so they agree
+     * across hosts and the freshest copy is taken rather than a sum. The
+     * smoothed rate is only close: each host steps its own EMA, re-seeded when
+     * its hash expired, so the copies converge rather than match.
+     * A single host is returned exactly as published.
+     *
+     * @param  non-empty-list<array<string, string>>  $aggregates
+     * @return array<string, string>
+     */
+    #[\NoDiscard]
+    public static function combineAggregates(array $aggregates): array
+    {
+        if (count($aggregates) === 1) {
+            return $aggregates[0];
+        }
+
+        $ints = [];
+        $floats = [];
+        $latencySum = 0.0;
+        $latencyJobs = 0;
+        $hasLatency = false;
+        $freshest = [];
+        $freshestAt = -1;
+
+        foreach ($aggregates as $fields) {
+            foreach (self::SUMMED_INT_FIELDS as $field) {
+                if (isset($fields[$field])) {
+                    $ints[$field] = ($ints[$field] ?? 0) + (int) $fields[$field];
+                }
+            }
+
+            foreach (self::SUMMED_FLOAT_FIELDS as $field) {
+                if (isset($fields[$field])) {
+                    $floats[$field] = ($floats[$field] ?? 0.0) + (float) $fields[$field];
+                }
+            }
+
+            if (isset($fields['avg_latency'])) {
+                $hasLatency = true;
+                $jobs = max(0, (int) ($fields['jobs_processed'] ?? 0));
+                $latencySum += (float) $fields['avg_latency'] * $jobs;
+                $latencyJobs += $jobs;
+            }
+
+            $updatedAt = (int) ($fields['updated_at'] ?? 0);
+
+            if ($updatedAt > $freshestAt) {
+                $freshestAt = $updatedAt;
+                $freshest = $fields;
+            }
+        }
+
+        $combined = [];
+
+        foreach (self::CLUSTER_WIDE_FIELDS as $field) {
+            if (isset($freshest[$field])) {
+                $combined[$field] = $freshest[$field];
+            }
+        }
+
+        foreach ($ints as $field => $sum) {
+            $combined[$field] = (string) $sum;
+        }
+
+        foreach ($floats as $field => $sum) {
+            $combined[$field] = (string) round($sum, 2);
+        }
+
+        if ($hasLatency) {
+            $combined['avg_latency'] = (string) ($latencyJobs > 0 ? round($latencySum / $latencyJobs, 2) : 0);
+        }
+
+        $combined['updated_at'] = (string) max(0, $freshestAt);
+
+        return $combined;
     }
 
     /**
@@ -1387,10 +1791,13 @@ LUA;
      * Previous EMA value, so the smoothed rate survives across ticks without
      * the master holding any state. Seeds from the current sample on the first
      * publish, otherwise the needle would crawl up from zero after a restart.
+     *
+     * Read from the host's own hash, so each master advances its own EMA once
+     * per tick instead of every master stepping one shared value.
      */
-    private function previousSmoothedThroughput(float $fallback): float
+    private function previousSmoothedThroughput(string $host, float $fallback): float
     {
-        $previous = $this->getRedis()->execute('HGET', $this->prefix.'metrics', 'throughput_smoothed');
+        $previous = $this->getRedis()->execute('HGET', $this->liveKey($host), 'throughput_smoothed');
 
         return is_string($previous) || is_numeric($previous) ? (float) $previous : $fallback;
     }
@@ -1401,8 +1808,11 @@ LUA;
      * lingering.
      *
      * Runs once per bucket of the tier at most (once a minute for the minute
-     * tier, once a day for the day tier): the field count is bounded by
-     * retention, so this is a few thousand integer comparisons per day.
+     * tier, once a day for the day tier), and once across the whole fleet:
+     * the hashes are shared by every master, so a `SET NX` claim per key and
+     * bucket lets the first master prune and the rest skip. The walk is an
+     * HSCAN in pages rather than one HKEYS, so a large hash never comes back
+     * in a single reply.
      */
     private function pruneKey(string $key, string $tier, int $currentBucket): void
     {
@@ -1423,21 +1833,49 @@ LUA;
             return;
         }
 
-        $oldestKept = $currentBucket - $retention + self::TIER_SECONDS[$tier];
-        $fields = $redis->execute('HKEYS', $key);
+        // The claim lives one bucket width, so the next bucket has a fresh one.
+        $claim = $redis->execute(
+            'SET',
+            $this->prefix.'metrics:prune:'.substr($key, strlen($this->prefix)).':'.$currentBucket,
+            '1',
+            'NX',
+            'EX',
+            (string) self::TIER_SECONDS[$tier],
+        );
 
-        if (is_array($fields)) {
-            // Gauge fields are "{epoch}:{metric}", counter fields are bare
-            // epochs; an int cast reads the leading epoch out of both.
-            $stale = array_values(array_filter(
-                array_map(Narrow::string(...), $fields),
-                static fn (string $field): bool => (int) $field < $oldestKept,
-            ));
+        if ($claim === null || $claim === false) {
+            return;
+        }
+
+        $oldestKept = $currentBucket - $retention + self::TIER_SECONDS[$tier];
+        $cursor = '0';
+
+        do {
+            $reply = $redis->execute('HSCAN', $key, $cursor, 'COUNT', '1000');
+
+            if (! is_array($reply) || count($reply) < 2) {
+                break;
+            }
+
+            $cursor = Narrow::string($reply[0] ?? null);
+            $page = Narrow::list($reply[1] ?? null);
+            $stale = [];
+
+            // Flat [field, value, ...]. Gauge fields are "{epoch}:..." and
+            // counter fields bare epochs; an int cast reads the leading epoch
+            // out of both.
+            for ($i = 0, $n = count($page); $i < $n; $i += 2) {
+                $field = Narrow::string($page[$i]);
+
+                if ((int) $field < $oldestKept) {
+                    $stale[] = $field;
+                }
+            }
 
             if ($stale !== []) {
                 $redis->execute('HDEL', $key, ...$stale);
             }
-        }
+        } while ($cursor !== '0');
 
         $redis->execute('EXPIRE', $key, (string) ($retention * 2));
     }
@@ -1542,12 +1980,29 @@ LUA;
             return;
         }
 
-        $this->getRedis()->execute(
-            'ZREMRANGEBYSCORE',
-            $indexKey,
-            '-inf',
-            '('.($currentDayBucket - $retention),
-        );
+        $cutoff = '('.($currentDayBucket - $retention);
+        $redis = $this->getRedis();
+
+        $redis->execute('ZREMRANGEBYSCORE', $indexKey, '-inf', $cutoff);
+
+        // A first sighting can be older than the cutoff while the host is still
+        // reporting, so the first-seen index is not pruned by its own score:
+        // of the members first seen before the cutoff, drop the ones the host
+        // index no longer holds (swept above, or by the housekeeper).
+        $old = $redis->execute('ZRANGEBYSCORE', $this->hostFirstSeenKey(), '-inf', $cutoff);
+
+        if (! is_array($old) || $old === []) {
+            return;
+        }
+
+        $old = array_map(Narrow::string(...), $old);
+        $alive = $redis->execute('ZMSCORE', $indexKey, ...$old);
+        $alive = is_array($alive) ? array_values($alive) : [];
+        $gone = array_values(array_filter($old, static fn (int $i): bool => ! is_numeric($alive[$i] ?? null), ARRAY_FILTER_USE_KEY));
+
+        if ($gone !== []) {
+            $redis->execute('ZREM', $this->hostFirstSeenKey(), ...$gone);
+        }
     }
 
     /**
@@ -1689,6 +2144,15 @@ LUA;
     }
 
     /**
+     * Same members as the host index, scored by the first sighting instead of
+     * the last.
+     */
+    private function hostFirstSeenKey(): string
+    {
+        return $this->prefix.'metrics:hosts:first';
+    }
+
+    /**
      * Make a hostname safe to use inside a colon-delimited field.
      *
      * A colon in a host would silently invent a field segment, and `*`, `?`,
@@ -1696,10 +2160,17 @@ LUA;
      * `[A-Za-z0-9._-]` is replaced, and a short digest is appended whenever the
      * replacement changed something, so two machines whose names clean to the
      * same string can never collapse into one row.
+     *
+     * Idempotent: a name this method produced comes back unchanged, so a host
+     * read from the index and normalised again still finds its history.
      */
     #[\NoDiscard]
     public static function normaliseHost(string $host): string
     {
+        if (preg_match('/^[A-Za-z0-9._-]{1,48}(~[0-9a-f]{6})?$/', $host) === 1) {
+            return $host;
+        }
+
         $clean = preg_replace('/[^A-Za-z0-9._-]/', '_', trim($host)) ?? '';
 
         if ($clean === '') {
@@ -1760,10 +2231,16 @@ LUA;
      *
      * A single dedicated connection is sufficient — metrics publishing
      * is infrequent and non-blocking.
+     *
+     * With a read timeout a reply lost to a half-open socket fails the call
+     * instead of blocking the caller until TCP gives up, which in the master's
+     * synchronous monitor loop would stop reaping and the watchdog as well.
      */
     private function getRedis(): RedisClient
     {
-        return $this->redis ??= createRedisClient($this->redisUri);
+        return $this->redis ??= $this->readTimeout !== null && $this->readTimeout > 0
+            ? new RedisClient(new ReconnectingRedisLink(createRedisConnector($this->redisUri), readTimeout: $this->readTimeout))
+            : createRedisClient($this->redisUri);
     }
 
     /**
@@ -1773,7 +2250,7 @@ LUA;
      * @param  array<mixed>  $pairs
      * @return array<string, string>
      */
-    private function flatPairsToAssoc(array $pairs): array
+    private static function flatPairsToAssoc(array $pairs): array
     {
         $assoc = [];
 

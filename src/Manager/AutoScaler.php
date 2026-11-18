@@ -42,6 +42,13 @@ final class AutoScaler
     #[\NoDiscard]
     public function evaluate(int $currentWorkers, array $workerMetrics): ScaleDecision
     {
+        // A fleet below its floor grows back whatever the load, like Horizon's
+        // clamp to minProcesses. The fleet size is local knowledge, so this
+        // holds even when no metrics could be read.
+        if ($currentWorkers < $this->minWorkers && $currentWorkers < $this->maxWorkers) {
+            return $this->canScale ? ScaleDecision::ScaleUp : ScaleDecision::NoChange;
+        }
+
         if ($workerMetrics === []) {
             return ScaleDecision::NoChange;
         }

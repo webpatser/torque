@@ -33,8 +33,10 @@ final class OverviewData
      */
     public function get(string $range = '1h'): array
     {
-        // Prefer the master-published aggregate (has a real throughput); fall
-        // back to aggregating live worker hashes when no master is running.
+        // Prefer the master-published aggregates, every live host summed (they
+        // carry a real throughput); fall back to aggregating live worker hashes
+        // when no master is running. The gauge series below are combined
+        // across hosts the same way, inside the publisher.
         $agg = $this->metrics->getAggregatedMetrics();
 
         if ($agg === []) {

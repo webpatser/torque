@@ -48,6 +48,7 @@ final class TorqueStatusCommand extends Command
         $redis = createRedisClient($redisUri);
 
         $this->renderMasterStatus();
+        $this->renderOwedRespawns($redis, $prefix);
         $this->renderPauseStatus($redis, $prefix);
         $this->renderDataVersion($redis, $prefix);
         $this->renderOverallMetrics($redis, $prefix, $config);
@@ -74,6 +75,44 @@ final class TorqueStatusCommand extends Command
             $pid !== null
                 ? "<fg=green;options=bold>RUNNING</> <fg=gray>(PID {$pid})</>"
                 : '<fg=red;options=bold>STOPPED</>',
+        );
+
+        $this->newLine();
+    }
+
+    /**
+     * Show the workers a master owes after failed forks, per host.
+     *
+     * Nothing is printed while none are owed. A master whose forks keep
+     * failing stays up with no workers, and without this line the only sign
+     * is its log. Read from the live per-host hashes the masters publish.
+     */
+    private function renderOwedRespawns(RedisClient $redis, string $prefix): void
+    {
+        $owed = [];
+
+        try {
+            $hosts = $redis->execute('ZRANGE', $prefix.'metrics:live', '0', '-1');
+
+            foreach (is_array($hosts) ? $hosts : [] as $host) {
+                $host = Narrow::string($host);
+                $count = Narrow::int($redis->execute('HGET', $prefix.'metrics:live:'.$host, MasterProcess::PENDING_RESPAWNS_FIELD));
+
+                if ($count > 0) {
+                    $owed[] = "{$count} on {$host}";
+                }
+            }
+        } catch (\Throwable) {
+            return;
+        }
+
+        if ($owed === []) {
+            return;
+        }
+
+        $this->components->twoColumnDetail(
+            '<fg=red;options=bold>Respawns owed</>',
+            implode(', ', $owed).' <fg=gray>(worker forks failing; see the master log)</>',
         );
 
         $this->newLine();
@@ -138,7 +177,8 @@ final class TorqueStatusCommand extends Command
         $avgLatency = null;
 
         try {
-            $agg = $this->getHashAll($redis, $prefix.'metrics');
+            // Every live host's aggregate, summed, as the dashboard reads it.
+            $agg = MetricsPublisher::readAggregate($redis, $prefix);
 
             if ($agg === []) {
                 // No master-published aggregate: aggregate the live worker

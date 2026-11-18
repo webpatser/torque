@@ -126,6 +126,31 @@ it('returns no change for empty metrics', function () {
     expect($scaler->evaluate(4, []))->toBe(ScaleDecision::NoChange);
 });
 
+it('scales up a fleet below min workers whatever the usage', function () {
+    $scaler = new AutoScaler(
+        redisUri: 'redis://127.0.0.1:6379',
+        minWorkers: 2,
+        cooldownSeconds: 0,
+    );
+
+    // Idle, and with no metrics at all: the fleet size alone decides.
+    expect($scaler->evaluate(1, [['active' => 0, 'total' => 50]]))->toBe(ScaleDecision::ScaleUp)
+        ->and($scaler->evaluate(1, []))->toBe(ScaleDecision::ScaleUp)
+        ->and($scaler->evaluate(2, [['active' => 0, 'total' => 50], ['active' => 0, 'total' => 50]]))->toBe(ScaleDecision::NoChange);
+});
+
+it('keeps the cooldown when scaling up to min workers', function () {
+    $scaler = new AutoScaler(
+        redisUri: 'redis://127.0.0.1:6379',
+        minWorkers: 2,
+        cooldownSeconds: 9999,
+    );
+
+    $scaler->recordAction();
+
+    expect($scaler->evaluate(1, [['active' => 0, 'total' => 50]]))->toBe(ScaleDecision::NoChange);
+});
+
 it('handles zero total slots gracefully', function () {
     $scaler = new AutoScaler(
         redisUri: 'redis://127.0.0.1:6379',

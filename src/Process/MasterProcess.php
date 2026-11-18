@@ -5,6 +5,10 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Process;
 
 use Closure;
+use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
+use Fledge\Async\Redis\Connection\RedisTimeoutException;
+use Fledge\Async\Redis\RedisClient;
+use Fledge\Async\Redis\RedisException;
 use Illuminate\Support\ConfigurationUrlParser;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
@@ -21,6 +25,7 @@ use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\Redis\createRedisClient;
+use function Fledge\Async\Redis\createRedisConnector;
 
 /**
  * Forks N worker processes and monitors them.
@@ -192,6 +197,43 @@ LUA;
         get => count($this->workerPids);
     }
 
+    /**
+     * Respawns owed after a failed fork (EAGAIN, ENOMEM), retried from the
+     * monitor tick. A transient fork failure must not end supervision.
+     */
+    private int $pendingRespawns = 0;
+
+    /** Clock time of the next respawn retry. */
+    private float $respawnRetryAt = 0.0;
+
+    /** Seconds to wait before the next retry, doubled per failure. */
+    private float $respawnBackoff = 0.0;
+
+    /** Longest wait between two respawn retries, in seconds. */
+    private const float RESPAWN_BACKOFF_MAX = 30.0;
+
+    /** Field in this host's `metrics:live:{host}` hash that `torque:status` reads. */
+    public const string PENDING_RESPAWNS_FIELD = 'pending_respawns';
+
+    /** The owed-respawn count last written to Redis. */
+    private int $publishedPendingRespawns = 0;
+
+    /** Clock time an ongoing autoscale failure was last logged, null while autoscaling works. */
+    private ?float $autoscaleFailureLoggedAt = null;
+
+    /** Seconds between two log lines for the same ongoing autoscale failure. */
+    private const int AUTOSCALE_FAILURE_LOG_INTERVAL = 300;
+
+    /** Master-side client for the pause read and the owed-respawn field. */
+    private ?RedisClient $masterRedis = null;
+
+    /**
+     * `pcntl_fork()`, held as a closure so a test can stand in for the kernel.
+     *
+     * @var Closure(): int
+     */
+    private Closure $fork;
+
     private readonly string $artisanPath;
 
     /**
@@ -206,6 +248,7 @@ LUA;
         private readonly ?Closure $errorLogger = null,
     ) {
         $this->artisanPath = base_path('artisan');
+        $this->fork = pcntl_fork(...);
     }
 
     /**
@@ -226,6 +269,63 @@ LUA;
     private function redisPrefix(): string
     {
         return Narrow::string($this->configSection('redis')['prefix'] ?? null, 'torque:');
+    }
+
+    /** Seconds a master-side Redis read waits when `redis.read_timeout_seconds` is not set, as in a worker. */
+    private const float DEFAULT_READ_TIMEOUT = 30.0;
+
+    /**
+     * `redis.read_timeout_seconds` for the master's long-lived clients, null
+     * when zero or less (wait forever).
+     *
+     * Without one, a reply lost to a half-open socket blocks this synchronous
+     * loop, and with it reaping, respawns and the watchdog, until TCP gives up.
+     */
+    private function readTimeout(): ?float
+    {
+        $seconds = Narrow::float($this->configSection('redis')['read_timeout_seconds'] ?? null, self::DEFAULT_READ_TIMEOUT);
+
+        return $seconds > 0 ? $seconds : null;
+    }
+
+    private function makeMetricsPublisher(): MetricsPublisher
+    {
+        return new MetricsPublisher(
+            redisUri: $this->redisUri(),
+            prefix: $this->redisPrefix(),
+            settings: $this->configSection('metrics'),
+            readTimeout: $this->readTimeout(),
+        );
+    }
+
+    /**
+     * The master's own client, with the read timeout; dropped after a failure
+     * so the next tick connects afresh.
+     */
+    private function masterRedis(): RedisClient
+    {
+        $timeout = $this->readTimeout();
+
+        return $this->masterRedis ??= $timeout !== null
+            ? new RedisClient(new ReconnectingRedisLink(createRedisConnector($this->redisUri()), readTimeout: $timeout))
+            : createRedisClient($this->redisUri());
+    }
+
+    /**
+     * The stream depth probe, built from the same settings as
+     * {@see StreamQueueResolver::make()} plus the read timeout.
+     */
+    private function makeDepthProbe(): StreamQueue
+    {
+        return new StreamQueue(
+            redisUri: $this->redisUri(),
+            default: 'default',
+            prefix: $this->redisPrefix(),
+            consumerGroup: Narrow::string($this->config['consumer_group'] ?? null, 'torque'),
+            cluster: Narrow::bool($this->configSection('redis')['cluster'] ?? null),
+            serializer: Narrow::string($this->config['serializer'] ?? null, 'json'),
+            readTimeout: $this->readTimeout(),
+        );
     }
 
     /**
@@ -321,11 +421,7 @@ LUA;
         // The aggregate metrics publisher runs for every master when metrics
         // are enabled; autoscale additionally builds its scaler on top of it.
         if ($this->configSection('metrics')['enabled'] ?? true) {
-            $this->metricsPublisher = new MetricsPublisher(
-                redisUri: $this->redisUri(),
-                prefix: $this->redisPrefix(),
-                settings: $this->configSection('metrics'),
-            );
+            $this->metricsPublisher = $this->makeMetricsPublisher();
         }
 
         $autoscaleConfig = $this->configSection('autoscale');
@@ -344,28 +440,33 @@ LUA;
 
             // Autoscale reads worker metrics, so it needs the publisher even
             // when the aggregate publishing itself was disabled.
-            $this->metricsPublisher ??= new MetricsPublisher(
-                redisUri: $redisUri,
-                prefix: $this->redisPrefix(),
-                settings: $this->configSection('metrics'),
-            );
+            $this->metricsPublisher ??= $this->makeMetricsPublisher();
 
             ($this->logger)('Autoscaling enabled ('
                 .Narrow::string($autoscaleConfig['min_workers'] ?? null).'-'.Narrow::string($autoscaleConfig['max_workers'] ?? null)
                 .' workers)');
         }
 
-        $exitCode = $this->monitor();
-
-        // No global worker-metrics wipe here: workers delete their own key on
-        // graceful exit and every hash carries a heartbeat TTL, so crash
+        // No global worker-metrics wipe after the loop: workers delete their own
+        // key on graceful exit and every hash carries a heartbeat TTL, so crash
         // ghosts self-expire within a minute. A wipe would also delete the
         // replacement fleet's metrics when a drained-away master exits after
         // a takeover.
+        return $this->runMonitor();
+    }
 
-        $this->removePidFile();
-
-        return $exitCode;
+    /**
+     * {@see monitor()}, with the PID file removed however the loop ends.
+     *
+     * The master lock needs no cleanup: the kernel releases it on exit.
+     */
+    private function runMonitor(): int
+    {
+        try {
+            return $this->monitor();
+        } finally {
+            $this->removePidFile();
+        }
     }
 
     /**
@@ -377,7 +478,7 @@ LUA;
      */
     private function spawnWorker(): void
     {
-        $pid = pcntl_fork();
+        $pid = ($this->fork)();
 
         if ($pid === -1) {
             throw new \RuntimeException('Failed to fork worker process');
@@ -415,6 +516,92 @@ LUA;
         $this->workerPids[$pid] = true;
         $this->workerSpawnedAt[$pid] = time();
         ($this->logger)("Worker spawned with PID {$pid}");
+    }
+
+    /**
+     * {@see spawnWorker()} for a running master: a failed fork is logged, not thrown.
+     *
+     * Only the initial spawn in {@see start()} lets the failure end the process.
+     */
+    private function trySpawnWorker(): bool
+    {
+        try {
+            $this->spawnWorker();
+        } catch (\RuntimeException) {
+            $errno = pcntl_get_last_error();
+            ($this->logger)('WARN Worker fork failed ('.($errno === 0 ? 'no error code' : pcntl_strerror($errno)).'); the master keeps supervising.');
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Add a worker (a replacement or a scale-up), or owe it when the fork fails.
+     *
+     * While respawns are already owed the new one joins the queue, so the
+     * backoff that is running is kept.
+     */
+    private function respawnWorker(): void
+    {
+        if ($this->pendingRespawns > 0) {
+            $this->pendingRespawns++;
+
+            return;
+        }
+
+        if (! $this->trySpawnWorker()) {
+            $this->pendingRespawns++;
+            $this->deferRespawn(microtime(true));
+        }
+    }
+
+    /**
+     * Retry owed respawns once their backoff has passed, one fork per tick.
+     *
+     * The clock is injectable so it can be exercised without the monitor loop.
+     */
+    private function retryPendingRespawns(?float $now = null): void
+    {
+        if ($this->pendingRespawns === 0) {
+            return;
+        }
+
+        if ($this->shouldStop) {
+            $this->pendingRespawns = 0;
+            $this->respawnBackoff = 0.0;
+
+            return;
+        }
+
+        // A draining fleet is paused and about to be stopped: a worker forked
+        // now would only be terminated. Kept owed; the stop drops them.
+        if ($this->draining || $this->drainRequested) {
+            return;
+        }
+
+        $now ??= microtime(true);
+
+        if ($now < $this->respawnRetryAt) {
+            return;
+        }
+
+        if (! $this->trySpawnWorker()) {
+            $this->deferRespawn($now);
+
+            return;
+        }
+
+        $this->pendingRespawns--;
+        $this->respawnBackoff = 0.0;
+    }
+
+    private function deferRespawn(float $now): void
+    {
+        $this->respawnBackoff = min(self::RESPAWN_BACKOFF_MAX, max(1.0, $this->respawnBackoff * 2));
+        $this->respawnRetryAt = $now + $this->respawnBackoff;
+        ($this->logger)("{$this->pendingRespawns} worker respawn(s) owed; retrying in {$this->respawnBackoff}s.");
     }
 
     /**
@@ -456,7 +643,9 @@ LUA;
         // every ~10 iterations (~1 second at 100ms wait).
         $maintenanceTick = 0;
 
-        while (! empty($this->workerPids)) {
+        // Owed respawns keep the loop alive: a fork failure on the last worker
+        // must not end supervision.
+        while (! empty($this->workerPids) || ($this->pendingRespawns > 0 && ! $this->shouldStop)) {
             if ($syncSignals) {
                 $info = [];
                 $sig = \pcntl_sigtimedwait([SIGTERM, SIGINT, SIGCHLD, SIGUSR2], $info, 0, 100_000_000);
@@ -507,9 +696,11 @@ LUA;
                     ($this->logger)("Scaled-down worker PID {$pid} drained and exited.");
                 } elseif (! $this->shouldStop) {
                     ($this->logger)('Respawning replacement worker...');
-                    $this->spawnWorker();
+                    $this->respawnWorker();
                 }
             }
+
+            $this->retryPendingRespawns();
 
             $this->superviseLongWaitAlerts();
 
@@ -933,7 +1124,7 @@ LUA;
     /**
      * Read worker metrics from Redis and apply autoscaling decisions.
      */
-    private function evaluateAutoscale(): void
+    private function evaluateAutoscale(?float $now = null): void
     {
         // Never scale during a drain: the fleet is shutting down or handing
         // over, and scaling up mid-drain would fork workers just to kill them.
@@ -947,7 +1138,36 @@ LUA;
             return;
         }
 
-        $rawMetrics = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
+        // Best-effort like the aggregate publish: a failure skips this pass and
+        // never ends supervision. After a Redis error both clients are rebuilt,
+        // so the next tick does not wait out another read timeout on a silent
+        // socket; any other error keeps them, as reconnecting cannot fix it.
+        try {
+            $this->autoscale($this->autoScaler, $this->metricsPublisher);
+        } catch (\Throwable $e) {
+            if ($e instanceof RedisException) {
+                $this->metricsPublisher = $this->makeMetricsPublisher();
+                $this->masterRedis = null;
+            }
+
+            // Logged again every few minutes while it lasts, so a persistent
+            // bug does not leave autoscaling off without a trace.
+            $now ??= microtime(true);
+
+            if ($this->autoscaleFailureLoggedAt === null || $now - $this->autoscaleFailureLoggedAt >= self::AUTOSCALE_FAILURE_LOG_INTERVAL) {
+                ($this->logger)('Autoscale skipped ('.$e::class.": {$e->getMessage()}); retrying every tick.");
+                $this->autoscaleFailureLoggedAt = $now;
+            }
+
+            return;
+        }
+
+        $this->autoscaleFailureLoggedAt = null;
+    }
+
+    private function autoscale(AutoScaler $autoScaler, MetricsPublisher $metricsPublisher): void
+    {
+        $rawMetrics = $this->ownWorkerMetrics($metricsPublisher->getAllWorkerMetrics());
 
         // Build the format AutoScaler expects, keyed by the worker's PID so
         // scale-down can match against our child PID set.
@@ -955,7 +1175,9 @@ LUA;
         foreach ($rawMetrics as $workerId => $data) {
             $pid = (int) ($data['pid'] ?? (WorkerId::parse($workerId)->pid ?? 0));
 
-            if ($pid > 0) {
+            // A draining worker is leaving the pool: its slots say nothing
+            // about the capacity that stays.
+            if ($pid > 0 && ! isset($this->scalingDownPids[$pid])) {
                 $workerMetrics[$pid] = [
                     'active' => (int) ($data['active_slots'] ?? 0),
                     'total' => (int) ($data['total_slots'] ?? 0),
@@ -963,7 +1185,12 @@ LUA;
             }
         }
 
-        $decision = $this->autoScaler->evaluate($this->workerCount, $workerMetrics);
+        $decision = $autoScaler->evaluate($this->fleetSize(), $workerMetrics);
+
+        // Like Horizon, no growth into a paused fleet; scale-down stays.
+        if ($decision === ScaleDecision::ScaleUp && $this->fleetIsPaused()) {
+            return;
+        }
 
         match ($decision) {
             ScaleDecision::ScaleUp => $this->scaleUp(),
@@ -995,17 +1222,50 @@ LUA;
     }
 
     /**
-     * Scale up by spawning one additional worker.
+     * Workers that count toward the pool, as Horizon counts its processes: the
+     * children not being scaled down, plus respawns owed after a failed fork.
+     */
+    private function fleetSize(): int
+    {
+        return count(array_diff_key($this->workerPids, $this->scalingDownPids)) + $this->pendingRespawns;
+    }
+
+    /**
+     * Whether a `{prefix}paused` key stops this fleet's pickup: a deliberate
+     * `torque:pause`. Another master's `drain:<pid>` does not, its workers
+     * ignore that; our own drain never reaches here.
+     *
+     * One GET, read only on a pass that decided to scale up.
+     */
+    private function fleetIsPaused(): bool
+    {
+        $value = $this->masterRedis()->execute('GET', $this->redisPrefix().'paused');
+
+        return $value !== null && DrainPause::ownerPid(Narrow::string($value)) === null;
+    }
+
+    /**
+     * Scale up by one worker.
+     *
+     * A failed fork becomes an owed respawn: it counts toward the fleet, so the
+     * scaler does not ask again, and it is retried on the respawn backoff.
      */
     private function scaleUp(): void
     {
-        ($this->logger)("Autoscaler: scaling up (workers: {$this->workerCount} -> ".($this->workerCount + 1).')');
-        $this->spawnWorker();
+        $fleet = $this->fleetSize();
+        ($this->logger)("Autoscaler: scaling up (workers: {$fleet} -> ".($fleet + 1).')');
+
+        $this->respawnWorker();
         $this->autoScaler?->recordAction();
     }
 
     /**
-     * Scale down by sending SIGTERM to the least busy worker.
+     * Scale down by one: cancel an owed respawn, or else send SIGTERM to the
+     * least busy worker.
+     *
+     * Owed respawns count toward {@see fleetSize()}, so terminating a live
+     * worker while one is owed would shrink the workers that actually run below
+     * the floor the scaler believes it keeps.
      *
      * The targeted worker is added to {@see $scalingDownPids} so
      * the monitor loop does not respawn it after it drains and exits.
@@ -1014,13 +1274,27 @@ LUA;
      */
     private function scaleDown(array $workerMetrics): void
     {
+        if ($this->pendingRespawns > 0) {
+            $fleet = $this->fleetSize();
+            $this->pendingRespawns--;
+
+            if ($this->pendingRespawns === 0) {
+                $this->respawnBackoff = 0.0;
+            }
+
+            ($this->logger)("Autoscaler: scaling down (workers: {$fleet} -> ".($fleet - 1).'), cancelling an owed respawn');
+            $this->autoScaler?->recordAction();
+
+            return;
+        }
+
         // Build a PID-to-active-slots map for workers we currently own; the
         // metrics map is keyed by PID (see evaluateAutoscale). A child with
         // no metrics row yet sorts last so a just-forked worker is never the
         // scale-down victim.
         $pidActivity = [];
 
-        foreach (array_keys($this->workerPids) as $pid) {
+        foreach (array_keys(array_diff_key($this->workerPids, $this->scalingDownPids)) as $pid) {
             $pidActivity[$pid] = (int) ($workerMetrics[$pid]['active'] ?? PHP_INT_MAX);
         }
 
@@ -1031,9 +1305,10 @@ LUA;
         // Pick the worker with the lowest active slot count.
         asort($pidActivity);
         $targetPid = array_key_first($pidActivity);
+        $fleet = $this->fleetSize();
 
-        ($this->logger)("Autoscaler: scaling down (workers: {$this->workerCount} -> "
-            .($this->workerCount - 1)."), sending SIGTERM to PID {$targetPid}");
+        ($this->logger)("Autoscaler: scaling down (workers: {$fleet} -> "
+            .($fleet - 1)."), sending SIGTERM to PID {$targetPid}");
 
         $this->scalingDownPids[$targetPid] = true;
         posix_kill($targetPid, SIGTERM);
@@ -1102,6 +1377,11 @@ LUA;
 
         try {
             $workers = $this->ownWorkerMetrics($this->metricsPublisher->getAllWorkerMetrics());
+        } catch (RedisTimeoutException) {
+            // Every drain tick asks; the next one starts on a fresh client.
+            $this->metricsPublisher = $this->makeMetricsPublisher();
+
+            return false;
         } catch (\Throwable) {
             return false;
         }
@@ -1243,6 +1523,7 @@ LUA;
                 consumerGroup: Narrow::string($this->config['consumer_group'] ?? null, 'torque'),
                 cluster: (bool) ($this->configSection('redis')['cluster'] ?? false),
                 serializer: Narrow::string($this->config['serializer'] ?? null, 'json'),
+                readTimeout: $this->readTimeout(),
             );
 
             foreach ($thresholds as $name => $threshold) {
@@ -1710,11 +1991,7 @@ LUA;
         $timeout = Narrow::float($this->config['takeover_ready_timeout_seconds'] ?? null, 30.0);
         $deadline = microtime(true) + $timeout;
 
-        $publisher = new MetricsPublisher(
-            redisUri: $this->redisUri(),
-            prefix: $this->redisPrefix(),
-            settings: $this->configSection('metrics'),
-        );
+        $publisher = $this->makeMetricsPublisher();
 
         while (microtime(true) < $deadline && ! $this->shouldStop) {
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
@@ -1838,7 +2115,9 @@ LUA;
 
             // Gauges are point-in-time, so unlike the counters they are sampled
             // on every tick including the first.
-            $this->metricsPublisher->recordGauges($this->gaugeSamples($aggregate));
+            // Keyed by this host: every master writes only its own share, and
+            // readers add the hosts up instead of averaging them.
+            $this->metricsPublisher->recordGauges($this->gaugeSamples($aggregate), host: MetricsPublisher::localHost());
             $this->metricsPublisher->recordHostGauges($this->hostGaugeSamples($workers));
 
             $this->lastAggregateJobsTotal = $jobsTotal;
@@ -1847,10 +2126,43 @@ LUA;
             $this->lastAggregatePerJob = $perJob;
             $this->lastAggregateAt = $now;
 
-            $this->metricsPublisher->publishAggregate($aggregate);
+            $this->metricsPublisher->publishAggregate($aggregate, MetricsPublisher::localHost());
+            $this->publishPendingRespawns();
+        } catch (RedisTimeoutException) {
+            // The next tick starts on a fresh client rather than one whose
+            // connection just went silent.
+            $this->metricsPublisher = $this->makeMetricsPublisher();
+            $this->masterRedis = null;
         } catch (\Throwable) {
             // Metrics must never take the master down.
         }
+    }
+
+    /**
+     * Put the owed-respawn count in this host's live aggregate hash, next to
+     * the fields {@see MetricsPublisher::publishAggregate()} writes, for
+     * `torque:status`. A master whose forks keep failing has no workers left
+     * to show anything else.
+     *
+     * One HSET per publish while respawns are owed, one more to write the 0,
+     * and no round trip at all otherwise. The hash keeps the field through
+     * later publishes, which only set their own fields, and loses it when it
+     * expires, which reads as nothing owed.
+     */
+    private function publishPendingRespawns(): void
+    {
+        if ($this->pendingRespawns === 0 && $this->publishedPendingRespawns === 0) {
+            return;
+        }
+
+        $this->masterRedis()->execute(
+            'HSET',
+            $this->redisPrefix().'metrics:live:'.MetricsPublisher::normaliseHost(MetricsPublisher::localHost()),
+            self::PENDING_RESPAWNS_FIELD,
+            (string) $this->pendingRespawns,
+        );
+
+        $this->publishedPendingRespawns = $this->pendingRespawns;
     }
 
     /**
@@ -2088,12 +2400,23 @@ LUA;
     {
         $pending = 0;
         $delayed = 0;
-        $probe = $this->depthProbe ??= rescue(fn (): StreamQueue => StreamQueueResolver::make(), null, false);
+        $probe = $this->depthProbe ??= rescue(fn (): StreamQueue => $this->makeDepthProbe(), null, false);
 
         if ($probe !== null) {
             foreach (array_keys((array) ($this->config['streams'] ?? [])) as $stream) {
-                // One round trip per stream; pending is the waiting count.
-                $depths = rescue(fn (): array => $probe->depths((string) $stream), null, false);
+                // One round trip per stream; pending is the waiting count. A
+                // silent socket would time out once per stream, so the probe is
+                // dropped at the first and rebuilt on the next tick.
+                try {
+                    $depths = $probe->depths((string) $stream);
+                } catch (RedisTimeoutException) {
+                    $this->depthProbe = null;
+
+                    break;
+                } catch (\Throwable) {
+                    $depths = null;
+                }
+
                 $pending += (int) ($depths['waiting'] ?? 0);
                 $delayed += (int) ($depths['delayed'] ?? 0);
             }

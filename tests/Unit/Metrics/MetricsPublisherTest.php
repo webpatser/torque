@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\Connection\RedisTimeoutException;
 use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
@@ -30,7 +31,28 @@ function cleanupRedisKeys(MetricsPublisher $publisher, string $prefix, array $wo
         $redis->execute('DEL', $prefix.'worker:'.$id);
     }
 
-    $redis->execute('DEL', $prefix.'metrics');
+    $redis->execute('DEL', $prefix.'metrics', $prefix.'metrics:live');
+    deleteKeysMatching($redis, $prefix.'metrics:live:*');
+}
+
+/**
+ * Delete every key matching a pattern; the test database is small, so KEYS is fine.
+ */
+function deleteKeysMatching(mixed $redis, string $pattern): void
+{
+    $keys = $redis->execute('KEYS', $pattern);
+
+    foreach (is_array($keys) ? $keys : [] as $key) {
+        $redis->execute('DEL', (string) $key);
+    }
+}
+
+/**
+ * The per-host aggregate key a publisher on this machine writes.
+ */
+function localAggregateKey(string $prefix): string
+{
+    return $prefix.'metrics:live:'.MetricsPublisher::normaliseHost((string) gethostname());
 }
 
 function makeSnapshot(
@@ -194,11 +216,7 @@ it('publishes aggregated metrics', function () {
         // Weighted avg latency: (20.0 * 105 + 30.0 * 210) / 315 = 26.67
         expect((float) $metrics['avg_latency'])->toBeGreaterThan(0.0);
 
-        // Clean up.
-        $redis = (new ReflectionClass($publisher))
-            ->getMethod('getRedis')
-            ->invoke($publisher);
-        $redis->execute('DEL', $prefix.'metrics');
+        cleanupRedisKeys($publisher, $prefix, []);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
@@ -220,10 +238,7 @@ it('reads back aggregated metrics', function () {
         expect($metrics['jobs_failed'])->toBe('2');
         expect($metrics['workers'])->toBe('1');
 
-        $redis = (new ReflectionClass($publisher))
-            ->getMethod('getRedis')
-            ->invoke($publisher);
-        $redis->execute('DEL', $prefix.'metrics');
+        cleanupRedisKeys($publisher, $prefix, []);
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
@@ -307,7 +322,7 @@ it('publishes a precomputed aggregate with an expiry', function () {
         $redis = (new ReflectionClass($publisher))
             ->getMethod('getRedis')
             ->invoke($publisher);
-        $ttl = (int) $redis->execute('TTL', $prefix.'metrics');
+        $ttl = (int) $redis->execute('TTL', localAggregateKey($prefix));
 
         expect($aggregate['throughput'])->toBe('123.46')
             ->and($aggregate['workers'])->toBe('4')
@@ -331,7 +346,7 @@ it('sets an expiry on the snapshot-based aggregate publish as well', function ()
         $redis = (new ReflectionClass($publisher))
             ->getMethod('getRedis')
             ->invoke($publisher);
-        $ttl = (int) $redis->execute('TTL', $prefix.'metrics');
+        $ttl = (int) $redis->execute('TTL', localAggregateKey($prefix));
 
         expect($ttl)->toBeGreaterThan(0)->toBeLessThanOrEqual(30);
 
@@ -357,6 +372,8 @@ function cleanupRollups(MetricsPublisher $publisher, string $prefix, array $queu
             $redis->execute('DEL', $prefix.'metrics:rollup:'.$tier.':'.$queue);
         }
     }
+
+    deleteKeysMatching($redis, $prefix.'metrics:prune:*');
 }
 
 it('records outcomes into every tier at once', function () {
@@ -630,6 +647,7 @@ function cleanupGaugesAndJobs(MetricsPublisher $publisher, string $prefix, array
     }
 
     $redis->execute('DEL', $prefix.'metrics:jobs');
+    deleteKeysMatching($redis, $prefix.'metrics:prune:*');
 }
 
 it('folds gauge samples into sum, count and max per bucket', function () {
@@ -796,7 +814,7 @@ function cleanupHosts(MetricsPublisher $publisher, string $prefix): void
         $redis->execute('DEL', $prefix.'metrics:gauge:'.$tier.':host');
     }
 
-    $redis->execute('DEL', $prefix.'metrics:hosts');
+    $redis->execute('DEL', $prefix.'metrics:hosts', $prefix.'metrics:hosts:first');
 }
 
 it('records per-host outcomes into every tier under one key per tier', function () {
@@ -944,6 +962,155 @@ it('lists only the hosts seen inside the requested range', function () {
     }
 });
 
+it('keeps a first sighting while the host still reports and drops it with the host', function () {
+    $prefix = 'torque-host-first-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+    $long = $now - 800 * 86400;
+
+    try {
+        cleanupHosts($publisher, $prefix);
+
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+
+        $publisher->recordHostOutcomes(['web-gone' => [1, 0], 'web-long' => [1, 0]], $long);
+        $publisher->recordHostOutcomes(['web-long' => [1, 0]], $now);
+
+        // Both were first seen beyond the 730 day retention; only the one that
+        // stopped reporting leaves either index.
+        expect(array_keys($publisher->hostsSeen(0)))->toBe(['web-long'])
+            ->and($redis->execute('ZSCORE', $prefix.'metrics:hosts:first', 'web-gone'))->toBeNull()
+            ->and((int) $redis->execute('ZSCORE', $prefix.'metrics:hosts:first', 'web-long'))->toBe($long);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
+it('retries a first sighting whose write failed, with the earliest epoch', function () {
+    $prefix = 'torque-host-first-retry-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+    $earlier = $now - 7200;
+
+    try {
+        cleanupGaugesAndJobs($publisher, $prefix);
+        cleanupHosts($publisher, $prefix);
+
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+
+        // A string where the sorted set belongs makes the first-seen ZADD fail.
+        $redis->execute('SET', $prefix.'metrics:hosts:first', 'blocked');
+
+        expect(fn () => $publisher->recordGauges([MetricsPublisher::GAUGE_CONCURRENT => 4], $earlier, 'web-01'))
+            ->toThrow(RedisException::class);
+
+        $redis->execute('DEL', $prefix.'metrics:hosts:first');
+
+        // The same process publishes again, then a later process starts on the
+        // same host. The retry must carry the earlier epoch, or the later
+        // process's first sighting would hide the earliest bucket.
+        $publisher->recordGauges([MetricsPublisher::GAUGE_CONCURRENT => 4], $now, 'web-01');
+        createPublisher($prefix)->recordGauges([MetricsPublisher::GAUGE_CONCURRENT => 4], $now + 1, 'web-01');
+
+        $series = createPublisher($prefix)->gaugeSeries(MetricsPublisher::GAUGE_CONCURRENT, MetricsPublisher::TIER_HOUR, 3, $now);
+
+        expect((int) $redis->execute('ZSCORE', $prefix.'metrics:hosts:first', 'web-01'))->toBe($earlier)
+            ->and($series[intdiv($earlier, 3600) * 3600])->toBe(['avg' => 4.0, 'max' => 4.0]);
+    } finally {
+        cleanupGaugesAndJobs($publisher, $prefix);
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
+/**
+ * Autoscaled pods get a new hostname per deploy, and the host index keeps a
+ * name for the day tier's retention. Asking every indexed host for every
+ * bucket of the window would cost metrics x buckets x hosts fields per poll;
+ * a host is only asked for the buckets between its first and last sighting.
+ */
+it('reads cluster gauges only for the buckets each host was live in', function () {
+    $prefix = 'torque-gauge-churn-test:';
+    $publisher = createPublisher($prefix);
+    $now = time();
+    $hosts = 200;
+    $buckets = 168;
+    $metrics = [
+        MetricsPublisher::GAUGE_CONCURRENT,
+        MetricsPublisher::GAUGE_MEMORY,
+        MetricsPublisher::GAUGE_WORKER_MEMORY_PEAK,
+        MetricsPublisher::GAUGE_LATENCY,
+        MetricsPublisher::GAUGE_PENDING,
+    ];
+
+    try {
+        cleanupGaugesAndJobs($publisher, $prefix);
+        cleanupHosts($publisher, $prefix);
+
+        // One short-lived pod every 50 minutes across the week, oldest first,
+        // each publishing a single tick. Two pods can share an hour bucket.
+        $expected = [];
+
+        for ($i = $hosts - 1; $i >= 0; $i--) {
+            $at = $now - $i * 3000;
+            $host = 'pod-'.$i;
+
+            $publisher->recordHostOutcomes([$host => [2, 0]], $at);
+            $publisher->recordGauges([
+                MetricsPublisher::GAUGE_CONCURRENT => $i + 1,
+                MetricsPublisher::GAUGE_MEMORY => 10.0,
+                MetricsPublisher::GAUGE_WORKER_MEMORY_PEAK => (float) $i,
+                MetricsPublisher::GAUGE_LATENCY => 100.0,
+                MetricsPublisher::GAUGE_PENDING => 5,
+            ], $at, $host);
+
+            $bucket = intdiv($at, 3600) * 3600;
+            $expected[$bucket] = ($expected[$bucket] ?? 0) + $i + 1;
+        }
+
+        $reader = createPublisher($prefix);
+        $series = $reader->gaugeSeriesMulti($metrics, MetricsPublisher::TIER_HOUR, $buckets, $now);
+        $fields = $reader->fieldsRequested();
+
+        // A second identical call reports the same count, not a running total.
+        expect($reader->gaugeSeriesMulti($metrics, MetricsPublisher::TIER_HOUR, $buckets, $now))->toBe($series)
+            ->and($reader->fieldsRequested())->toBe($fields);
+
+        // Unscoped fallback per metric and bucket, plus per host the four
+        // host-scoped gauges and the latency weight for its one live bucket.
+        $bound = count($metrics) * $buckets + (4 + 1) * $hosts;
+
+        expect($fields)->toBeLessThanOrEqual($bound);
+
+        // The combined series is what the hosts published: slots add per
+        // bucket, queue depth is the shared sample, quiet buckets read zero.
+        foreach ($series[MetricsPublisher::GAUGE_CONCURRENT] as $bucket => $sample) {
+            expect($sample['avg'])->toBe((float) ($expected[$bucket] ?? 0))
+                ->and($series[MetricsPublisher::GAUGE_PENDING][$bucket]['avg'])->toBe(isset($expected[$bucket]) ? 5.0 : 0.0);
+        }
+
+        expect(array_sum(array_column($series[MetricsPublisher::GAUGE_CONCURRENT], 'avg')))->toBe((float) array_sum($expected))
+            ->and(end($series[MetricsPublisher::GAUGE_LATENCY])['avg'])->toBe(100.0);
+
+        // A host without a first sighting (written before the index existed)
+        // is read from the window's start up to its last sighting, and reads
+        // the same. The unbounded read asked every host for every bucket.
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+        $redis->execute('DEL', $prefix.'metrics:hosts:first');
+
+        // Same reader: the count covers its last call only, not its lifetime.
+        expect($reader->gaugeSeriesMulti($metrics, MetricsPublisher::TIER_HOUR, $buckets, $now))->toBe($series)
+            ->and($reader->fieldsRequested())->toBeGreaterThan($bound)
+            ->and($reader->fieldsRequested())->toBeLessThan(count($metrics) * $buckets + (4 + 1) * $buckets * $hosts);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    } finally {
+        cleanupGaugesAndJobs($publisher, $prefix);
+        cleanupHosts($publisher, $prefix);
+    }
+});
+
 /**
  * A publish tick records outcomes and then gauges for the same fleet, so the
  * index touch would run twice for one tick's worth of information. The guard
@@ -1002,4 +1169,104 @@ it('makes a hostname safe to use inside a colon-delimited field', function () {
         ->and(MetricsPublisher::normaliseHost(''))->toBe('unknown')
         ->and(MetricsPublisher::normaliseHost('   '))->toBe('unknown')
         ->and(strlen(MetricsPublisher::normaliseHost(str_repeat('h', 200))))->toBeLessThanOrEqual(56);
+});
+
+it('leaves an already normalised hostname unchanged', function (string $host) {
+    // Index members are stored normalised and read back through the series
+    // readers, which normalise again; a second pass must not mint a new name.
+    $once = MetricsPublisher::normaliseHost($host);
+
+    expect(MetricsPublisher::normaliseHost($once))->toBe($once);
+})->with([
+    'colon' => 'web:01',
+    'space' => 'web 01',
+    'tilde' => 'web~01',
+    'too long' => str_repeat('h', 200),
+    'clean' => 'web-01',
+]);
+
+it('prunes a shared hash once per bucket however many masters write it', function () {
+    $prefix = 'torque-prune-lock-test:';
+    $first = createPublisher($prefix);
+    $second = createPublisher($prefix);
+    $now = time();
+    $bucket = intdiv($now, 60) * 60;
+    $stale = (string) ($bucket - 3 * 86400);
+
+    try {
+        cleanupRollups($first, $prefix);
+
+        $redis = (new ReflectionClass($first))->getMethod('getRedis')->invoke($first);
+
+        $first->recordOutcomes(1, 0, [], $now);
+        $redis->execute('HSET', $prefix.'metrics:rollup:minute', $stale, '5,0');
+
+        // A second master in the same bucket finds the bucket already pruned.
+        $second->recordOutcomes(1, 0, [], $now);
+
+        expect($redis->execute('HEXISTS', $prefix.'metrics:rollup:minute', $stale))->toBe(1);
+
+        // The next bucket is pruned again, by whichever master gets there first.
+        $second->recordOutcomes(1, 0, [], $bucket + 60);
+
+        expect($redis->execute('HEXISTS', $prefix.'metrics:rollup:minute', $stale))->toBe(0)
+            ->and($first->series('minute', 2, null, $bucket + 60))
+            ->toBe([$bucket => ['processed' => 2, 'failed' => 0], $bucket + 60 => ['processed' => 1, 'failed' => 0]]);
+
+        cleanupRollups($first, $prefix);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+it('keeps one aggregate per host and sums them on read', function () {
+    $prefix = 'torque-live-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        cleanupRedisKeys($publisher, $prefix, []);
+
+        $publisher->publishAggregate(['throughput' => 1.25, 'concurrent' => 3, 'total_slots' => 20, 'avg_latency' => 10.0, 'jobs_processed' => 30, 'jobs_failed' => 1, 'memory_mb' => 64.5, 'workers' => 2], 'web-01');
+        $publisher->publishAggregate(['throughput' => 0.75, 'concurrent' => 1, 'total_slots' => 10, 'avg_latency' => 40.0, 'jobs_processed' => 10, 'jobs_failed' => 0, 'memory_mb' => 32.0, 'workers' => 1], 'web-02');
+
+        $redis = (new ReflectionClass($publisher))->getMethod('getRedis')->invoke($publisher);
+
+        expect($redis->execute('EXISTS', $prefix.'metrics'))->toBe(0)
+            ->and((int) $redis->execute('TTL', $prefix.'metrics:live:web-01'))->toBeGreaterThan(0)->toBeLessThanOrEqual(30)
+            ->and($redis->execute('HGET', $prefix.'metrics:live:web-02', 'workers'))->toBe('1');
+
+        $aggregate = $publisher->getAggregatedMetrics();
+
+        expect($aggregate['throughput'])->toBe('2')
+            ->and($aggregate['concurrent'])->toBe('4')
+            ->and($aggregate['total_slots'])->toBe('30')
+            ->and($aggregate['jobs_processed'])->toBe('40')
+            ->and($aggregate['jobs_failed'])->toBe('1')
+            ->and($aggregate['memory_mb'])->toBe('96.5')
+            ->and($aggregate['workers'])->toBe('3')
+            // (30 x 10 + 10 x 40) / 40 processed jobs.
+            ->and($aggregate['avg_latency'])->toBe('17.5');
+
+        cleanupRedisKeys($publisher, $prefix, []);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+it('times out a read on a socket that never answers', function () {
+    // Accepted by the kernel's backlog and never read: the command goes out
+    // and no reply ever comes, as on a half-open socket.
+    $server = stream_socket_server('tcp://127.0.0.1:0');
+    $address = (string) stream_socket_get_name($server, false);
+
+    try {
+        $publisher = new MetricsPublisher(redisUri: 'redis://'.$address, readTimeout: 0.3);
+        $started = microtime(true);
+
+        expect(fn () => $publisher->getAggregatedMetrics())
+            ->toThrow(RedisTimeoutException::class)
+            ->and(microtime(true) - $started)->toBeLessThan(5.0);
+    } finally {
+        fclose($server);
+    }
 });

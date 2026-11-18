@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Webpatser\Torque\Manager\AutoScaler;
+use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
 
 it('pidFilePath returns storage path', function () {
@@ -227,6 +229,390 @@ it('constructor accepts config and logger', function () {
     expect($master)->toBeInstanceOf(MasterProcess::class)
         ->and($master->workerPids)->toBe([])
         ->and($master->workerCount)->toBe(0);
+});
+
+// Fake child PIDs above every kernel's pid_max (Linux caps at 2^22), so a
+// posix_kill from the code under test can only ever return ESRCH.
+const FAKE_CHILD_PID = 2147483000;
+
+it('keeps supervising when a respawn fork fails and retries it after a backoff', function () {
+    $logs = [];
+    $master = new MasterProcess(config: ['workers' => 1], logger: function (string $m) use (&$logs) {
+        $logs[] = $m;
+    });
+
+    $fork = new ReflectionProperty($master, 'fork');
+    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $retry = new ReflectionMethod($master, 'retryPendingRespawns');
+
+    // The OS refuses the fork (EAGAIN, ENOMEM): no throw out of the monitor loop.
+    $fork->setValue($master, fn (): int => -1);
+    (new ReflectionMethod($master, 'respawnWorker'))->invoke($master);
+
+    expect($pending->getValue($master))->toBe(1)
+        ->and($master->workerPids)->toBe([])
+        ->and(implode("\n", $logs))->toContain('fork failed');
+
+    // Still failing at the retry: it stays owed.
+    $now = microtime(true);
+    $retry->invoke($master, $now + 3600);
+    expect($pending->getValue($master))->toBe(1);
+
+    // Fork works again, but the backoff of that last failure has not passed.
+    $fork->setValue($master, fn (): int => FAKE_CHILD_PID);
+    $retry->invoke($master, $now + 3600.5);
+    expect($master->workerPids)->toBe([]);
+
+    $retry->invoke($master, $now + 7200);
+    expect($pending->getValue($master))->toBe(0)
+        ->and($master->workerPids)->toBe([FAKE_CHILD_PID => true])
+        ->and($master->workerCount)->toBe(1);
+});
+
+it('drops owed respawns once the master is stopping', function () {
+    $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+
+    (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
+    (new ReflectionProperty($master, 'pendingRespawns'))->setValue($master, 2);
+    (new ReflectionProperty($master, 'shouldStop'))->setValue($master, true);
+
+    (new ReflectionMethod($master, 'retryPendingRespawns'))->invoke($master, microtime(true) + 3600);
+
+    expect((new ReflectionProperty($master, 'pendingRespawns'))->getValue($master))->toBe(0)
+        ->and($master->workerPids)->toBe([]);
+});
+
+it('puts a failed scale-up fork on the owed-respawn backoff', function () {
+    $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+    $scaler = new AutoScaler(redisUri: 'redis://127.0.0.1:6379', minWorkers: 2, cooldownSeconds: 0);
+    $forks = 0;
+
+    (new ReflectionProperty($master, 'autoScaler'))->setValue($master, $scaler);
+    (new ReflectionProperty($master, 'fork'))->setValue($master, function () use (&$forks): int {
+        $forks++;
+
+        return -1;
+    });
+
+    (new ReflectionMethod($master, 'scaleUp'))->invoke($master);
+
+    // The worker is owed, so it counts toward the fleet and the scaler does
+    // not ask again; the retry waits out the backoff instead of forking each tick.
+    expect($forks)->toBe(1)
+        ->and((new ReflectionProperty($master, 'pendingRespawns'))->getValue($master))->toBe(1)
+        ->and((new ReflectionMethod($master, 'fleetSize'))->invoke($master))->toBe(1)
+        ->and((new ReflectionProperty($master, 'respawnRetryAt'))->getValue($master))->toBeGreaterThan(microtime(true));
+
+    (new ReflectionMethod($master, 'retryPendingRespawns'))->invoke($master, microtime(true));
+
+    expect($forks)->toBe(1);
+});
+
+it('owes no respawn into a fleet that is draining', function () {
+    $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+    $retry = new ReflectionMethod($master, 'retryPendingRespawns');
+    $pending = new ReflectionProperty($master, 'pendingRespawns');
+
+    (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
+
+    foreach (['drainRequested', 'draining'] as $flag) {
+        $pending->setValue($master, 1);
+        (new ReflectionProperty($master, $flag))->setValue($master, true);
+
+        $retry->invoke($master, microtime(true) + 3600);
+
+        expect($master->workerPids)->toBe([])
+            ->and($pending->getValue($master))->toBe(1);
+
+        (new ReflectionProperty($master, $flag))->setValue($master, false);
+    }
+});
+
+/**
+ * A TCP listener that accepts the handshake (the kernel backlog does) and
+ * never answers: a silent Redis. Closed by the caller.
+ *
+ * @return array{0: resource, 1: int}
+ */
+function silentRedisServer(): array
+{
+    $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+
+    if ($server === false) {
+        test()->markTestSkipped("Cannot listen: {$errstr}");
+    }
+
+    $name = (string) stream_socket_get_name($server, false);
+
+    return [$server, (int) substr($name, strrpos($name, ':') + 1)];
+}
+
+it('survives a silent Redis in the autoscale and drain reads and starts the next tick on a new client', function () {
+    [$server, $port] = silentRedisServer();
+    $logs = [];
+
+    try {
+        $master = new MasterProcess(
+            config: ['workers' => 1, 'redis' => ['uri' => "redis://127.0.0.1:{$port}", 'read_timeout_seconds' => 0.3]],
+            logger: function (string $m) use (&$logs) {
+                $logs[] = $m;
+            },
+        );
+
+        $publisher = new ReflectionProperty($master, 'metricsPublisher');
+        $publisher->setValue($master, (new ReflectionMethod($master, 'makeMetricsPublisher'))->invoke($master));
+        (new ReflectionProperty($master, 'autoScaler'))->setValue($master, new AutoScaler(redisUri: 'unused', cooldownSeconds: 0));
+        (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
+
+        $before = $publisher->getValue($master);
+        (new ReflectionMethod($master, 'evaluateAutoscale'))->invoke($master);
+        $afterAutoscale = $publisher->getValue($master);
+
+        expect($afterAutoscale)->not->toBe($before)
+            ->and($master->workerPids)->toBe([])
+            ->and(implode("\n", $logs))->toContain('Autoscale skipped');
+
+        expect((new ReflectionMethod($master, 'fleetIsIdle'))->invoke($master))->toBeFalse()
+            ->and($publisher->getValue($master))->not->toBe($afterAutoscale);
+    } finally {
+        fclose($server);
+    }
+});
+
+it('does not scale up while the fleet is paused', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-'.bin2hex(random_bytes(4)).':';
+
+    $master = new MasterProcess(
+        config: ['workers' => 1, 'redis' => ['uri' => torqueRedisUri(), 'prefix' => $prefix]],
+        logger: fn (string $m) => null,
+    );
+
+    (new ReflectionProperty($master, 'metricsPublisher'))->setValue($master, (new ReflectionMethod($master, 'makeMetricsPublisher'))->invoke($master));
+    (new ReflectionProperty($master, 'autoScaler'))->setValue($master, new AutoScaler(redisUri: 'unused', minWorkers: 2, cooldownSeconds: 0));
+    (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
+    $evaluate = new ReflectionMethod($master, 'evaluateAutoscale');
+
+    try {
+        // A deliberate torque:pause holds the below-min rule back.
+        $redis->execute('SET', $prefix.'paused', (string) time());
+        $evaluate->invoke($master);
+        expect($master->workerPids)->toBe([]);
+
+        // Another master's drain does not pause this fleet.
+        $redis->execute('SET', $prefix.'paused', 'drain:'.(FAKE_CHILD_PID + 9), 'EX', '60');
+        $evaluate->invoke($master);
+        expect($master->workerPids)->toBe([FAKE_CHILD_PID => true]);
+    } finally {
+        $redis->execute('DEL', $prefix.'paused');
+    }
+});
+
+/**
+ * A master on a fresh Redis prefix whose fake children report the given
+ * active slots out of 50, with the autoscaler and publisher wired as run() does.
+ *
+ * @param  array<int, int>  $activeByPid
+ * @return array{0: MasterProcess, 1: string}
+ */
+function autoscalingMaster(array $activeByPid, int $minWorkers, int $maxWorkers, Closure $logger): array
+{
+    $redis = torqueRedis();
+    $prefix = 'torque-test-'.bin2hex(random_bytes(4)).':';
+
+    $master = new MasterProcess(
+        config: ['workers' => count($activeByPid), 'redis' => ['uri' => torqueRedisUri(), 'prefix' => $prefix]],
+        logger: $logger,
+    );
+
+    (new ReflectionProperty($master, 'metricsPublisher'))->setValue($master, (new ReflectionMethod($master, 'makeMetricsPublisher'))->invoke($master));
+    (new ReflectionProperty($master, 'autoScaler'))->setValue($master, new AutoScaler(
+        redisUri: 'unused',
+        minWorkers: $minWorkers,
+        maxWorkers: $maxWorkers,
+        cooldownSeconds: 0,
+    ));
+    (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => -1);
+    (new ReflectionProperty($master, 'workerPids'))->setValue($master, array_fill_keys(array_keys($activeByPid), true));
+
+    foreach ($activeByPid as $pid => $active) {
+        $redis->execute('HSET', $prefix.'worker:test-'.$pid, 'pid', (string) $pid, 'active_slots', (string) $active, 'total_slots', '50');
+    }
+
+    return [$master, $prefix];
+}
+
+function forgetAutoscalingMaster(string $prefix, array $pids): void
+{
+    foreach ($pids as $pid) {
+        torqueRedis()->execute('DEL', $prefix.'worker:test-'.$pid);
+    }
+}
+
+it('cancels owed respawns before it terminates a live worker on scale-down', function () {
+    $pids = [FAKE_CHILD_PID, FAKE_CHILD_PID + 1, FAKE_CHILD_PID + 2, FAKE_CHILD_PID + 3];
+    [$master, $prefix] = autoscalingMaster(array_fill_keys($pids, 0), minWorkers: 2, maxWorkers: 8, logger: fn (string $m) => null);
+    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $scalingDown = new ReflectionProperty($master, 'scalingDownPids');
+    $evaluate = new ReflectionMethod($master, 'evaluateAutoscale');
+
+    try {
+        // 4 live and 2 owed after ENOMEM, then the load drops.
+        $pending->setValue($master, 2);
+
+        $evaluate->invoke($master);
+        $evaluate->invoke($master);
+
+        expect($pending->getValue($master))->toBe(0)
+            ->and($scalingDown->getValue($master))->toBe([])
+            ->and(count($master->workerPids))->toBe(4)
+            ->and((new ReflectionProperty($master, 'respawnBackoff'))->getValue($master))->toBe(0.0);
+
+        // Nothing owed any more: the quietest live worker goes, as before.
+        $evaluate->invoke($master);
+
+        expect(count($scalingDown->getValue($master)))->toBe(1)
+            ->and($pending->getValue($master))->toBe(0);
+    } finally {
+        forgetAutoscalingMaster($prefix, $pids);
+    }
+});
+
+it('does not scale up past the cap while respawns are owed', function () {
+    $pids = [FAKE_CHILD_PID, FAKE_CHILD_PID + 1];
+    [$master, $prefix] = autoscalingMaster(array_fill_keys($pids, 50), minWorkers: 1, maxWorkers: 4, logger: fn (string $m) => null);
+    $pending = new ReflectionProperty($master, 'pendingRespawns');
+
+    try {
+        // 2 live and 2 owed under full load: the owed ones already fill the cap.
+        $pending->setValue($master, 2);
+
+        (new ReflectionMethod($master, 'evaluateAutoscale'))->invoke($master);
+
+        expect($pending->getValue($master))->toBe(2)
+            ->and(count($master->workerPids))->toBe(2);
+    } finally {
+        forgetAutoscalingMaster($prefix, $pids);
+    }
+});
+
+it('keeps its clients on a non-Redis autoscale error and logs it again while it lasts', function () {
+    $logs = [];
+    // A bug in the pass itself, not Redis: the scale-up log line throws.
+    [$master, $prefix] = autoscalingMaster([], minWorkers: 2, maxWorkers: 8, logger: function (string $m) use (&$logs): void {
+        if (str_contains($m, 'scaling up')) {
+            throw new LogicException('scaler bug');
+        }
+
+        $logs[] = $m;
+    });
+    $publisher = new ReflectionProperty($master, 'metricsPublisher');
+    $client = new ReflectionProperty($master, 'masterRedis');
+    $evaluate = new ReflectionMethod($master, 'evaluateAutoscale');
+    $now = microtime(true);
+
+    $evaluate->invoke($master, $now);
+    $publisherBefore = $publisher->getValue($master);
+    $clientBefore = $client->getValue($master);
+
+    $evaluate->invoke($master, $now + 60);
+
+    expect($publisher->getValue($master))->toBe($publisherBefore)
+        ->and($client->getValue($master))->not->toBeNull()
+        ->and($client->getValue($master))->toBe($clientBefore)
+        ->and($logs)->toHaveCount(1)
+        ->and($logs[0])->toContain('Autoscale skipped (LogicException: scaler bug)');
+
+    $evaluate->invoke($master, $now + 300);
+
+    expect($logs)->toHaveCount(2);
+});
+
+it('removes the PID file when the monitor loop ends by exception', function () {
+    $master = new MasterProcess(config: ['workers' => 1], logger: function (string $m): void {
+        throw new LogicException('logger down');
+    });
+
+    (new ReflectionMethod($master, 'writePidFile'))->invoke($master);
+    (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => -1);
+    (new ReflectionProperty($master, 'pendingRespawns'))->setValue($master, 1);
+
+    $async = pcntl_async_signals();
+
+    try {
+        expect(fn () => (new ReflectionMethod($master, 'runMonitor'))->invoke($master))
+            ->toThrow(LogicException::class, 'logger down');
+
+        expect(file_exists(MasterProcess::pidFilePath()))->toBeFalse();
+    } finally {
+        // monitor() blocks these for sigtimedwait where it exists.
+        pcntl_sigprocmask(SIG_UNBLOCK, [SIGTERM, SIGINT, SIGCHLD, SIGUSR2]);
+        pcntl_async_signals($async);
+        @unlink(MasterProcess::pidFilePath());
+    }
+});
+
+it('publishes owed respawns into its own host hash and clears them once', function () {
+    $redis = torqueRedis();
+    $prefix = 'torque-test-'.bin2hex(random_bytes(4)).':';
+    $key = $prefix.'metrics:live:'.MetricsPublisher::normaliseHost(MetricsPublisher::localHost());
+
+    $master = new MasterProcess(
+        config: ['workers' => 1, 'redis' => ['uri' => torqueRedisUri(), 'prefix' => $prefix]],
+        logger: fn (string $m) => null,
+    );
+    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $publish = new ReflectionMethod($master, 'publishPendingRespawns');
+
+    try {
+        $publish->invoke($master);
+        expect($redis->execute('EXISTS', $key))->toBe(0);
+
+        $pending->setValue($master, 2);
+        $publish->invoke($master);
+        expect($redis->execute('HGET', $key, MasterProcess::PENDING_RESPAWNS_FIELD))->toBe('2');
+
+        $pending->setValue($master, 0);
+        $publish->invoke($master);
+        expect($redis->execute('HGET', $key, MasterProcess::PENDING_RESPAWNS_FIELD))->toBe('0');
+
+        // Nothing owed and nothing left to clear: no write at all.
+        $redis->execute('DEL', $key);
+        $publish->invoke($master);
+        expect($redis->execute('EXISTS', $key))->toBe(0);
+    } finally {
+        $redis->execute('DEL', $key);
+    }
+});
+
+it('never picks a draining worker for scale-down and counts it out of the fleet', function () {
+    $master = new MasterProcess(config: ['workers' => 3], logger: fn (string $m) => null);
+    [$draining, $busy, $quiet] = [FAKE_CHILD_PID, FAKE_CHILD_PID + 1, FAKE_CHILD_PID + 2];
+
+    (new ReflectionProperty($master, 'workerPids'))->setValue($master, [$draining => true, $busy => true, $quiet => true]);
+    $scalingDown = new ReflectionProperty($master, 'scalingDownPids');
+    $scalingDown->setValue($master, [$draining => true]);
+    $fleetSize = new ReflectionMethod($master, 'fleetSize');
+
+    expect($fleetSize->invoke($master))->toBe(2);
+
+    // The draining worker reports the fewest active slots, yet the next
+    // victim is the quietest worker that is still in service.
+    (new ReflectionMethod($master, 'scaleDown'))->invoke($master, [
+        $draining => ['active' => 0, 'total' => 50],
+        $busy => ['active' => 5, 'total' => 50],
+        $quiet => ['active' => 3, 'total' => 50],
+    ]);
+
+    expect($scalingDown->getValue($master))->toBe([$draining => true, $quiet => true])
+        ->and($fleetSize->invoke($master))->toBe(1);
+
+    // Everyone draining: nothing left to pick.
+    (new ReflectionProperty($master, 'workerPids'))->setValue($master, [$draining => true]);
+    $scalingDown->setValue($master, [$draining => true]);
+    (new ReflectionMethod($master, 'scaleDown'))->invoke($master, [$draining => ['active' => 0, 'total' => 50]]);
+
+    expect($scalingDown->getValue($master))->toBe([$draining => true]);
 });
 
 it('turns cumulative per-class counters into per-tick deltas', function () {
