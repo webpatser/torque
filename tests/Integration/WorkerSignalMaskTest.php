@@ -42,6 +42,8 @@ $init = function (string $artisan): void {
     $this->artisanPath = $artisan;
     $this->config = ['queues' => ['default'], 'slots_per_worker' => 1];
     $this->logger = static function (string $message): void {};
+    // The constructor is skipped, so set the real fork it would have assigned.
+    $this->fork = static fn (): int => pcntl_fork();
 };
 Closure::bind($init, $master, Webpatser\Torque\Process\MasterProcess::class)($argv[2]);
 

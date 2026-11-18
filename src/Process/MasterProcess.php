@@ -228,11 +228,11 @@ LUA;
     private ?RedisClient $masterRedis = null;
 
     /**
-     * Stand-in for `pcntl_fork()` so a test can play the kernel; null forks for real.
+     * Forks the process: `pcntl_fork()` in production, replaced by a test to play the kernel.
      *
-     * @var (Closure(): int)|null
+     * @var Closure(): int
      */
-    private ?Closure $fork = null;
+    private Closure $fork;
 
     private readonly string $artisanPath;
 
@@ -248,6 +248,7 @@ LUA;
         private readonly ?Closure $errorLogger = null,
     ) {
         $this->artisanPath = base_path('artisan');
+        $this->fork = static fn (): int => pcntl_fork();
     }
 
     /**
@@ -477,7 +478,7 @@ LUA;
      */
     private function spawnWorker(): void
     {
-        $pid = $this->fork !== null ? ($this->fork)() : pcntl_fork();
+        $pid = ($this->fork)();
 
         if ($pid === -1) {
             throw new \RuntimeException('Failed to fork worker process');
