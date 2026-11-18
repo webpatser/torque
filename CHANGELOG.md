@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-18
+
 ### Changed
 - `torque:prune --deep` without `--consumer-idle` now uses the same 3600 seconds as the routine pass (it was 0, which deleted every consumer without pending work).
 - `torque:prune --dead-letter-max` defaults to the configured `dead_letter.max_entries` (it was a fixed 100000).
