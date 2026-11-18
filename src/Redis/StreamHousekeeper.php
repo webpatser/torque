@@ -57,8 +57,6 @@ final class StreamHousekeeper
     /** The master's limit on redelivery fields looked at per stream per sweep. */
     public const int REDELIVERY_FIELDS_PER_SWEEP = 1000;
 
-    private ?RedisClient $redis = null;
-
     /** @var array<string, string> Stream key => HSCAN cursor a capped sweep stopped at. */
     private array $redeliveryCursors = [];
 
@@ -70,6 +68,7 @@ final class StreamHousekeeper
      * @param  int  $maxEntries  Extra hard cap applied after the handler's own policy. 0 = handler only.
      * @param  int  $jobStreamTtl  `job_events.ttl`, the basis for the orphaned-stream cutoff.
      * @param  int  $dailyRetentionDays  `metrics.rollups.daily_days`; 0 keeps the day tier forever.
+     * @param  RedisClient|null  $redis  Client to use instead of one connected lazily to `$redisUri`.
      */
     public function __construct(
         private readonly string $redisUri,
@@ -81,6 +80,7 @@ final class StreamHousekeeper
         private readonly bool $cluster = false,
         private readonly int $jobStreamTtl = 300,
         private readonly int $dailyRetentionDays = 730,
+        private ?RedisClient $redis = null,
     ) {}
 
     /**
@@ -178,7 +178,11 @@ final class StreamHousekeeper
      *
      * A consumer with pending entries is left alone: DELCONSUMER discards its
      * PEL, so those jobs would be lost instead of being reclaimed by the next
-     * worker's XAUTOCLAIM.
+     * worker's XAUTOCLAIM. XINFO only picks the candidates; each delete goes
+     * through {@see StreamQueue::LUA_DELETE_IDLE_CONSUMER}, which checks the PEL
+     * again in the same step, because a worker reusing the name can take a
+     * delivery between the two round trips. Only deletes the script confirms
+     * are counted.
      *
      * @param  int|null  $redeliveryFieldLimit  Redelivery fields to look at per stream
      *                                          before stopping; the next call on this
@@ -225,7 +229,18 @@ final class StreamHousekeeper
                 }
 
                 if (! $dryRun) {
-                    $this->redis()->execute('XGROUP', 'DELCONSUMER', $streamKey, $this->consumerGroup, Narrow::string($info['name'] ?? null));
+                    $deleted = $this->redis()->execute(
+                        'EVAL',
+                        StreamQueue::LUA_DELETE_IDLE_CONSUMER,
+                        '1',
+                        $streamKey,
+                        $this->consumerGroup,
+                        Narrow::string($info['name'] ?? null),
+                    );
+
+                    if (Narrow::int($deleted) !== 1) {
+                        continue;
+                    }
                 }
 
                 $removed[$queue]++;

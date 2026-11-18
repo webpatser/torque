@@ -31,8 +31,8 @@ use Webpatser\Torque\Support\Narrow;
 final class TorquePruneCommand extends Command
 {
     protected $signature = 'torque:prune
-        {--dead-letter-max=100000 : Hard cap on dead-letter entries (0 = TTL only)}
-        {--consumer-idle= : Delete idle consumers without pending work after this many seconds (default 3600, or 0 with --deep)}
+        {--dead-letter-max= : Hard cap on dead-letter entries (default torque.dead_letter.max_entries; 0 adds no cap beyond it)}
+        {--consumer-idle= : Delete idle consumers without pending work after this many seconds (default 3600)}
         {--deep : Also sweep leftovers from older Torque versions (orphaned job streams, stale indexes, stale worker hashes)}
         {--dry-run : Report what would be removed without touching Redis}';
 
@@ -43,18 +43,27 @@ final class TorquePruneCommand extends Command
         $dryRun = (bool) $this->option('dry-run');
         $deep = (bool) $this->option('deep');
 
-        // A deep clean is an explicit operator action on an upgraded install,
-        // so it defaults to removing every consumer without pending work
-        // regardless of how long it has been idle. The routine pass keeps the
-        // conservative hour.
-        $consumerIdle = $this->option('consumer-idle') !== null
-            ? (int) $this->option('consumer-idle')
-            : ($deep ? 0 : 3600);
+        // The same hour the master uses, with or without --deep: a live worker
+        // idle between polls has nothing pending either, so a lower default
+        // would sweep consumers of running workers.
+        $consumerIdle = 3600;
 
+        if ($this->option('consumer-idle') !== null) {
+            $consumerIdle = filter_var($this->option('consumer-idle'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+
+            if ($consumerIdle === false) {
+                $this->components->error('The --consumer-idle option must be a whole number of seconds, 0 or more.');
+
+                return self::FAILURE;
+            }
+        }
+
+        // Without the option the configured cap applies, as in the master's own
+        // pass; a fixed default here would override dead_letter.max_entries.
         $housekeeper = StreamHousekeeper::fromConfig(
             Narrow::map(config('torque')),
             $deadLetters,
-            maxEntries: (int) $this->option('dead-letter-max'),
+            maxEntries: $this->option('dead-letter-max') !== null ? (int) $this->option('dead-letter-max') : null,
         );
 
         if ($deep) {

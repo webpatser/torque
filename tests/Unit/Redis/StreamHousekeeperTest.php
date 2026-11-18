@@ -2,12 +2,18 @@
 
 declare(strict_types=1);
 
+use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
+use Fledge\Async\Redis\Connection\RedisLink;
+use Fledge\Async\Redis\Protocol\RedisResponse;
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Container\Container;
 use Illuminate\Foundation\Application;
 use Webpatser\Torque\Job\DeadLetterHandler;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
+
+use function Fledge\Async\Redis\createRedisConnector;
 
 /*
  * The housekeeper is the shared implementation behind `torque:prune` and the
@@ -111,6 +117,66 @@ it('counts without deleting on a dry run', function () {
 
     expect($removed)->toBe(['default' => 1])
         ->and($this->redis->execute('XINFO', 'CONSUMERS', $stream, $this->group))->toHaveCount(1);
+});
+
+/*
+ * XINFO CONSUMERS and the delete are separate round trips, so a worker reusing
+ * the name can take a delivery in between. The link below plays that worker:
+ * right after XINFO it reads the waiting entry as `dead-worker`, then lets the
+ * housekeeper's next command through. A plain DELCONSUMER would drop that
+ * entry's PEL record, and nothing could reclaim it any more.
+ */
+it('keeps a consumer that takes a delivery between the check and the delete', function () {
+    $stream = $this->prefix.'default';
+    $group = $this->group;
+    $redis = $this->redis;
+
+    $redis->execute('XGROUP', 'CREATE', $stream, $group, '$', 'MKSTREAM');
+    $redis->execute('XGROUP', 'CREATECONSUMER', $stream, $group, 'dead-worker');
+    $redis->execute('XADD', $stream, '*', 'payload', 'job');
+
+    $link = new class(new ReconnectingRedisLink(createRedisConnector(torqueRedisUri())), function () use ($redis, $stream, $group): void {
+        $redis->execute('XREADGROUP', 'GROUP', $group, 'dead-worker', 'COUNT', '1', 'STREAMS', $stream, '>');
+    }) implements RedisLink
+    {
+        private bool $checked = false;
+
+        private bool $interleaved = false;
+
+        public function __construct(private readonly RedisLink $link, private readonly Closure $worker) {}
+
+        public function execute(string $command, array $parameters): RedisResponse
+        {
+            if ($this->checked && ! $this->interleaved) {
+                $this->interleaved = true;
+                ($this->worker)();
+            }
+
+            $response = $this->link->execute($command, $parameters);
+
+            if (strtoupper($command) === 'XINFO') {
+                $this->checked = true;
+            }
+
+            return $response;
+        }
+    };
+
+    $housekeeper = new StreamHousekeeper(
+        redisUri: torqueRedisUri(),
+        prefix: $this->prefix,
+        consumerGroup: $group,
+        queues: ['default'],
+        deadLetters: new DeadLetterHandler(redisUri: torqueRedisUri(), ttl: 60, prefix: $this->prefix, maxEntries: 0),
+        redis: new RedisClient($link),
+    );
+
+    $removed = $housekeeper->pruneConsumers(idleSeconds: 0);
+
+    $pending = $redis->execute('XPENDING', $stream, $group, '-', '+', '10', 'dead-worker');
+
+    expect($removed)->toBe(['default' => 0])
+        ->and($pending)->toHaveCount(1);
 });
 
 it('reports nothing for a stream whose group does not exist yet', function () {

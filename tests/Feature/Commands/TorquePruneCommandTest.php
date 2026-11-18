@@ -46,6 +46,64 @@ it('deletes idle consumers without pending messages and keeps busy ones', functi
 });
 
 /*
+ * Without --dead-letter-max the command applies dead_letter.max_entries, like
+ * the master's own pass. It used to add a cap of 100000 on top, so a larger
+ * configured cap, or 0 (TTL only), was cut back to 100000 on every run.
+ */
+it('keeps the configured dead-letter cap when --dead-letter-max is not given', function (int $configured) {
+    config(['torque.dead_letter.max_entries' => $configured]);
+
+    // Comfortably past 100000 plus one stream node, so an approximate trim to
+    // 100000 would show.
+    $this->redis->execute('EVAL', <<<'LUA'
+        for i = 1, tonumber(ARGV[1]) do
+            redis.call('XADD', KEYS[1], '*', 'payload', 'x')
+        end
+        return 1
+        LUA, '1', 'torque-test:dead-letter', '101000');
+
+    Artisan::call('torque:prune');
+
+    expect((int) $this->redis->execute('XLEN', 'torque-test:dead-letter'))->toBe(101000);
+})->with(['TTL only' => 0, 'larger cap' => 200000]);
+
+it('still caps the stream with an explicit --dead-letter-max', function () {
+    config(['torque.dead_letter.max_entries' => 0]);
+
+    $this->redis->execute('EVAL', <<<'LUA'
+        for i = 1, tonumber(ARGV[1]) do
+            redis.call('XADD', KEYS[1], '*', 'payload', 'x')
+        end
+        return 1
+        LUA, '1', 'torque-test:dead-letter', '1000');
+
+    Artisan::call('torque:prune', ['--dead-letter-max' => 100]);
+
+    expect((int) $this->redis->execute('XLEN', 'torque-test:dead-letter'))->toBeLessThan(1000);
+});
+
+it('keeps a consumer idle for less than an hour during a deep sweep', function () {
+    $group = config('torque.consumer_group');
+    $this->redis->execute('XGROUP', 'CREATE', 'torque-test:default', $group, '$', 'MKSTREAM');
+    $this->redis->execute('XGROUP', 'CREATECONSUMER', 'torque-test:default', $group, 'resting-worker');
+
+    Artisan::call('torque:prune', ['--deep' => true]);
+
+    expect($this->redis->execute('XINFO', 'CONSUMERS', 'torque-test:default', $group))->toHaveCount(1);
+});
+
+it('rejects a --consumer-idle that is not a non-negative integer', function (string $value) {
+    $group = config('torque.consumer_group');
+    $this->redis->execute('XGROUP', 'CREATE', 'torque-test:default', $group, '$', 'MKSTREAM');
+    $this->redis->execute('XGROUP', 'CREATECONSUMER', 'torque-test:default', $group, 'resting-worker');
+
+    $status = Artisan::call('torque:prune', ['--consumer-idle' => $value]);
+
+    expect($status)->toBe(1)
+        ->and($this->redis->execute('XINFO', 'CONSUMERS', 'torque-test:default', $group))->toHaveCount(1);
+})->with(['negative' => '-5', 'not a number' => 'soon', 'fraction' => '1.5']);
+
+/*
  * --deep adds the upgrade sweep (orphaned job streams, stale index members,
  * stale worker hashes) to the routine trim, and reports every category.
  */
