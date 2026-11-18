@@ -345,6 +345,8 @@ TORQUE_CLUSTER=true
 
 When cluster mode is enabled, all Redis keys for a given queue are wrapped in hash tags (`{queue-name}`) so they land on the same cluster slot. This ensures Lua scripts and multi-key operations work correctly across the stream, delayed set, and notification keys.
 
+Set the flag on every Redis Cluster install: job events are recorded with one multi-key script that a cluster rejects with CROSSSLOT. Torque then falls back to the cluster path and logs one warning, but the flag avoids the failed call.
+
 If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will not double-wrap them.
 
 ## CLI Commands

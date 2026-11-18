@@ -28,6 +28,14 @@ No data step and no config change. The Redis layout of the fleet aggregate and t
 - **Hosts that go away** drop out of the aggregate sums 30 seconds after their last publish. Their gauge samples stay in the buckets they wrote, as history.
 - During a reload takeover two masters on one box write the same `{prefix}metrics:live:{host}` hash in turn, each with its own half of the fleet, so that host's figures can read low for the few seconds the takeover lasts.
 
+### Worker index and job events
+
+- **New key `{prefix}metrics:workers`:** a sorted set of worker ids, scored by the epoch of the worker's last heartbeat, with a 60 second TTL refreshed on every publish. Each worker writes its own entry (with its `{prefix}worker:{id}` hash); the entry is removed when the worker deregisters or the orphan cleanup deletes its hash, and a reader drops entries whose hash is gone. Tooling that scanned `{prefix}worker:*` can read `ZRANGE {prefix}metrics:workers 0 -1` and `HGETALL {prefix}worker:{id}` instead.
+- **Rolling deploy:** while any master on the previous release still writes the shared `{prefix}metrics` hash, readers also scan the keyspace for worker hashes, so workers of both releases are listed. The scan stops by itself 30 seconds after the last old master stopped (the hash expires).
+- **Redis Cluster users must set `redis.cluster` (`TORQUE_CLUSTER=true`).** Job events now go through one script that touches the event stream and both dashboard indexes. Without the flag on a cluster that script is rejected with CROSSSLOT; the event is then recorded through the cluster path, later events use it directly, and one warning is logged asking for the flag. Nothing is lost, but the first event of each process pays a failed call and the log carries the warning until the flag is set.
+- In cluster mode a job event whose script fails may still leave its uuid in the dashboard indexes; the reader finds no stream for it, drops the index entry and skips the row.
+- **Scripts:** the Redis user already needs `EVAL`/`EVALSHA` for the queue, metrics and housekeeping code, which used scripts before this release; the new scripts add no new permission. Worker heartbeats and job events used plain commands before and now use scripts, so a user restricted to a command list needs `EVAL` and `EVALSHA` among them (already required by the rest of Torque).
+
 ## Unreleased: prune, flush and autoscaler behaviour
 
 No data step and no config change. Three behaviours differ from before, and a script or schedule that relied on the old ones can notice.
