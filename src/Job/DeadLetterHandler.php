@@ -9,7 +9,9 @@ use Illuminate\Container\Container;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Encryption\Encrypter;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Queue\Attributes\ReadsQueueAttributes;
 use Illuminate\Queue\Failed\DatabaseUuidFailedJobProvider;
+use Illuminate\Support\InteractsWithTime;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Worker\WorkerProcess;
@@ -25,6 +27,16 @@ use function Fledge\Async\Redis\createRedisClient;
  */
 final class DeadLetterHandler
 {
+    use InteractsWithTime;
+    use ReadsQueueAttributes;
+
+    /**
+     * Named as a string so the handler loads on illuminate/queue below 13.43.
+     * A property, not a constant: static analysis then sees a plain string
+     * that `class_exists()` narrows, whichever version is installed.
+     */
+    private string $retryForAttribute = 'Illuminate\Queue\Attributes\RetryFor';
+
     private readonly RedisClient $redis;
 
     private readonly string $deadLetterStream;
@@ -258,6 +270,8 @@ final class DeadLetterHandler
                 $payload['retryUntil'] = $retryUntil instanceof \DateTimeInterface
                     ? $retryUntil->getTimestamp()
                     : $retryUntil;
+            } elseif (is_object($instance) && is_int($retryFor = $this->retryForSeconds($instance))) {
+                $payload['retryUntil'] = $this->availableAt($retryFor);
             }
         }
 
@@ -266,6 +280,27 @@ final class DeadLetterHandler
             : (igbinary_serialize($payload) ?? throw new \RuntimeException('igbinary_serialize() failed to encode the job payload.'));
 
         return [$encoded, is_string($payload['uuid'] ?? null) ? $payload['uuid'] : null];
+    }
+
+    /**
+     * The window of a `#[RetryFor]` attribute on the job, in seconds, or null
+     * when the job has none. As stock `queue:retry` reads it, so a retried job
+     * gets a deadline counted from now instead of the stale one it failed with.
+     *
+     * The attribute arrived in illuminate/queue 13.43; on an older install
+     * there is nothing to read.
+     */
+    private function retryForSeconds(object $instance): ?int
+    {
+        $attribute = $this->retryForAttribute;
+
+        if (! class_exists($attribute)) {
+            return null;
+        }
+
+        $seconds = $this->getAttributeValue($instance, $attribute);
+
+        return is_int($seconds) ? $seconds : null;
     }
 
     /**

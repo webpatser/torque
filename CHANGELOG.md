@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-11-19
+
+### Fixed
+- Dead-letter retry: a job that declares its retry window with `#[RetryFor]` (illuminate/queue 13.43) and has no `retryUntil()` method gets a `retryUntil` counted from the retry, as stock `queue:retry` does, instead of keeping the stale deadline it failed with and expiring on its first attempt. On illuminate/queue below 13.43 nothing changes.
+
+### Parity
+- Reviewed Horizon v5.52.0 and the unreleased 5.x branch through 2026-11-19; nothing to port (#1848 dependency floors and the ClearCommand guard in Horizon-only code, #1850 asset build). Framework v13.43.0: RetryFor reaches the worker through the payload via StreamQueue's parent createPayloadArray, the dead letter retry now refreshes it; WorkCommand output change and releaseUsingBackoff() need nothing.
+
 ## [2.3.1] - 2026-11-18
 
 ### Changed
@@ -869,7 +877,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.3.1...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.3.2...HEAD
+[2.3.2]: https://github.com/webpatser/torque/compare/v2.3.1...v2.3.2
 [2.3.1]: https://github.com/webpatser/torque/compare/v2.3.0...v2.3.1
 [2.2.1]: https://github.com/webpatser/torque/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/webpatser/torque/compare/v2.1.0...v2.2.0

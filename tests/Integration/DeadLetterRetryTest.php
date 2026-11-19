@@ -13,6 +13,7 @@ use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Tests\Fixtures\DeadLetterRetryProbeJob;
 use Webpatser\Torque\Tests\Fixtures\EncryptedDeadLetterRetryProbeJob;
 use Webpatser\Torque\Tests\Fixtures\JobLimitsProbeJob;
+use Webpatser\Torque\Tests\Fixtures\RetryForDeadLetterRetryProbeJob;
 
 /*
 |--------------------------------------------------------------------------
@@ -208,6 +209,31 @@ it('runs a job past its retryUntil under strict_attempts after a retry', functio
     dlr_deadLetter($ctx, new DeadLetterRetryProbeJob(until: 1), ['retryUntil' => time() - 60, 'attempts' => 2]);
 
     $ctx['handler']->retry($ctx['handler']->list(1)[0]['id']);
+
+    $run = dlr_run($ctx, ['max_jobs' => 1, 'strict_attempts' => true]);
+
+    expect($run['attempts'])->toBe([1])
+        ->and($run['failed'])->toBe(0)
+        ->and($run['deadLetters'])->toBe(0);
+});
+
+it('refreshes retryUntil from a #[RetryFor] attribute after a retry', function () {
+    if (! class_exists('Illuminate\Queue\Attributes\RetryFor')) {
+        $this->markTestSkipped('#[RetryFor] needs illuminate/queue 13.43 or later.');
+    }
+
+    $ctx = dlr_context();
+    dlr_deadLetter($ctx, new RetryForDeadLetterRetryProbeJob(until: 1), ['retryUntil' => time() - 60, 'attempts' => 2]);
+
+    $before = time();
+    $ctx['handler']->retry($ctx['handler']->list(1)[0]['id']);
+    $after = time();
+
+    $stored = StreamQueue::decodePayload((string) torqueRedis()->execute('XRANGE', $ctx['streamQueue']->getStreamKey(), '-', '+')[0][1][1]);
+
+    expect($stored['retryUntil'])->toBeGreaterThanOrEqual($before + 300)
+        ->and($stored['retryUntil'])->toBeLessThanOrEqual($after + 300)
+        ->and($stored['attempts'])->toBe(0);
 
     $run = dlr_run($ctx, ['max_jobs' => 1, 'strict_attempts' => true]);
 
