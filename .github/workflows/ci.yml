@@ -11,8 +11,16 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    name: PHP 8.5
+    name: PHP 8.6 (${{ matrix.event-loop }})
     timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        event-loop: [poll, select]
+
+    env:
+      FLEDGE_EVENT_LOOP: ${{ matrix.event-loop }}
 
     services:
       redis:
@@ -32,9 +40,10 @@ jobs:
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
-          php-version: '8.5'
+          php-version: '8.6'
           coverage: none
           extensions: igbinary
+          ini-values: zend.assertions=1, assert.exception=1
           tools: composer:v2
 
       - name: Install dependencies

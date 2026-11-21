@@ -95,7 +95,17 @@ it('sniffs the igbinary header without decoding the body', function () {
     $headerOnly = "\x00\x00\x00\x02\x14\xff\xff\xff";
 
     expect(StreamQueue::isValidPayload($headerOnly, 'igbinary'))->toBeTrue();
-});
+})->skip(! extension_loaded('igbinary'), 'ext-igbinary not loaded');
+
+it('treats an igbinary blob as a serializer mismatch, not as valid, while ext-igbinary is missing', function () {
+    // Configured for igbinary on a host without the extension: the blob cannot be
+    // decoded here, so it must take the mismatch path (quarantined, recoverable)
+    // rather than pass the gate and fail in decodePayload().
+    $headerOnly = "\x00\x00\x00\x02\x14\xff\xff\xff";
+
+    expect(StreamQueue::isValidPayload($headerOnly, 'igbinary'))->toBeFalse()
+        ->and(StreamQueue::isSerializerMismatch($headerOnly, 'igbinary'))->toBeTrue();
+})->skip(extension_loaded('igbinary'), 'ext-igbinary is loaded');
 
 it('rejects an igbinary object header without decoding', function () {
     $objectBlob = igbinary_serialize(new ArrayObject(['a' => 1]));

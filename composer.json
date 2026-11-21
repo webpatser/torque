@@ -1,11 +1,11 @@
 {
     "name": "webpatser/torque",
-    "description": "Coroutine-based queue worker for Laravel — N jobs per process via PHP Fibers and Redis Streams",
+    "description": "Coroutine-based queue worker for Laravel: N jobs per process via PHP Fibers and Redis Streams, PHP 8.6 only",
     "keywords": ["laravel", "queue", "fibers", "coroutines", "redis-streams", "async", "fledge"],
     "license": "MIT",
     "type": "library",
     "require": {
-        "php": "^8.5",
+        "php": "^8.6",
         "illuminate/queue": "^13.34",
         "illuminate/console": "^13.34",
         "illuminate/support": "^13.34",
@@ -24,7 +24,7 @@
         "larastan/larastan": "^3.10",
         "laravel/pint": "^1.29",
         "orchestra/testbench": "^11.0",
-        "pestphp/pest": "^4.0"
+        "pestphp/pest": "^5.0"
     },
     "autoload": {
         "psr-4": {
@@ -44,7 +44,7 @@
         }
     },
     "scripts": {
-        "test": "pest",
+        "test": "php -d zend.assertions=1 -d assert.exception=1 vendor/bin/pest",
         "analyse": "phpstan analyse --memory-limit=1G"
     },
     "config": {

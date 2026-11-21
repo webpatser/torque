@@ -2,7 +2,7 @@
 
 **The queue that keeps spinning.** Coroutine-based queue worker for Laravel.
 
-Torque replaces Horizon's 1-job-per-process model with N-jobs-per-process using PHP 8.5 Fibers. When a job waits on I/O, the scheduler switches to another job, so a handful of processes deliver the throughput Horizon needs dozens of processes for.
+Torque replaces Horizon's 1-job-per-process model with N-jobs-per-process using PHP 8.6 Fibers. When a job waits on I/O, the scheduler switches to another job, so a handful of processes deliver the throughput Horizon needs dozens of processes for.
 
 ```text
 2 workers x 50 coroutines = 100 concurrent jobs in ~120 MB RAM
@@ -36,10 +36,14 @@ equivalent Horizon throughput on async I/O ≈ 30 processes (~2.5 GB)
 
 ## Requirements
 
-- PHP 8.5+
-- Laravel 12+
+- PHP 8.6
+- Laravel 13
 - Redis 7+ or Valkey (Redis Streams support)
 - [Revolt](https://revolt.run) event loop (installed automatically)
+
+### PHP version policy
+
+This package supports only the latest stable PHP release. When a new PHP version is released, the next release of this package requires it and support for the previous PHP version ends. Currently: PHP 8.6.
 
 ## Installation
 
@@ -689,7 +693,7 @@ php artisan torque:supervisor --workers=4 --user=forge
 
 Options:
 
-- `--php`: the PHP binary written into the config (default `PHP_BINARY`). `PHP_BINARY` is the fully resolved binary (for example a Homebrew Cellar patch-level path) and can go stale after an upgrade, so in production pass a stable path such as `--php=/usr/bin/php8.5`.
+- `--php`: the PHP binary written into the config (default `PHP_BINARY`). `PHP_BINARY` is the fully resolved binary (for example a Homebrew Cellar patch-level path) and can go stale after an upgrade, so in production pass a stable path such as `--php=/usr/bin/php8.6`.
 - `--app-path`: override the application path written into the config; it must be absolute. When `base_path()` is a Deployer release (`releases/N`), the sibling `current` symlink is detected and used automatically, so the config survives new releases.
 - `--stdout`: print the config instead of writing a file, for example `php artisan torque:supervisor --stdout | sudo tee /etc/supervisor/conf.d/torque.conf`. `--path` is ignored with `--stdout` (a warning goes to stderr).
 
@@ -832,11 +836,11 @@ Torque can encode its Redis Streams envelope with [igbinary](https://github.com/
 
 ```bash
 pecl install igbinary
-echo "extension=igbinary" | sudo tee -a /etc/php/8.5/cli/php.ini
-echo "extension=igbinary" | sudo tee -a /etc/php/8.5/fpm/php.ini
+echo "extension=igbinary" | sudo tee -a /etc/php/8.6/cli/php.ini
+echo "extension=igbinary" | sudo tee -a /etc/php/8.6/fpm/php.ini
 ```
 
-Or via your distro: `apt install php8.5-igbinary` on Debian/Ubuntu, `brew install php@8.5-igbinary` style packages on macOS.
+Or via your distro: `apt install php8.6-igbinary` on Debian/Ubuntu, `brew install php@8.6-igbinary` style packages on macOS.
 
 **Enable** in your `.env`:
 
