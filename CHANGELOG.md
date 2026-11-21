@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-21
+
+### Breaking Changes
+- PHP requirement raised to `^8.6`; PHP 8.5 is no longer supported.
+- The event loop is `webpatser/fledge-loop` (`Fledge\Loop`) instead of `revolt/event-loop` (`Revolt\EventLoop`), which Torque no longer requires and which cannot be installed next to it. Code of your own that calls `Revolt\EventLoop` (job classes, listeners, service providers) has to move to `Fledge\Loop`: same static methods, no alias layer. Drain queues whose serialized payloads reference Revolt classes before deploying.
+- Requires `webpatser/fledge-fiber` `^13.43.0.3`, the first release on fledge-loop.
+
+### Added
+- `event_loop` config key (`FLEDGE_EVENT_LOOP`): `auto` (default: `poll`, PHP 8.6 `Io\Poll` on kqueue or epoll, where available, otherwise `select`), `poll` or `select` (the rollback). `torque:start` installs it for the master and refuses a value the workers could not start on, instead of leaving a fleet that dies and respawns; every worker installs it during its own setup. Both log `Event loop: <driver>`.
+- An integration test that runs a real fleet through `torque:start` and `torque:worker` on each driver: two workers process jobs, a SIGTERM to the master drains them gracefully within the drain grace, and no process is left behind.
+
+### Changed
+- Upgrade path versus non-release installs: a Composer path repository (which reports whatever version it guessed or was given, often `1.0.0`), Torque as the root package, a branch and `1.0.0+no-version-set` now count as a dev install. A dev install runs the upgrade steps, records nothing in `{prefix}version` and says so once per start; it used to store its version, so a path install recorded `1.0.0` and every later start refused with "last upgraded by 1.0.0, below 1.4.0". The gate for a stored release below 1.4.0 is unchanged. A key that already holds such a `1.0.0` keeps refusing until it is set to a real release (`SET {prefix}version 1.4.0`, as the refusal says).
+- The long-wait alert steps, which run in forks of the alert process, start on a fresh event loop of their own (`Fledge\Loop::afterFork()`), so a listener or notification channel that awaits (a Fledge Redis, cache or HTTP client) works there instead of running into the parent's loop.
+- `clamp()` and first-class callables in a few places where they are equivalent (respawn backoff, the stall watchdog's clock-jump threshold, the slot retry backoff, the dashboard gauge, `Narrow::string(...)` in `array_map`).
+- CI runs on PHP 8.6 with assertions enabled (`zend.assertions=1`, `assert.exception=1`), once per loop driver (`poll`, `select`); `composer test` enables them too.
+- Dev dependency `pestphp/pest` raised to `^5.0` (Pest 4 does not install on PHP 8.6).
+
+### Fixed
+- `StreamQueueSerializerTest`: the igbinary header sniff test expects a valid payload only when ext-igbinary is loaded; without it the blob is a serializer mismatch (quarantined, recoverable), which `StreamQueue::isValidPayload()` already did correctly and a new test pins.
+
+### Notes
+- Workers are started with `pcntl_fork()` followed at once by `pcntl_exec()` of `artisan torque:worker`, from the master's `{main}`, so a worker inherits no loop state and uses `Fledge\Loop::install()`, never `afterFork()`.
+- Fledge's async layer started as a port of amphp and its event loop as a port of Revolt, both MIT licensed; Fledge goes its own way and does not track either project. The README says so where it lists the dependencies.
+
 ## [2.3.2] - 2026-11-19
 
 ### Fixed
