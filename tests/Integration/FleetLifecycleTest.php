@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Fledge\Loop\Driver\PollDriver;
 use Illuminate\Filesystem\Filesystem;
+use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Tests\Fixtures\LoopStallProbeJob;
 
@@ -21,7 +22,19 @@ use Webpatser\Torque\Tests\Fixtures\LoopStallProbeJob;
 | The fixture leads its own process group, so afterEach takes everything down
 | with one kill whatever state a failed test left behind.
 |
-| Requires a running Redis instance.
+| Requires a running Redis instance, and `ps` and `pgrep` (torque:start uses
+| them to identify processes); the tests skip without them. Slim Linux images
+| lack both: in fledge-fiber's php86 image, for example, run
+|
+|   docker run --rm --network fledge-fiber_default \
+|     -v "$PWD/..:/src" -w /src/torque -e TORQUE_TEST_REDIS_URI=redis://<redis>:6379/15 \
+|     fledge-fiber-php86 sh -c 'apt-get update -qq && apt-get install -y -qq procps \
+|     && php -d zend.assertions=1 -d assert.exception=1 vendor/bin/pest tests/Integration/FleetLifecycleTest.php'
+|
+| (the parent directory is mounted because vendor/ may symlink to siblings).
+|
+| The processes start without FLEDGE_EVENT_LOOP in their environment, unless a
+| test sets it: it would take precedence over the configured driver.
 |
 */
 
@@ -77,8 +90,8 @@ beforeEach(function () {
         }
     };
 
-    $this->start = function (string $driver): int {
-        file_put_contents($this->dir.'/config.json', json_encode([
+    $this->configure = function (string $driver, array $settings = []): void {
+        file_put_contents($this->dir.'/config.json', json_encode(array_replace_recursive([
             'redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix, 'cluster' => false],
             'consumer_group' => TORQUE_FLEET_GROUP,
             'serializer' => 'json',
@@ -93,14 +106,26 @@ beforeEach(function () {
             'drain_grace_seconds' => TORQUE_FLEET_DRAIN_GRACE,
             'metrics' => ['enabled' => false],
             'autoscale' => ['enabled' => false],
-        ], JSON_THROW_ON_ERROR));
+        ], $settings), JSON_THROW_ON_ERROR));
+    };
+
+    $this->start = function (string $driver, ?string $environment = null, array $settings = []): int {
+        ($this->configure)($driver, $settings);
 
         $log = $this->dir.'/output.log';
+        $env = getenv();
+        unset($env['FLEDGE_EVENT_LOOP']);
+
+        if ($environment !== null) {
+            $env['FLEDGE_EVENT_LOOP'] = $environment;
+        }
 
         $this->master = proc_open(
             [PHP_BINARY, dirname(__DIR__).'/Fixtures/fleet-app.php', $this->dir],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', $log, 'a'], 2 => ['file', $log, 'a']],
             $pipes,
+            null,
+            $env,
         );
 
         if (! is_resource($this->master)) {
@@ -109,6 +134,13 @@ beforeEach(function () {
 
         return proc_get_status($this->master)['pid'];
     };
+
+    // Last, so afterEach finds everything it cleans up.
+    foreach (['ps', 'pgrep'] as $tool) {
+        if (trim((string) shell_exec('command -v '.$tool.' 2>/dev/null')) === '') {
+            $this->markTestSkipped("Needs `{$tool}` (Debian and Ubuntu images: apt-get install procps).");
+        }
+    }
 });
 
 afterEach(function () {
@@ -184,3 +216,87 @@ it('runs a fleet on the configured loop driver and drains it on SIGTERM', functi
         ->not->toContain('Uncaught in event loop')
         ->not->toContain('Event loop crashed');
 })->with(['poll', 'select']);
+
+it('lets FLEDGE_EVENT_LOOP in the process environment win over the configured driver', function () {
+    // As after `config:cache` with an older value: the environment is the rollback switch.
+    $masterPid = ($this->start)('uv', 'select');
+
+    ($this->waitFor)('two workers on the loop', fn (): bool => count(($this->workers)()) === 2
+        && substr_count(($this->output)(), '[torque:worker] Event loop: select (from FLEDGE_EVENT_LOOP from the process environment)') === 2);
+
+    expect(($this->output)())->toContain('Event loop: select (from FLEDGE_EVENT_LOOP from the process environment)')
+        ->not->toContain('Unusable event loop driver');
+
+    posix_kill($masterPid, SIGTERM);
+
+    ($this->waitFor)('the master to exit', fn (): bool => ! proc_get_status($this->master)['running'], TORQUE_FLEET_DRAIN_GRACE + 10);
+
+    expect(proc_get_status($this->master)['exitcode'])->toBe(0);
+});
+
+it('has a worker drain on SIGTERM as soon as it shows up as ready for a takeover', function () {
+    $masterPid = ($this->start)('select', settings: ['metrics' => ['enabled' => true, 'publish_interval' => 0.05]]);
+    $publisher = new MetricsPublisher(redisUri: torqueRedisUri(), prefix: $this->prefix);
+    $ready = null;
+
+    // What waitForOwnFleetReady() reads: the first worker hash of one of its PIDs.
+    ($this->waitFor)('a worker metrics hash', function () use ($publisher, &$ready): bool {
+        foreach ($publisher->getAllWorkerMetrics() as $data) {
+            $pid = (int) ($data['pid'] ?? 0);
+
+            if (in_array($pid, ($this->workers)(), true)) {
+                $ready = $pid;
+
+                return true;
+            }
+        }
+
+        return false;
+    }, 15.0);
+
+    posix_kill($ready, SIGTERM);
+
+    ($this->waitFor)('the worker to end', fn (): bool => str_contains(($this->output)(), "Worker PID {$ready} "));
+
+    expect(($this->output)())->toContain("Worker PID {$ready} exited (code 0)")
+        ->not->toContain("Worker PID {$ready} killed by signal");
+
+    posix_kill($masterPid, SIGTERM);
+    ($this->waitFor)('the master to exit', fn (): bool => ! proc_get_status($this->master)['running'], TORQUE_FLEET_DRAIN_GRACE + 10);
+});
+
+it('respawns workers that cannot start on a backoff and says why', function () {
+    $masterPid = ($this->start)('select');
+
+    ($this->waitFor)('two workers on the loop', fn (): bool => count(($this->workers)()) === 2
+        && substr_count(($this->output)(), 'Starting 4 reader Fibers') === 2);
+
+    // As an edit of .env while the fleet runs: the next workers boot on a value
+    // torque:start never saw.
+    ($this->configure)('uv');
+
+    foreach (($this->workers)() as $worker) {
+        posix_kill($worker, SIGTERM);
+    }
+
+    ($this->waitFor)('the error after repeated fast deaths', fn (): bool => str_contains(($this->output)(), 'workers in a row died within'), 20.0);
+
+    usleep(1_000_000);
+    $output = ($this->output)();
+
+    // Two at the start, two orderly replacements, and two retries after 1 and 2
+    // seconds: the third death is the error, the fourth waits 8 seconds.
+    expect(count(($this->workers)()))->toBeLessThanOrEqual(6)
+        ->and($output)->toContain('[torque:worker] FATAL Unusable event loop driver from torque.event_loop')
+        ->toContain('expected one of: auto, poll, select')
+        ->toContain('exited (code 78)')
+        ->toContain('respawning in 1s')
+        ->toContain('respawning in 2s')
+        ->toContain('refused a setting at boot')
+        ->and(substr_count($output, 'workers in a row died within'))->toBe(1);
+
+    posix_kill($masterPid, SIGTERM);
+    ($this->waitFor)('the master to exit', fn (): bool => ! proc_get_status($this->master)['running'], TORQUE_FLEET_DRAIN_GRACE + 10);
+
+    expect(proc_get_status($this->master)['exitcode'])->toBe(0);
+});

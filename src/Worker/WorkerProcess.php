@@ -622,8 +622,12 @@ LUA;
         Loop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
 
         // The loop hands these to the kernel at its next tick, not in onSignal().
+        // Until then SIGTERM still has its default action and kills the worker.
         // No slot claims a job before that tick: each reader Fiber starts with its
-        // stagger delay(), which only resumes after a tick has activated them.
+        // stagger delay(), which only resumes after a tick has activated them. And
+        // nothing advertises this worker as ready before it either: the readiness
+        // signal a takeover waits for is the worker metrics hash, which only the
+        // metrics timer below writes, from inside the loop.
 
         $masterPidForPause = posix_getppid();
         $pauseFetchFailed = false;
@@ -744,6 +748,8 @@ LUA;
         // Blocked-loop heartbeat for the master's watchdog. A timer on purpose: it
         // stops exactly when the loop does. The first beat comes before any slot
         // can claim a job, so a job blocking the very first tick is still seen.
+        // That first beat precedes the tick that installs the signal handlers, so
+        // it must never serve as a readiness signal; nothing reads it as one.
         if (MasterProcess::loopStallKillSeconds($this->config) > 0) {
             $heartbeatFile = MasterProcess::heartbeatPath((int) getmypid());
 
@@ -1302,6 +1308,13 @@ LUA;
         // "0 workers" before the exit. An idle worker now exits within a tick, so
         // this normally publishes once more; it still matters for a worker held
         // open by an in-flight job for the full grace.
+        //
+        // The first publish is also the readiness signal: the takeover handshake
+        // (MasterProcess::waitForOwnFleetReady()) stops the old fleet once a new
+        // worker's hash exists. A timer callback runs only after the loop's first
+        // tick activated it, and that same activation installed the SIGTERM and
+        // SIGINT handlers above, so a worker seen as ready drains on SIGTERM
+        // instead of dying of it. Keep the first publish inside the loop.
         $metricsInterval = Narrow::float($metricsConfig['publish_interval'] ?? null, 1.0);
         Loop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
             $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
