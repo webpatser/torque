@@ -58,3 +58,34 @@ it('keeps a loop that already has callbacks, and warns only when it is not the c
         Loop::cancel($callback);
     }
 });
+
+it('lets the process environment win over the configured name', function () {
+    expect(EventLoopDriver::configured(['event_loop' => 'poll'], 'select'))->toBe('select')
+        ->and(EventLoopDriver::configured(['event_loop' => 'select'], null))->toBe('select')
+        // A stale cached value the environment rescues, and a bad environment that is not rescued.
+        ->and(EventLoopDriver::resolve(['event_loop' => 'uv'], 'select'))->toBe('select')
+        ->and(fn () => EventLoopDriver::resolve(['event_loop' => 'select'], 'uv'))
+        ->toThrow(InvalidArgumentException::class, 'expected one of: auto, poll, select');
+});
+
+it('names the setting that decided', function () {
+    expect(EventLoopDriver::source('select'))->toBe('FLEDGE_EVENT_LOOP from the process environment')
+        ->and(EventLoopDriver::source(null))->toBe('torque.event_loop');
+});
+
+it('reads FLEDGE_EVENT_LOOP from the process environment, null when unset or empty', function () {
+    $original = getenv('FLEDGE_EVENT_LOOP');
+
+    try {
+        putenv('FLEDGE_EVENT_LOOP= select ');
+        expect(EventLoopDriver::environment())->toBe('select');
+
+        putenv('FLEDGE_EVENT_LOOP=');
+        expect(EventLoopDriver::environment())->toBeNull();
+
+        putenv('FLEDGE_EVENT_LOOP');
+        expect(EventLoopDriver::environment())->toBeNull();
+    } finally {
+        putenv($original === false ? 'FLEDGE_EVENT_LOOP' : "FLEDGE_EVENT_LOOP={$original}");
+    }
+});

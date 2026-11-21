@@ -31,12 +31,35 @@ it('rejects queue names with special characters', function () {
         ->expectsOutputToContain('Invalid queue name');
 });
 
+/**
+ * Run with FLEDGE_EVENT_LOOP set to this value in the process environment, or unset for null.
+ */
+function torque_with_event_loop_env(?string $value, Closure $test): void
+{
+    $original = getenv('FLEDGE_EVENT_LOOP');
+    putenv($value === null ? 'FLEDGE_EVENT_LOOP' : "FLEDGE_EVENT_LOOP={$value}");
+
+    try {
+        $test();
+    } finally {
+        putenv($original === false ? 'FLEDGE_EVENT_LOOP' : "FLEDGE_EVENT_LOOP={$original}");
+    }
+}
+
 it('refuses an event loop driver the workers could not start on', function () {
     config(['torque.event_loop' => 'uv']);
 
-    $this->artisan('torque:start', ['--queues' => 'default'])
+    torque_with_event_loop_env(null, fn () => $this->artisan('torque:start', ['--queues' => 'default'])
         ->assertFailed()
-        ->expectsOutputToContain('Unusable event loop driver');
+        ->expectsOutputToContain('Unusable event loop driver from torque.event_loop'));
+});
+
+it('judges FLEDGE_EVENT_LOOP from the process environment over the configured driver', function () {
+    config(['torque.event_loop' => 'select']);
+
+    torque_with_event_loop_env('uv', fn () => $this->artisan('torque:start', ['--queues' => 'default'])
+        ->assertFailed()
+        ->expectsOutputToContain('Unusable event loop driver from FLEDGE_EVENT_LOOP from the process environment'));
 });
 
 /*

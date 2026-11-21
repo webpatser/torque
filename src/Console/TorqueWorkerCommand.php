@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
+use Fledge\Loop\UnsupportedFeatureException;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\Narrow;
@@ -21,6 +22,9 @@ use Webpatser\Torque\Worker\WorkerProcess;
  */
 final class TorqueWorkerCommand extends Command
 {
+    /** Exit status for a setting the worker cannot start on (sysexits EX_CONFIG). */
+    public const int EXIT_CONFIG = 78;
+
     protected $signature = 'torque:worker
         {--queues=default : Comma-separated queue names}
         {--concurrency=50 : Coroutine slots}';
@@ -41,13 +45,25 @@ final class TorqueWorkerCommand extends Command
         });
 
         $config = Narrow::map(config('torque'));
+        $environment = EventLoopDriver::environment();
+        $source = EventLoopDriver::source($environment);
 
         // Before anything runs on the loop. This process was exec'd by the master,
-        // so it inherited no loop state: install(), never afterFork().
-        $driver = EventLoopDriver::install($config, static function (string $warning): void {
-            fwrite(STDERR, "[torque:worker] WARN {$warning}\n");
-        });
-        fwrite(STDERR, "[torque:worker] Event loop: {$driver}\n");
+        // so it inherited no loop state: install(), never afterFork(). torque:start
+        // checked the same setting, but .env can change while the fleet runs: the
+        // reason goes to stderr, which the master shares, and the status tells the
+        // master's respawn backoff that this was a configuration refusal.
+        try {
+            $driver = EventLoopDriver::install($config, static function (string $warning): void {
+                fwrite(STDERR, "[torque:worker] WARN {$warning}\n");
+            }, $environment);
+        } catch (\InvalidArgumentException|UnsupportedFeatureException $e) {
+            fwrite(STDERR, "[torque:worker] FATAL Unusable event loop driver from {$source}: {$e->getMessage()}\n");
+
+            return self::EXIT_CONFIG;
+        }
+
+        fwrite(STDERR, "[torque:worker] Event loop: {$driver} (from {$source})\n");
 
         if ($this->option('queues') !== null) {
             $config['queues'] = array_map('trim', explode(',', $this->option('queues')));

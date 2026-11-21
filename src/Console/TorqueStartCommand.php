@@ -176,15 +176,20 @@ final class TorqueStartCommand extends Command
         // The master's own loop (its Redis reads run on it), and the check that the
         // workers can start: they install the same driver, and an unusable value
         // would otherwise only show as a fleet that dies and respawns forever.
+        // FLEDGE_EVENT_LOOP in the real process environment wins over a cached
+        // torque.event_loop, so the rollback works without a config rebuild.
+        $environment = EventLoopDriver::environment();
+        $source = EventLoopDriver::source($environment);
+
         try {
-            $driver = EventLoopDriver::install($config, fn (string $warning) => $this->components->warn($warning));
+            $driver = EventLoopDriver::install($config, fn (string $warning) => $this->components->warn($warning), $environment);
         } catch (\InvalidArgumentException|UnsupportedFeatureException $e) {
-            $this->components->error('Unusable event loop driver (torque.event_loop, FLEDGE_EVENT_LOOP): '.$e->getMessage());
+            $this->components->error("Unusable event loop driver from {$source}: ".$e->getMessage());
 
             return self::FAILURE;
         }
 
-        $this->components->info("Event loop: {$driver}");
+        $this->components->info("Event loop: {$driver} (from {$source})");
 
         if ($takeoverPid !== null) {
             $this->components->info("Takeover: replacing master PID {$takeoverPid} once this fleet is ready.");

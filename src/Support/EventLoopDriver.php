@@ -12,7 +12,7 @@ use Fledge\Loop\DriverFactory;
 use Fledge\Loop\UnsupportedFeatureException;
 
 /**
- * Picks the event loop driver a Torque process runs on, from `torque.event_loop`.
+ * Picks the event loop driver a Torque process runs on.
  *
  * The master and every worker are processes of their own: the master forks and
  * immediately execs `artisan torque:worker`, so a worker starts on a fresh PHP
@@ -21,34 +21,68 @@ use Fledge\Loop\UnsupportedFeatureException;
  * `Loop::afterFork()`, which is only for a child that keeps running the parent's
  * code (the long-wait alert steps do that, see TorqueLongWaitAlertCommand).
  *
- * The key reads `FLEDGE_EVENT_LOOP` (`auto`, `poll` or `select`), so a cached
- * config keeps the choice, and one variable steers Torque and the rest of Fledge.
+ * The environment variable, when set in the process environment, takes
+ * precedence over the cached configuration. `FLEDGE_EVENT_LOOP` (`auto`, `poll`
+ * or `select`) is the rollback switch an operator reaches for during an
+ * incident, so it must work without a config rebuild: a non-empty value from
+ * `getenv()` wins over `torque.event_loop`, which itself reads the same variable
+ * and only differs once `config:cache` has frozen an older value. The callers in
+ * production pass {@see environment()}; the methods default to the config alone.
  */
 final class EventLoopDriver
 {
+    /** The variable the rest of Fledge reads too. */
+    public const string ENV = DriverFactory::ENV;
+
+    /** `FLEDGE_EVENT_LOOP` from this process's environment, null when unset or empty. */
+    public static function environment(): ?string
+    {
+        $value = getenv(self::ENV);
+
+        return is_string($value) && trim($value) !== '' ? trim($value) : null;
+    }
+
     /**
      * The configured name, `auto` when unset or empty.
      *
      * @param  array<array-key, mixed>  $config  The `torque` config.
+     * @param  string|null  $environment  {@see environment()}: wins when not null.
      */
-    public static function configured(array $config): string
+    public static function configured(array $config, ?string $environment = null): string
     {
+        if ($environment !== null) {
+            return $environment;
+        }
+
         $name = trim(Narrow::string($config['event_loop'] ?? null, 'auto'));
 
         return $name === '' ? 'auto' : $name;
     }
 
     /**
+     * Which setting decided, for the log line that names it.
+     *
+     * @param  string|null  $environment  {@see environment()}.
+     */
+    public static function source(?string $environment): string
+    {
+        return $environment !== null
+            ? self::ENV.' from the process environment'
+            : 'torque.event_loop';
+    }
+
+    /**
      * The driver the configured name resolves to here: `poll` or `select`.
      *
      * @param  array<array-key, mixed>  $config  The `torque` config.
+     * @param  string|null  $environment  {@see environment()}: wins when not null.
      *
      * @throws \InvalidArgumentException For a name other than auto, poll or select.
      * @throws UnsupportedFeatureException For `poll` where neither kqueue nor epoll exists.
      */
-    public static function resolve(array $config): string
+    public static function resolve(array $config, ?string $environment = null): string
     {
-        return DriverFactory::resolve(self::configured($config));
+        return DriverFactory::resolve(self::configured($config, $environment));
     }
 
     /**
@@ -61,14 +95,15 @@ final class EventLoopDriver
      *
      * @param  array<array-key, mixed>  $config  The `torque` config.
      * @param  \Closure(string): void  $warn
+     * @param  string|null  $environment  {@see environment()}: wins when not null.
      * @return string The driver the loop runs on: `poll`, `select`, or a class name.
      *
      * @throws \InvalidArgumentException For a name other than auto, poll or select.
      * @throws UnsupportedFeatureException For `poll` where neither kqueue nor epoll exists.
      */
-    public static function install(array $config, \Closure $warn): string
+    public static function install(array $config, \Closure $warn, ?string $environment = null): string
     {
-        $resolved = self::resolve($config);
+        $resolved = self::resolve($config, $environment);
 
         try {
             Loop::install($resolved);
