@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Fledge\Fiber\Redis\FledgeRedisConnection;
+use Fledge\Fiber\Redis\FledgeRedisConnector;
 use Fledge\Loop;
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Handler\MockHandler;
@@ -13,6 +15,7 @@ use Illuminate\Notifications\Channels\SlackWebhookChannel;
 use Illuminate\Notifications\Slack\SlackMessage;
 use Illuminate\Notifications\SlackNotificationRouterChannel;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Http;
@@ -601,6 +604,43 @@ it('starts each step on a fresh event loop of its own, so a listener can await',
 
     expect(torque_lw_alert_command())->toBe(0)
         ->and(($this->sent)())->toBe(['event '.EventLoopDriver::nameOf(Loop::getDriver())]);
+});
+
+it('gives a step its own Redis and cache connections when the app opened them before the fork', function () {
+    // A Fledge Redis client behind a Redis cache store, used here before the
+    // command forks, as a service provider reading the cache at boot would.
+    $uri = parse_url(torqueRedisUri());
+
+    config([
+        'database.redis.client' => 'fledge',
+        'database.redis.torque_lw' => [
+            'host' => $uri['host'] ?? '127.0.0.1',
+            'port' => $uri['port'] ?? 6379,
+            'database' => (int) ltrim($uri['path'] ?? '/0', '/'),
+        ],
+        'cache.stores.torque_lw' => ['driver' => 'redis', 'connection' => 'torque_lw', 'prefix' => $this->prefix],
+    ]);
+    app()->forgetInstance('redis');
+    // Not static: the manager binds the creator to itself.
+    app('redis')->extend('fledge', fn (): FledgeRedisConnector => new FledgeRedisConnector);
+
+    $store = Cache::store('torque_lw');
+    $store->put('parent', 'p', 60);
+
+    expect(app('redis')->connection('torque_lw'))->toBeInstanceOf(FledgeRedisConnection::class);
+
+    Event::listen(LongWaitDetected::class, function (): void {
+        $cache = Cache::store('torque_lw');
+        $cache->put('child', 'c', 60);
+        file_put_contents($this->runDir.'/sent.log', 'event '.$cache->get('parent')."\n", FILE_APPEND);
+    });
+
+    expect(torque_lw_alert_command(['--limit' => 6]))->toBe(0)
+        ->and(Artisan::output())->not->toContain('timed out')
+        ->and(($this->sent)())->toBe(['event p'])
+        // The fork left this process's connection alone: it still answers, and sees the step's write.
+        ->and($store->get('child'))->toBe('c')
+        ->and($store->get('parent'))->toBe('p');
 });
 
 it('skips Slack with a log line when the channel package is not installed', function () {

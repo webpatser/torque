@@ -41,6 +41,14 @@ final class TorqueLongWaitAlertCommand extends Command
     /** Goes before the exception message, so no message can read as {@see STEP_OK}. */
     private const string STEP_FAILED = 'failed:';
 
+    /**
+     * What a step's fork took over from this process and must never close: kept
+     * referenced until the fork's SIGKILL, so no destructor runs.
+     *
+     * @var list<mixed>
+     */
+    private static array $inherited = [];
+
     /** @var string */
     protected $signature = 'torque:long-wait-alert
         {queue : The queue over its threshold}
@@ -165,11 +173,15 @@ final class TorqueLongWaitAlertCommand extends Command
         }
 
         if ($pid === 0) {
-            posix_setpgid(0, 0);
-            fclose($reader);
-
+            // Everything in here ends in the SIGKILL below, whatever throws.
             try {
+                // The fresh loop first, before anything else in the child (the rule
+                // of Loop::afterFork()), then the connections that needed the old one.
                 self::startFreshLoop();
+                self::forgetInheritedConnections();
+                posix_setpgid(0, 0);
+                fclose($reader);
+
                 $step();
                 $result = self::STEP_OK;
             } catch (Throwable $e) {
@@ -216,10 +228,55 @@ final class TorqueLongWaitAlertCommand extends Command
     private static function startFreshLoop(): void
     {
         try {
-            Loop::afterFork(EventLoopDriver::configured(Narrow::map(config('torque'))));
+            Loop::afterFork(EventLoopDriver::configured(Narrow::map(config('torque')), EventLoopDriver::environment()));
         } catch (\RuntimeException) {
             // Fibers of this process threw while unwinding in the fork. That is this
             // process's abandoned work, not the step's, and the fresh loop is in place.
+        }
+    }
+
+    /**
+     * Make the step's fork open its own Redis, database and cache connections.
+     *
+     * Booting the app (a service provider, a cache read) can have opened them in
+     * this process already. In the fork such an object is a copy: its socket is
+     * shared with this process, and a Fledge client's reads ran on loop callbacks
+     * that {@see startFreshLoop()} just dropped, so a command on it is never
+     * answered and the step hangs until it is killed. Laravel's own answer to a
+     * lost connection, purge() and reconnect(), does not fit here: purge()
+     * disconnects first, which sends QUIT (Redis) or COM_QUIT (MySQL) on the
+     * socket this process still uses.
+     *
+     * So the managers forget them without closing anything. The objects are kept
+     * referenced, so no destructor runs either; the fork ends with SIGKILL. The
+     * next use resolves a fresh connection from the same configuration.
+     */
+    private static function forgetInheritedConnections(): void
+    {
+        $app = app();
+
+        foreach (['redis' => 'connections', 'db' => 'connections', 'cache' => 'stores'] as $abstract => $property) {
+            if (! $app->resolved($abstract)) {
+                continue;
+            }
+
+            $manager = $app->make($abstract);
+
+            if (! property_exists($manager, $property)) {
+                continue;
+            }
+
+            $held = new \ReflectionProperty($manager, $property);
+            self::$inherited = [...self::$inherited, $held->getValue($manager)];
+            $held->setValue($manager, []);
+        }
+
+        // Shared bindings that hold a resolved store or connection themselves.
+        foreach (['cache.store', 'redis.connection', 'db.connection'] as $abstract) {
+            if ($app->resolved($abstract) && $app->isShared($abstract)) {
+                self::$inherited = [...self::$inherited, $app->make($abstract)];
+                $app->forgetInstance($abstract);
+            }
         }
     }
 
