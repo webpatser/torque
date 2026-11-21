@@ -382,7 +382,13 @@ describe('release limit', function () {
     $past = fn (): array => ['attempts' => 2, 'torque_releases' => 2, 'torque_release_deadline' => time() - 10];
 
     it('dead-letters a real release() loop once its limit has passed', function () {
-        $run = torque_run_limits_worker(new JobLimitsProbeJob('release'), ['max_retries' => 3], maxJobs: 100000, options: ['release_limit_seconds' => 1, 'lifetime' => 3]);
+        // The deadline and the worker lifetime are both whole seconds: a release
+        // limit of 1 second fails a pickup after 1 to 2 seconds, and a lifetime of
+        // 3 stopped the worker after 2 to 3. When both fell on the same second the
+        // worker could stop first, leaving the job in the stream for the next
+        // worker to dead-letter. So the worker runs until the failure instead, with
+        // the lifetime only as a backstop inside the 30 second harness deadline.
+        $run = torque_run_limits_worker(new JobLimitsProbeJob('release'), ['max_retries' => 3], maxJobs: 100000, options: ['release_limit_seconds' => 1, 'lifetime' => 20, 'stop_on_failure' => true]);
 
         expect(count($run['attempts']))->toBeGreaterThan(1)
             ->and($run['failed'])->toBe([MaxAttemptsExceededException::class])

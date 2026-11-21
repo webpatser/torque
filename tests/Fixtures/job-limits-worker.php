@@ -5,7 +5,8 @@ declare(strict_types=1);
 /*
  * Runs a real WorkerProcess, appending one JSON line per observation to a log
  * file. Started by tests/Integration/JobLimitsTest.php; exits by itself once max
- * jobs or its lifetime is hit.
+ * jobs or its lifetime is hit, or after the first failed job with
+ * `stop_on_failure`.
  *
  * Arguments: redis uri, key prefix, consumer group, queue, log file, and a JSON
  * object with the stream config and worker options under test.
@@ -52,8 +53,16 @@ $log = static function (array $row) use ($logFile): void {
 
 $app->make(ExceptionHandler::class)->reportable(static fn (Throwable $e): bool => false);
 
-Event::listen(JobFailed::class, static function (JobFailed $event) use ($log): void {
+$stopOnFailure = (bool) ($settings['stop_on_failure'] ?? false);
+
+Event::listen(JobFailed::class, static function (JobFailed $event) use ($log, $stopOnFailure): void {
     $log(['type' => 'failed', 'exception' => $event->exception::class]);
+
+    if ($stopOnFailure) {
+        // A test waiting for this failure ends here, through the worker's own
+        // SIGTERM handling, instead of at a lifetime it would have to race.
+        posix_kill((int) getmypid(), SIGTERM);
+    }
 });
 
 $delayedKey = $prefix.$queue.':delayed';
