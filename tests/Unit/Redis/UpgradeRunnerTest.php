@@ -112,12 +112,44 @@ it('leaves a newer stored version alone and says so', function () {
         ->and($this->logged[0])->toContain('newer than the installed 2.0.0');
 });
 
-it('always runs on a dev install and stores dev', function () {
+it('always runs on a dev install and records nothing, saying so once a start', function () {
     ($this->runner)('dev')->run();
     ($this->runner)('dev')->run();
 
     expect($this->ran)->toBe(['2.0.0', '2.0.0'])
-        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('dev');
+        ->and($this->redis->execute('GET', $this->versionKey))->toBeNull()
+        ->and(array_values(array_filter($this->logged, static fn (string $line): bool => str_contains($line, 'without a release version'))))->toHaveCount(2)
+        ->and(implode("\n", $this->logged))->toContain('the data version stays unrecorded')
+        ->not->toContain('recorded version');
+});
+
+it('leaves the last release recorded when a dev install starts over it', function () {
+    $this->redis->execute('SET', $this->versionKey, '2.3.2');
+
+    ($this->runner)('dev')->run();
+
+    expect((string) $this->redis->execute('GET', $this->versionKey))->toBe('2.3.2')
+        ->and($this->logged[0])->toContain('the data version stays 2.3.2');
+});
+
+it('treats a path repository, its own checkout and an undetermined version as dev', function (?string $pretty, ?string $source, string $expected) {
+    expect(UpgradeRunner::normalizeVersion($pretty, $source))->toBe($expected);
+})->with([
+    'a release' => ['2.4.0', null, '2.4.0'],
+    'a release with v' => ['v2.4.0', null, '2.4.0'],
+    'a pre-release' => ['2.4.0-RC1', null, '2.4.0-RC1'],
+    'a path repository guess' => ['1.0.0', 'path', 'dev'],
+    'a path repository with a pinned version' => ['2.4.0', 'path', 'dev'],
+    'the root package' => ['2.4.0', 'root', 'dev'],
+    'no version set' => ['1.0.0+no-version-set', null, 'dev'],
+    'a branch' => ['dev-main', null, 'dev'],
+    'a branch alias' => ['2.x-dev', null, 'dev'],
+    'unknown' => [null, null, 'dev'],
+]);
+
+it('calls this checkout a dev install', function () {
+    // The suite runs with Torque as the root package.
+    expect(UpgradeRunner::installedVersion())->toBe('dev');
 });
 
 it('runs again when a release is deployed over a dev install', function () {

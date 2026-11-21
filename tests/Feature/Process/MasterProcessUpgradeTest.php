@@ -16,8 +16,8 @@ use Webpatser\Torque\Redis\UpgradeRunner;
  * rather than start(), which would fork a fleet for each assertion.
  *
  * This checkout reports itself as a dev install, which by design always runs
- * the steps; the once-per-version contract is therefore asserted with a runner
- * pinned to a release number.
+ * the steps and records nothing; the once-per-version contract is therefore
+ * asserted with a runner pinned to a release number.
  */
 
 beforeEach(function () {
@@ -138,11 +138,17 @@ afterEach(function () {
 });
 
 it('records the version on start', function () {
+    ($this->upgrade)(($this->master)(), ($this->pinnedRunner)('2.4.0'));
+
+    expect((string) $this->redis->execute('GET', $this->versionKey))->toBe('2.4.0')
+        ->and(implode("\n", $this->logged))->toContain('Upgrading Torque data');
+});
+
+it('records nothing on start from a dev install, and says so', function () {
     ($this->upgrade)(($this->master)());
 
-    expect((string) $this->redis->execute('GET', $this->versionKey))
-        ->toBe(UpgradeRunner::installedVersion())
-        ->and(implode("\n", $this->logged))->toContain('Upgrading Torque data');
+    expect($this->redis->execute('GET', $this->versionKey))->toBeNull()
+        ->and(implode("\n", $this->logged))->toContain('without a release version');
 });
 
 it('does nothing on the next start at the same version', function () {
@@ -218,7 +224,7 @@ it('sends a refusal to the error logger, not the status logger', function () {
         ->and(implode("\n", $this->logged))->not->toContain('Refusing to start');
 });
 
-it('starts a fleet on the minimum stored version and moves the version on', function () {
+it('starts a fleet on the minimum stored version, which a dev install leaves alone', function () {
     $this->redis->execute('SET', $this->versionKey, '1.4.0');
 
     ($this->startRealMaster)();
@@ -226,7 +232,7 @@ it('starts a fleet on the minimum stored version and moves the version on', func
 
     expect(($this->masterLog)())->toContain('Starting 1 worker')
         ->not->toContain('Refusing to start')
-        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe(UpgradeRunner::installedVersion());
+        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.4.0');
 });
 
 it('starts a fleet when the stored version is dev or missing', function (?string $stored) {

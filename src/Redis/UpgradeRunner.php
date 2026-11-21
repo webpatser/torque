@@ -39,8 +39,14 @@ final class UpgradeRunner
     /** Suffix of the key holding the last-upgraded version. */
     public const string VERSION_KEY_SUFFIX = 'version';
 
-    /** Stored for any install without a comparable release version. */
+    /**
+     * The installed version of any install without a reliable release number.
+     *
+     * Never recorded since 2.4.0. Older releases stored it, so a stored `dev` is still read.
+     */
     public const string DEV_VERSION = 'dev';
+
+    private const string PACKAGE = 'webpatser/torque';
 
     /** The oldest stored release this version can upgrade from. */
     public const string MINIMUM_STORED_VERSION = '1.4.0';
@@ -92,24 +98,76 @@ final class UpgradeRunner
      * The installed package version, normalized.
      *
      * A leading `v` is stripped, and anything that is not a release number
-     * (`dev-main`, a branch alias, an unreadable install) collapses to `dev`,
-     * which always re-runs the steps: a developer moving between branches
-     * should get the cleanup, not a version comparison that quietly skips it.
+     * collapses to `dev`: `dev-main`, a branch alias, an unreadable install,
+     * Torque as the root package (its own checkout), a Composer path repository,
+     * whose version is whatever Composer guessed or was told (often `1.0.0`),
+     * and `1.0.0+no-version-set`. A dev install always re-runs the steps (a
+     * developer moving between branches should get the cleanup, not a version
+     * comparison that quietly skips it) and records nothing, see {@see self::run()}.
      */
     #[\NoDiscard]
     public static function installedVersion(): string
     {
         try {
-            $version = InstalledVersions::getPrettyVersion('webpatser/torque');
+            return self::normalizeVersion(InstalledVersions::getPrettyVersion(self::PACKAGE), self::nonReleaseSource());
         } catch (\Throwable) {
-            $version = null;
+            return self::DEV_VERSION;
+        }
+    }
+
+    /**
+     * A Composer pretty version as a release number, or `dev`.
+     *
+     * @param  string|null  $nonReleaseSource  `root` or `path` when the install is not a
+     *                                         release whatever its version says, null otherwise.
+     */
+    #[\NoDiscard]
+    public static function normalizeVersion(?string $prettyVersion, ?string $nonReleaseSource = null): string
+    {
+        if ($nonReleaseSource !== null || $prettyVersion === null) {
+            return self::DEV_VERSION;
         }
 
-        $version = preg_replace('/^v/', '', (string) $version);
+        $version = (string) preg_replace('/^v/', '', $prettyVersion);
 
-        return $version !== null && preg_match('/^\d+\.\d+/', $version) === 1
-            ? $version
-            : self::DEV_VERSION;
+        return preg_match('/^\d+\.\d+[^+]*$/', $version) === 1 ? $version : self::DEV_VERSION;
+    }
+
+    /**
+     * `root` when Torque is the root package, `path` when a path repository
+     * installed it, null for an install from a registry or a VCS repository.
+     *
+     * A symlinked path install is told by its link; a mirrored one only by the
+     * dist type in Composer's `installed.json`, which is read only then.
+     */
+    private static function nonReleaseSource(): ?string
+    {
+        if (InstalledVersions::getRootPackage()['name'] === self::PACKAGE) {
+            return 'root';
+        }
+
+        $path = InstalledVersions::getInstallPath(self::PACKAGE);
+
+        if ($path === null) {
+            return null;
+        }
+
+        if (is_link(rtrim($path, '/\\'))) {
+            return 'path';
+        }
+
+        $installedJson = dirname((string) (new \ReflectionClass(InstalledVersions::class))->getFileName()).'/installed.json';
+        $installed = is_file($installedJson) ? json_decode((string) file_get_contents($installedJson), true) : null;
+
+        foreach (Narrow::list(Narrow::map($installed)['packages'] ?? null) as $package) {
+            $package = Narrow::map($package);
+
+            if (($package['name'] ?? null) === self::PACKAGE) {
+                return (Narrow::map($package['dist'] ?? null)['type'] ?? null) === 'path' ? 'path' : null;
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -154,6 +212,11 @@ final class UpgradeRunner
      * even when {@see self::assertUpgradePath()} passed during a Redis outage
      * that has ended since: the next start still has to refuse.
      *
+     * A dev install ({@see self::installedVersion()}) runs every step, records
+     * nothing and says so once. Recording its version would be recording a guess:
+     * a path install that Composer calls `1.0.0` would make every later start
+     * refuse, and a stored `dev` would hide the last release that ran.
+     *
      * @return array{ran: bool, from: string|null, to: string, counts: array<string, int>}
      */
     public function run(): array
@@ -182,7 +245,11 @@ final class UpgradeRunner
             }
         }
 
-        ($this->logger)('Upgrading Torque data from '.($stored ?? 'an unrecorded version')." to {$current}.");
+        if ($current === self::DEV_VERSION) {
+            ($this->logger)('Torque is installed without a release version (its own checkout, a path repository, a branch or a version Composer could not determine): running the upgrade steps, the data version stays '.($stored ?? 'unrecorded').'.');
+        } else {
+            ($this->logger)('Upgrading Torque data from '.($stored ?? 'an unrecorded version')." to {$current}.");
+        }
 
         $counts = [];
 
@@ -196,11 +263,15 @@ final class UpgradeRunner
             }
         }
 
-        $this->redis()->execute('SET', $this->prefix.self::VERSION_KEY_SUFFIX, $current);
+        if ($current !== self::DEV_VERSION) {
+            $this->redis()->execute('SET', $this->prefix.self::VERSION_KEY_SUFFIX, $current);
+        }
 
-        ($this->logger)($counts === []
-            ? "Torque data is up to date; recorded version {$current}."
-            : 'Upgrade cleanup: '.self::describe($counts).'.');
+        if ($counts !== []) {
+            ($this->logger)('Upgrade cleanup: '.self::describe($counts).'.');
+        } elseif ($current !== self::DEV_VERSION) {
+            ($this->logger)("Torque data is up to date; recorded version {$current}.");
+        }
 
         return ['ran' => true, 'from' => $stored, 'to' => $current, 'counts' => $counts];
     }
