@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Fledge\Loop;
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
@@ -20,7 +21,10 @@ use Webpatser\Torque\Events\LongWaitDetected;
 use Webpatser\Torque\Notifications\LongWaitNotification;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Queue\StreamQueue;
+use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Torque;
+
+use function Fledge\Async\delay;
 
 /*
  * `MasterProcess::handleLongWaitTick()` reads the oldest waiting job of each
@@ -583,6 +587,20 @@ it('runs the event before the notifications', function () {
 
     expect(torque_lw_alert_command())->toBe(0)
         ->and(($this->sent)())->toBe(['event', 'mail ops@example.com emails', 'slack #ops emails']);
+});
+
+it('starts each step on a fresh event loop of its own, so a listener can await', function () {
+    // beforeEach's Redis client left this process with a loop watching its socket.
+    // A fork that kept that loop would be refused at its first wait.
+    $this->redis->execute('PING');
+
+    Event::listen(LongWaitDetected::class, function (): void {
+        delay(0.01);
+        file_put_contents($this->runDir.'/sent.log', 'event '.EventLoopDriver::nameOf(Loop::getDriver())."\n", FILE_APPEND);
+    });
+
+    expect(torque_lw_alert_command())->toBe(0)
+        ->and(($this->sent)())->toBe(['event '.EventLoopDriver::nameOf(Loop::getDriver())]);
 });
 
 it('skips Slack with a log line when the channel package is not installed', function () {

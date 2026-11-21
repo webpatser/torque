@@ -9,6 +9,7 @@ use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Fledge\Async\TimeoutCancellation;
+use Fledge\Loop;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
 use Illuminate\Contracts\Debug\ExceptionHandler;
 use Illuminate\Contracts\Events\Dispatcher;
@@ -40,7 +41,6 @@ use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Queue\Worker;
 use Illuminate\Queue\WorkerOptions;
 use Illuminate\Queue\WorkerStopReason;
-use Revolt\EventLoop;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
 use Webpatser\Torque\Job\AttemptAuthManager;
 use Webpatser\Torque\Job\AttemptContextRepository;
@@ -68,7 +68,7 @@ use function Fledge\Async\Redis\createRedisClient;
 use function Fledge\Async\Redis\createRedisConnector;
 
 /**
- * The heart of Torque. Runs inside a forked child process with a Revolt event loop.
+ * The heart of Torque. Runs in its own process (forked and exec'd by the master) on a Fledge event loop.
  *
  * Each worker reads jobs from one or more Redis Streams via XREADGROUP, then
  * dispatches them concurrently using Fibers gated by a semaphore. A dedicated
@@ -367,7 +367,7 @@ LUA;
     /**
      * Main entry point — blocks until the worker is stopped or limits are reached.
      *
-     * Creates the Revolt event loop, installs signal handlers, and registers
+     * Sets up the event loop callbacks, installs signal handlers, and registers
      * the polling and delayed-job-migration timers.
      */
     public function run(): void
@@ -526,7 +526,7 @@ LUA;
         }
 
         // Set error handler so uncaught Fiber exceptions are logged instead of exit(255).
-        EventLoop::setErrorHandler(function (\Throwable $e) {
+        Loop::setErrorHandler(function (\Throwable $e) {
             fwrite(STDERR, "[torque:worker] Uncaught in event loop: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
             fwrite(STDERR, $e->getTraceAsString()."\n");
         });
@@ -561,7 +561,7 @@ LUA;
         $pausedPollSeconds = $timerPeriod('paused_poll_seconds', 1.0);
         $force = (bool) ($this->config['force'] ?? false);
         $this->refreshDownState($force);
-        EventLoop::repeat($timerPeriod('down_check_seconds', 1.0), fn () => $this->refreshDownState($force));
+        Loop::repeat($timerPeriod('down_check_seconds', 1.0), fn () => $this->refreshDownState($force));
         $startTime = $this->startTime;
 
         // Built once for the event payloads. `timeout` carries the stock default:
@@ -618,12 +618,16 @@ LUA;
             $this->notifyInterrupted($signal, $slotJobs, $events, $connectionName, $primaryQueue, $slotScopes);
         };
 
-        EventLoop::onSignal(SIGTERM, fn () => $shutdownHandler(SIGTERM));
-        EventLoop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
+        Loop::onSignal(SIGTERM, fn () => $shutdownHandler(SIGTERM));
+        Loop::onSignal(SIGINT, fn () => $shutdownHandler(SIGINT));
+
+        // The loop hands these to the kernel at its next tick, not in onSignal().
+        // No slot claims a job before that tick: each reader Fiber starts with its
+        // stagger delay(), which only resumes after a tick has activated them.
 
         $masterPidForPause = posix_getppid();
         $pauseFetchFailed = false;
-        EventLoop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, $streamQueue, $cluster, &$pauseFetchFailed) {
+        Loop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, $streamQueue, $cluster, &$pauseFetchFailed) {
             // Framework pause state (queue:pause / queue:pause --all) lives in
             // the cache store, read synchronously outside the pool callback so
             // pool-connection hold time is unchanged. On a failed read we keep
@@ -692,7 +696,7 @@ LUA;
         // OOM), we get reparented and would otherwise keep consuming as an orphan
         // forever. Detect the reparenting and drain out through the normal stop path.
         $masterPid = posix_getppid();
-        EventLoop::repeat($timerPeriod('watchdog_check_seconds', 2.0), function () use ($masterPid, &$restartBaseline, &$restartBaselineKnown, &$restartReadFailed) {
+        Loop::repeat($timerPeriod('watchdog_check_seconds', 2.0), function () use ($masterPid, &$restartBaseline, &$restartBaselineKnown, &$restartReadFailed) {
             if (! $this->stopHasGrace && posix_getppid() !== $masterPid) {
                 fwrite(STDERR, "[torque:worker] Master (PID {$masterPid}) is gone, shutting down orphaned worker\n");
                 $this->requestStop(WorkerStopReason::Interrupted);
@@ -748,7 +752,7 @@ LUA;
             });
 
             $this->writeHeartbeat($heartbeatFile);
-            EventLoop::repeat(1.0, fn () => $this->writeHeartbeat($heartbeatFile));
+            Loop::repeat(1.0, fn () => $this->writeHeartbeat($heartbeatFile));
         }
 
         // Spawn N reader Fibers (one per concurrency slot).
@@ -1289,7 +1293,7 @@ LUA;
         // Delayed job migration timer: checks every second for matured delayed jobs.
         // Keeps running during the drain window so delayed jobs don't pile up while
         // a hung Fiber prevents the worker from exiting cleanly.
-        EventLoop::repeat($timerPeriod('delayed_check_seconds', 1.0), function () use ($redisPool, $queues, $buildStreamKey) {
+        Loop::repeat($timerPeriod('delayed_check_seconds', 1.0), function () use ($redisPool, $queues, $buildStreamKey) {
             $this->migrateDelayedJobs($redisPool, $queues, $buildStreamKey);
         });
 
@@ -1299,7 +1303,7 @@ LUA;
         // this normally publishes once more; it still matters for a worker held
         // open by an in-flight job for the full grace.
         $metricsInterval = Narrow::float($metricsConfig['publish_interval'] ?? null, 1.0);
-        EventLoop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
+        Loop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
             $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
         });
 
@@ -1308,7 +1312,7 @@ LUA;
         // Fires every 30s; threshold defaults to 300s. Catches hung user jobs
         // (e.g. external HTTP calls without a timeout) before they block the
         // worker through its full lifetime.
-        EventLoop::repeat(30.0, function () use (&$slotStarts, $stallThreshold) {
+        Loop::repeat(30.0, function () use (&$slotStarts, $stallThreshold) {
             $now = time();
             foreach ($slotStarts as $idx => $started) {
                 $age = $now - $started;
@@ -1324,7 +1328,7 @@ LUA;
         // Fibers up to drain_grace seconds to finish in-flight work, then call
         // exit(0) so the master sees SIGCHLD and respawns. Without this, a single
         // Fiber suspended inside processMessage() or a half-open Redis socket
-        // would keep the EventLoop running indefinitely and the worker would
+        // would keep the event loop running indefinitely and the worker would
         // never rotate.
         //
         // The memory limit alone has no such deadline: as in the stock worker,
@@ -1333,8 +1337,8 @@ LUA;
         // the same memory growth would abandon them again, forever.
         $drainGrace = DrainSettings::graceSeconds($this->config);
         $drainStartedAt = null;
-        EventLoop::repeat($timerPeriod('stop_check_seconds', 1.0), function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey, $events, $workerOptions, $connectionName, $primaryQueue, $streamQueue) {
-            // Revolt re-enables a repeat timer before invoking it, so a tick that
+        Loop::repeat($timerPeriod('stop_check_seconds', 1.0), function () use (&$drainStartedAt, &$slotStarts, &$slotJobs, $drainGrace, $metricsPublisher, $metrics, $redisUri, $queues, $consumerGroup, $buildStreamKey, $events, $workerOptions, $connectionName, $primaryQueue, $streamQueue) {
+            // The loop re-enables a repeat timer before invoking it, so a tick that
             // suspends in a listener or in the cleanup would be overtaken by the
             // next one, which could exit underneath it.
             if ($this->drainTickRunning) {
@@ -1419,10 +1423,10 @@ LUA;
         $crashed = false;
 
         try {
-            EventLoop::run();
+            Loop::run();
         } catch (\Throwable $e) {
             $crashed = true;
-            fwrite(STDERR, "[torque:worker] EventLoop crashed: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
+            fwrite(STDERR, "[torque:worker] Event loop crashed: {$e->getMessage()} in {$e->getFile()}:{$e->getLine()}\n");
             fwrite(STDERR, $e->getTraceAsString()."\n");
         }
 
@@ -2792,13 +2796,13 @@ LUA;
         $startedAt = hrtime(true);
 
         $timeout = $onTimeout === null ? null : $this->attemptTimeout($job, $streams[$job->getQueue()] ?? []);
-        $timer = $timeout === null ? null : EventLoop::delay($timeout, static fn () => $onTimeout($timeout, $startedAt));
+        $timer = $timeout === null ? null : Loop::delay($timeout, static fn () => $onTimeout($timeout, $startedAt));
 
         try {
             $job->fire();
         } finally {
             if ($timer !== null) {
-                EventLoop::cancel($timer);
+                Loop::cancel($timer);
             }
 
             $duration = round((hrtime(true) - $startedAt) / 1_000_000, 2);

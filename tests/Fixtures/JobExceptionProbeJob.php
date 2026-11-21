@@ -4,11 +4,11 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Tests\Fixtures;
 
+use Fledge\Loop;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Support\Facades\Context;
-use Revolt\EventLoop;
 use RuntimeException;
 
 use function Fledge\Async\delay;
@@ -116,7 +116,7 @@ final class JobExceptionProbeJob implements ShouldQueue
 
         $redis->execute('XGROUP', 'DESTROY', $stream, $group);
 
-        EventLoop::delay(1.2, static function () use ($redis, $stream, $group): void {
+        Loop::delay(1.2, static function () use ($redis, $stream, $group): void {
             $redis->execute('XGROUP', 'CREATE', $stream, $group, '0');
         });
     }

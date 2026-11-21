@@ -39,7 +39,7 @@ equivalent Horizon throughput on async I/O ≈ 30 processes (~2.5 GB)
 - PHP 8.6
 - Laravel 13
 - Redis 7+ or Valkey (Redis Streams support)
-- [Revolt](https://revolt.run) event loop (installed automatically)
+- Fledge Loop event loop (`webpatser/fledge-loop`, installed automatically)
 
 ### PHP version policy
 
@@ -377,6 +377,7 @@ All options are in `config/torque.php`. Key settings:
 |---------|---------|-------------|
 | `workers` | 4 | Number of worker processes |
 | `slots_per_worker` | 50 | Concurrent job slots per worker (`TORQUE_SLOTS_PER_WORKER`; the old `TORQUE_COROUTINES` still works) |
+| `event_loop` | `auto` | Event loop driver of the master and every worker (`FLEDGE_EVENT_LOOP`, the variable the rest of Fledge reads too). `auto` picks `poll` (PHP 8.6 `Io\Poll` on kqueue or epoll) where available, otherwise `select`; `poll` requires kqueue or epoll; `select` (`stream_select`) is the rollback, limited to descriptors below FD_SETSIZE (usually 1024) per process. `torque:start` refuses any other value. Each process installs it during its own setup and logs `Event loop: <driver>` |
 | `max_jobs_per_worker` | 10000 | Restart worker after N jobs (prevents memory leaks) |
 | `max_worker_lifetime` | 3600 | Restart worker after N seconds |
 | `max_worker_lifetime_jitter` | 0.1 | Random slice each worker subtracts from its own lifetime, as a ratio. The master forks the fleet inside one second, so without this every worker rotates in the same second. Only ever subtracts; `0.0` disables |
@@ -572,7 +573,7 @@ Without `--dead-letter-max` the cap is `dead_letter.max_entries`. `--consumer-id
 
 ```
 Master Process (torque:start)
-+-- Worker 1 (Revolt event loop)
++-- Worker 1 (Fledge event loop)
 |   +-- 50 Fibers (non-blocking poll + yield)
 |   +-- Redis Pool
 |   +-- MySQL Pool
@@ -593,8 +594,8 @@ Redis Streams
 
 ### How it works
 
-1. **Master** spawns N worker processes via `pcntl_exec()` (`php artisan torque:worker`)
-2. Each **worker** runs a Revolt event loop with M Fiber slots
+1. **Master** spawns N worker processes with `pcntl_fork()` followed at once by `pcntl_exec()` (`php artisan torque:worker`), so every worker is a fresh PHP process that inherits no event loop, Fiber or connection state from the master
+2. Each **worker** installs the configured event loop driver (`event_loop`) and runs it with M Fiber slots
 3. Each Fiber polls for messages with non-blocking `XREADGROUP` (no BLOCK). When no work is available, the Fiber yields to the event loop with a configurable delay (`poll_interval_ms` / 1000 seconds). This ensures timers (delayed job migration, metrics, pause checks) always fire reliably
 4. Fiber startup is staggered across the poll interval so polling is evenly distributed
 5. **Work-stealing**: idle Fibers claim stale messages from dead consumers via `XAUTOCLAIM` (per-queue `retry_after` as idle threshold)
@@ -868,8 +869,10 @@ php artisan torque:bench --workload=payload-large --serializer=igbinary
 ## Dependencies
 
 **Required** (installed automatically):
-- `revolt/event-loop`: Fiber scheduler
+- `webpatser/fledge-loop`: the event loop (Fiber scheduler)
 - `webpatser/fledge-fiber`: async/await primitives, non-blocking Redis, sync primitives
+
+Fledge's async layer started as a port of [amphp](https://amphp.org) and its event loop as a port of [Revolt](https://revolt.run), both MIT licensed. Those projects showed how far fibers can take PHP, and Fledge builds on that work. Fledge has since gone its own way: PHP 8.6 only, shaped around Laravel, and maintained independently, so it does not track either project.
 
 **Optional** (install when needed):
 - `webpatser/fledge-fiber-database`: Async MySQL for `MysqlPool`

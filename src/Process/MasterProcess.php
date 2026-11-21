@@ -17,6 +17,7 @@ use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\DrainSettings;
+use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\LegacyConfig;
 use Webpatser\Torque\Support\LongWaitGate;
 use Webpatser\Torque\Support\Narrow;
@@ -472,9 +473,12 @@ LUA;
     /**
      * Spawn a single worker as a clean PHP process.
      *
-     * Uses pcntl_fork() + pcntl_exec() to replace the process image entirely.
-     * This avoids Fiber/Revolt segfaults that happen when forking a process
-     * with active event loop state — pcntl_exec() replaces the memory image.
+     * Uses pcntl_fork() + pcntl_exec() to replace the process image entirely,
+     * so the worker inherits no event loop, fiber or connection state and
+     * installs its own loop driver ({@see EventLoopDriver}). Called from
+     * {main} only (start() and the monitor loop, never a loop callback or a
+     * fiber), and the child touches nothing but signal dispositions and its
+     * mask before exec, so `Loop::afterFork()` is not needed here.
      */
     private function spawnWorker(): void
     {
@@ -496,7 +500,7 @@ LUA;
             pcntl_sigprocmask(SIG_SETMASK, []);
 
             // Child: immediately replace process image with a fresh PHP process.
-            // This avoids inheriting any Fiber/Revolt/Redis state from the parent.
+            // This avoids inheriting any fiber, event loop or Redis state from the parent.
             $queues = implode(',', array_map(Narrow::string(...), (array) ($this->config['queues'] ?? ['default'])));
             $concurrency = (string) Narrow::int($this->config['slots_per_worker'] ?? null, 50);
 
@@ -512,7 +516,7 @@ LUA;
             exit(1);
         }
 
-        // Parent process — record the child PID.
+        // Parent process: record the child PID.
         $this->workerPids[$pid] = true;
         $this->workerSpawnedAt[$pid] = time();
         ($this->logger)("Worker spawned with PID {$pid}");

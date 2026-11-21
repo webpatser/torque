@@ -104,7 +104,7 @@ final class AttemptScope
 
                 CoroutineContext::set(self::CONTEXT_KEY, $scope);
 
-                // Revolt reuses callback Fibers, so the next closure on this
+                // The event loop reuses callback Fibers, so the next closure on this
                 // one must not inherit the scope.
                 return static fn () => CoroutineContext::forget(self::CONTEXT_KEY);
             },

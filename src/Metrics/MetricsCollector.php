@@ -9,7 +9,7 @@ use SplFixedArray;
 /**
  * Gathers real-time stats from a single worker process.
  *
- * Called periodically by the worker's Revolt timer to build a
+ * Called periodically by the worker's event loop timer to build a
  * {@see WorkerSnapshot} that the {@see MetricsPublisher} pushes to Redis.
  *
  * Latency samples are stored in a fixed-size circular buffer so memory

@@ -5,14 +5,16 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 /**
- * Internal command — runs a single Torque worker process.
+ * Internal command: runs a single Torque worker process.
  *
- * Not intended for direct use. The MasterProcess spawns this via proc_open()
- * so each worker is a clean PHP process (no pcntl_fork Fiber conflicts).
+ * Not intended for direct use. The MasterProcess starts this with pcntl_fork()
+ * followed at once by pcntl_exec(), so each worker is a fresh PHP process that
+ * inherits no event loop, fiber or connection state from the master.
  *
  * Usage:
  *   php artisan torque:worker --queues=scrpr --concurrency=5
@@ -23,7 +25,7 @@ final class TorqueWorkerCommand extends Command
         {--queues=default : Comma-separated queue names}
         {--concurrency=50 : Coroutine slots}';
 
-    protected $description = 'Run a single Torque worker (internal — use torque:start instead)';
+    protected $description = 'Run a single Torque worker (internal: use torque:start instead)';
 
     protected $hidden = true;
 
@@ -39,6 +41,13 @@ final class TorqueWorkerCommand extends Command
         });
 
         $config = Narrow::map(config('torque'));
+
+        // Before anything runs on the loop. This process was exec'd by the master,
+        // so it inherited no loop state: install(), never afterFork().
+        $driver = EventLoopDriver::install($config, static function (string $warning): void {
+            fwrite(STDERR, "[torque:worker] WARN {$warning}\n");
+        });
+        fwrite(STDERR, "[torque:worker] Event loop: {$driver}\n");
 
         if ($this->option('queues') !== null) {
             $config['queues'] = array_map('trim', explode(',', $this->option('queues')));

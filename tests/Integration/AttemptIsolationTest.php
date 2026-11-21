@@ -781,7 +781,7 @@ it('restores the previous scope after within(), also on a throw', function (bool
 
         $afterThrow = $name();
 
-        // Revolt reuses this Fiber for the next dataset.
+        // The event loop reuses this Fiber for the next dataset.
         AttemptScope::end();
 
         return [$returned, $afterReturn, $thrownInside, $afterThrow];

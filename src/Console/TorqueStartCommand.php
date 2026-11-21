@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Composer\InstalledVersions;
+use Fledge\Loop\UnsupportedFeatureException;
 use Illuminate\Console\Command;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 
@@ -170,6 +172,19 @@ final class TorqueStartCommand extends Command
         } elseif ($serializer === 'json' && ! $hasIgbinary) {
             $this->components->info('Tip: install ext-igbinary for ~2x faster payload encoding (set TORQUE_SERIALIZER=igbinary).');
         }
+
+        // The master's own loop (its Redis reads run on it), and the check that the
+        // workers can start: they install the same driver, and an unusable value
+        // would otherwise only show as a fleet that dies and respawns forever.
+        try {
+            $driver = EventLoopDriver::install($config, fn (string $warning) => $this->components->warn($warning));
+        } catch (\InvalidArgumentException|UnsupportedFeatureException $e) {
+            $this->components->error('Unusable event loop driver (torque.event_loop, FLEDGE_EVENT_LOOP): '.$e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $this->components->info("Event loop: {$driver}");
 
         if ($takeoverPid !== null) {
             $this->components->info("Takeover: replacing master PID {$takeoverPid} once this fleet is ready.");

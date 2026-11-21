@@ -40,6 +40,24 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Event loop driver
+    |--------------------------------------------------------------------------
+    | The driver the master and every worker run their event loop on:
+    |
+    | 'auto'   : default. `poll` where PHP 8.6's Io\Poll has kqueue (macOS,
+    |            BSD) or epoll (Linux), otherwise `select`.
+    | 'poll'   : Io\Poll; torque:start refuses when neither backend exists.
+    | 'select' : stream_select, the rollback. Limited to descriptors below
+    |            FD_SETSIZE (usually 1024) per process.
+    |
+    | Reads FLEDGE_EVENT_LOOP, the variable the rest of Fledge uses too, so
+    | one setting covers the whole application. torque:start refuses any
+    | other value. Each process installs it during its own setup.
+    */
+    'event_loop' => env('FLEDGE_EVENT_LOOP', 'auto'),
+
+    /*
+    |--------------------------------------------------------------------------
     | Max jobs before worker restart
     |--------------------------------------------------------------------------
     | Prevents memory leaks from long-running processes. The worker drains and

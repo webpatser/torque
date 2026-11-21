@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Closure;
+use Fledge\Loop;
 use Illuminate\Console\Command;
 use Illuminate\Notifications\ChannelManager;
 use Illuminate\Support\Facades\Log;
@@ -13,6 +14,7 @@ use InvalidArgumentException;
 use Throwable;
 use Webpatser\Torque\Events\LongWaitDetected;
 use Webpatser\Torque\Notifications\LongWaitNotification;
+use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Torque;
 
@@ -167,6 +169,7 @@ final class TorqueLongWaitAlertCommand extends Command
             fclose($reader);
 
             try {
+                self::startFreshLoop();
                 $step();
                 $result = self::STEP_OK;
             } catch (Throwable $e) {
@@ -198,6 +201,26 @@ final class TorqueLongWaitAlertCommand extends Command
             '' => 'ended without reporting a result',
             default => str_starts_with($result, self::STEP_FAILED) ? substr($result, strlen(self::STEP_FAILED)) : 'reported an unreadable result',
         };
+    }
+
+    /**
+     * Give a step's fork its own event loop, first thing, before the step can use one.
+     *
+     * Unlike a worker, the fork keeps running this process's code, so it inherits
+     * whatever loop booting the app or an earlier step left here: an epoll descriptor
+     * it shares with this process, or a kqueue one it does not have at all. A listener
+     * or a notification channel that awaits anything (a Fledge Redis, cache or HTTP
+     * client) would run on that. The fork happens in {main}, between steps, so
+     * nothing of this process is suspended mid-exchange.
+     */
+    private static function startFreshLoop(): void
+    {
+        try {
+            Loop::afterFork(EventLoopDriver::configured(Narrow::map(config('torque'))));
+        } catch (\RuntimeException) {
+            // Fibers of this process threw while unwinding in the fork. That is this
+            // process's abandoned work, not the step's, and the fresh loop is in place.
+        }
     }
 
     /**

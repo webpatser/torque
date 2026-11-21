@@ -6,7 +6,7 @@
     $live = array_values(array_filter($hosts, fn ($h) => $h['status'] === 'active'));
     $workerCount = array_sum(array_map(fn ($h) => count($h['workers']), $hosts));
 @endphp
-<x-torque::shell title="Workers" crumb="Revolt event loop processes" active="workers"
+<x-torque::shell title="Workers" crumb="Event loop processes" active="workers"
     :dead-count="$deadCount" :worker-count="$workerCount" :poll-interval="$pollInterval" :range="$range">
 
     <div class="grid mb16" style="grid-template-columns: repeat(4,1fr);">

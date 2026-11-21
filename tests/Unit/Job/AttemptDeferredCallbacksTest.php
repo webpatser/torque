@@ -116,7 +116,7 @@ it('does not leak an owner to the next closure on a reused Fiber', function () {
         AttemptScope::end();
     })->await();
 
-    // Child closures finished without suspending, so Revolt reuses their Fiber.
+    // Child closures finished without suspending, so the event loop reuses their Fiber.
     async(static function () use ($collection): void {
         $collection[] = new DeferredCallback(static fn () => null);
     })->await();

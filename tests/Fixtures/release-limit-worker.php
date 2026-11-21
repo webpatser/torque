@@ -16,12 +16,12 @@ declare(strict_types=1);
  * that did not stop shows up as a worker that ran to its lifetime.
  */
 
+use Fledge\Loop;
 use Illuminate\Cache\RateLimiting\Limit;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\RateLimiter;
 use Livewire\LivewireServiceProvider;
 use Orchestra\Testbench\Foundation\Application;
-use Revolt\EventLoop;
 use Webpatser\Torque\TorqueServiceProvider;
 use Webpatser\Torque\Worker\WorkerProcess;
 
@@ -66,7 +66,7 @@ $redis = createRedisClient($redisUri);
 $delayedKey = $prefix.$queue.':delayed';
 $stopping = false;
 
-EventLoop::repeat(0.1, static function () use ($redis, $delayedKey, $prefix, &$stopping): void {
+Loop::repeat(0.1, static function () use ($redis, $delayedKey, $prefix, &$stopping): void {
     foreach ($redis->execute('ZRANGE', $delayedKey, '0', '-1') ?? [] as $member) {
         // XX: the worker may have migrated the member since the ZRANGE, and re-adding it would duplicate the job.
         $redis->execute('ZADD', $delayedKey, 'XX', '0', $member);

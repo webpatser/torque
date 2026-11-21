@@ -31,6 +31,14 @@ it('rejects queue names with special characters', function () {
         ->expectsOutputToContain('Invalid queue name');
 });
 
+it('refuses an event loop driver the workers could not start on', function () {
+    config(['torque.event_loop' => 'uv']);
+
+    $this->artisan('torque:start', ['--queues' => 'default'])
+        ->assertFailed()
+        ->expectsOutputToContain('Unusable event loop driver');
+});
+
 /*
  * Refusal / takeover gate. These tests only exercise the early-return paths;
  * a proceeding start would fork a real fleet, which belongs to integration
