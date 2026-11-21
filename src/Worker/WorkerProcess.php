@@ -398,7 +398,7 @@ LUA;
         // As the (array) cast did: one name on its own is a list of one.
         $configuredQueues = $this->config['queues'] ?? ['default'];
         $queues = array_map(
-            static fn (mixed $queue): string => Narrow::string($queue),
+            Narrow::string(...),
             is_array($configuredQueues) ? array_values($configuredQueues) : [$configuredQueues],
         );
         $connectionName = Torque::CONNECTION;
@@ -853,7 +853,7 @@ LUA;
                             $readChain = function (array $readQueues) use ($fiberRedis, $prefix, $consumerGroup, $buildStreamKey, $streams, $loopCount, &$redelivered, &$recheckPending): ?array {
                                 // Queue names already; this only tells analysis so (PHPStan
                                 // ignores a @param docblock on a closure assigned to a variable).
-                                $readQueues = array_map(static fn (mixed $queue): string => Narrow::string($queue), $readQueues);
+                                $readQueues = array_map(Narrow::string(...), $readQueues);
 
                                 $found = $this->readNextMessage($fiberRedis, $readQueues, $prefix, $consumerGroup, $buildStreamKey);
 
@@ -2525,7 +2525,7 @@ LUA;
 
         try {
             return array_map(
-                static fn (mixed $queue): string => Narrow::string($queue),
+                Narrow::string(...),
                 array_values($manager->getPausedQueues($connectionName, $queues)),
             );
         } catch (\Throwable) {
@@ -3010,7 +3010,7 @@ LUA;
      */
     public static function slotBackoffSeconds(int $failures): float
     {
-        return min(30.0, 0.5 * 2 ** min(max($failures, 1) - 1, 10));
+        return min(30.0, 0.5 * 2 ** clamp($failures - 1, 0, 10));
     }
 
     /**

@@ -125,7 +125,7 @@ trait WithDashboardChrome
     {
         $allowed = config('torque.dashboard.poll_intervals', [0, 1000, 2000, 5000, 10000, 30000]);
 
-        return in_array($interval, array_map(static fn (mixed $value): int => Narrow::int($value), Narrow::list($allowed)), true);
+        return in_array($interval, array_map(Narrow::int(...), Narrow::list($allowed)), true);
     }
 
     /**

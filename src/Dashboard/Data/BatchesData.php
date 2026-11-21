@@ -125,7 +125,7 @@ final class BatchesData
             'pending' => (int) $batch->pendingJobs,
             'failed' => (int) $batch->failedJobs,
             'total' => (int) $batch->totalJobs,
-            'failedJobIds' => array_values(array_map(static fn (mixed $id): string => Narrow::string($id), $batch->failedJobIds)),
+            'failedJobIds' => array_values(array_map(Narrow::string(...), $batch->failedJobIds)),
             'createdAt' => $batch->createdAt->getTimestamp(),
             'finishedAt' => $batch->finishedAt?->getTimestamp(),
             'cancelled' => $batch->cancelled(),

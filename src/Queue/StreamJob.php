@@ -399,7 +399,7 @@ class StreamJob extends Job implements JobContract
         }
 
         if (is_array($backoff)) {
-            return implode(',', array_map(static fn (mixed $seconds): string => Narrow::string($seconds), $backoff));
+            return implode(',', array_map(Narrow::string(...), $backoff));
         }
 
         return Narrow::nullableString($backoff);

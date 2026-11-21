@@ -14,7 +14,7 @@
     $cx = $size / 2;
     $cy = $size / 2;
     $r = $size / 2 - 16;
-    $frac = max(0, min(1, $max > 0 ? $value / $max : 0));
+    $frac = clamp($max > 0 ? $value / $max : 0, 0, 1);
     $valDeg = $start + $sweep * $frac;
 
     $ticks = [];

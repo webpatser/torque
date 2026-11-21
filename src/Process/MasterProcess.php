@@ -603,7 +603,7 @@ LUA;
 
     private function deferRespawn(float $now): void
     {
-        $this->respawnBackoff = min(self::RESPAWN_BACKOFF_MAX, max(1.0, $this->respawnBackoff * 2));
+        $this->respawnBackoff = clamp($this->respawnBackoff * 2, 1.0, self::RESPAWN_BACKOFF_MAX);
         $this->respawnRetryAt = $now + $this->respawnBackoff;
         ($this->logger)("{$this->pendingRespawns} worker respawn(s) owed; retrying in {$this->respawnBackoff}s.");
     }
@@ -1018,7 +1018,7 @@ LUA;
      */
     public static function watchdogShouldSkipPass(float $gapSeconds, int $limit): bool
     {
-        return abs($gapSeconds) > max(1.0, min(5.0, $limit / 2));
+        return abs($gapSeconds) > clamp($limit / 2, 1.0, 5.0);
     }
 
     /**
