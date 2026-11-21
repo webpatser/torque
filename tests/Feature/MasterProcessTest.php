@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Webpatser\Torque\Console\TorqueWorkerCommand;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
@@ -267,6 +268,123 @@ it('keeps supervising when a respawn fork fails and retries it after a backoff',
     expect($pending->getValue($master))->toBe(0)
         ->and($master->workerPids)->toBe([FAKE_CHILD_PID => true])
         ->and($master->workerCount)->toBe(1);
+});
+
+// Wait statuses as waitpid() reports them on Linux and macOS.
+function torque_exit_status(int $code): int
+{
+    return $code << 8;
+}
+
+it('respawns a worker that died young on a doubling backoff and logs an error after a few', function () {
+    $logs = [];
+    $errors = [];
+    $master = new MasterProcess(
+        config: ['workers' => 2],
+        logger: function (string $m) use (&$logs) {
+            $logs[] = $m;
+        },
+        errorLogger: function (string $m) use (&$errors) {
+            $errors[] = $m;
+        },
+    );
+    $forks = 0;
+    (new ReflectionProperty($master, 'fork'))->setValue($master, function () use (&$forks): int {
+        return FAKE_CHILD_PID + $forks++;
+    });
+    $exit = new ReflectionMethod($master, 'handleWorkerExit');
+    $retry = new ReflectionMethod($master, 'retryPendingRespawns');
+    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $retryAt = new ReflectionProperty($master, 'respawnRetryAt');
+    $spawnedAt = new ReflectionProperty($master, 'workerSpawnedAt');
+    $pids = new ReflectionProperty($master, 'workerPids');
+
+    $now = (float) time();
+    $pids->setValue($master, [1001 => true, 1002 => true]);
+    $spawnedAt->setValue($master, [1001 => (int) $now - 1, 1002 => (int) $now - 1]);
+
+    // A failed exec: SIGKILL right after the spawn. Owed, not forked.
+    $exit->invoke($master, 1001, SIGKILL, $now);
+
+    expect($forks)->toBe(0)
+        ->and($pending->getValue($master))->toBe(1)
+        ->and($retryAt->getValue($master))->toBe($now + 1.0)
+        ->and(implode("\n", $logs))->toContain('Worker PID 1001 killed by signal 9 (SIGKILL)')
+        ->toContain('respawning in 1s');
+
+    // A boot exception: the wait doubles.
+    $exit->invoke($master, 1002, torque_exit_status(1), $now);
+
+    expect($pending->getValue($master))->toBe(2)
+        ->and($retryAt->getValue($master))->toBe($now + 2.0)
+        ->and($errors)->toBe([]);
+
+    // Not before the wait has passed.
+    $retry->invoke($master, $now + 1.5);
+    expect($forks)->toBe(0);
+
+    $retry->invoke($master, $now + 2.0);
+    $retry->invoke($master, $now + 2.1);
+    expect($forks)->toBe(2)
+        ->and($pending->getValue($master))->toBe(0);
+
+    // The third in a row: the error names the status and what it usually means.
+    $spawnedAt->setValue($master, [FAKE_CHILD_PID => (int) $now + 2, FAKE_CHILD_PID + 1 => (int) $now + 2]);
+    $exit->invoke($master, FAKE_CHILD_PID, torque_exit_status(TorqueWorkerCommand::EXIT_CONFIG), $now + 3);
+
+    expect($retryAt->getValue($master))->toBe($now + 3 + 4.0)
+        ->and($errors)->toHaveCount(1)
+        ->and($errors[0])->toContain('3 workers in a row died within 10s')
+        ->toContain('exited (code 78)')
+        ->toContain('FLEDGE_EVENT_LOOP');
+
+    // A worker spawned during the run that lives 10 seconds ends it.
+    (new ReflectionMethod($master, 'resetFastDeathsOnSurvivor'))->invoke($master, $now + 2 + MasterProcess::FAST_DEATH_SECONDS);
+
+    expect((new ReflectionProperty($master, 'fastDeaths'))->getValue($master))->toBe(0)
+        ->and((new ReflectionProperty($master, 'fastDeathBackoff'))->getValue($master))->toBe(0.0)
+        ->and(end($logs))->toContain('respawns are immediate');
+});
+
+it('respawns at once after an orderly stop, a memory limit or a watchdog kill, however young', function (int $status, bool $watchdog) {
+    $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+    $forks = 0;
+    (new ReflectionProperty($master, 'fork'))->setValue($master, function () use (&$forks): int {
+        return FAKE_CHILD_PID + $forks++;
+    });
+
+    $now = (float) time();
+    (new ReflectionProperty($master, 'workerPids'))->setValue($master, [1001 => true]);
+    (new ReflectionProperty($master, 'workerSpawnedAt'))->setValue($master, [1001 => (int) $now]);
+
+    if ($watchdog) {
+        (new ReflectionProperty($master, 'stallKilledPids'))->setValue($master, [1001 => true]);
+    }
+
+    (new ReflectionMethod($master, 'handleWorkerExit'))->invoke($master, 1001, $status, $now + 1);
+
+    expect($forks)->toBe(1)
+        ->and((new ReflectionProperty($master, 'pendingRespawns'))->getValue($master))->toBe(0)
+        ->and((new ReflectionProperty($master, 'fastDeaths'))->getValue($master))->toBe(0);
+})->with([
+    'exit 0' => [torque_exit_status(0), false],
+    'memory limit' => [torque_exit_status(12), false],
+    'watchdog SIGKILL' => [SIGKILL, true],
+]);
+
+it('does not let a worker from before a run of fast deaths end it', function () {
+    $master = new MasterProcess(config: ['workers' => 2], logger: fn (string $m) => null);
+    (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
+
+    $now = (float) time();
+    (new ReflectionProperty($master, 'workerPids'))->setValue($master, [1001 => true, 1002 => true]);
+    // 1001 has run for an hour; 1002 dies one second after its spawn.
+    (new ReflectionProperty($master, 'workerSpawnedAt'))->setValue($master, [1001 => (int) $now - 3600, 1002 => (int) $now - 1]);
+
+    (new ReflectionMethod($master, 'handleWorkerExit'))->invoke($master, 1002, torque_exit_status(1), $now);
+    (new ReflectionMethod($master, 'resetFastDeathsOnSurvivor'))->invoke($master, $now + 60);
+
+    expect((new ReflectionProperty($master, 'fastDeaths'))->getValue($master))->toBe(1);
 });
 
 it('drops owed respawns once the master is stopping', function () {

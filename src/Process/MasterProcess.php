@@ -9,7 +9,9 @@ use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
 use Fledge\Async\Redis\Connection\RedisTimeoutException;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
+use Illuminate\Queue\Worker;
 use Illuminate\Support\ConfigurationUrlParser;
+use Webpatser\Torque\Console\TorqueWorkerCommand;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -213,6 +215,25 @@ LUA;
     /** Longest wait between two respawn retries, in seconds. */
     private const float RESPAWN_BACKOFF_MAX = 30.0;
 
+    /**
+     * A worker that ends within this many seconds of its spawn, other than by an
+     * orderly stop, died young: the exec failed, the app threw while booting, or
+     * a setting it cannot start on. Respawning it at once would only repeat that.
+     */
+    public const int FAST_DEATH_SECONDS = 10;
+
+    /** Consecutive fast deaths, across the fleet, after which the master logs an error. */
+    public const int FAST_DEATHS_BEFORE_ERROR = 3;
+
+    /** Workers in a row that died young, reset once a worker spawned since then runs {@see FAST_DEATH_SECONDS}. */
+    private int $fastDeaths = 0;
+
+    /** Unix time of the first fast death of the current run of them. */
+    private int $fastDeathsSince = 0;
+
+    /** Seconds the next respawn after a fast death waits, doubled per fast death. */
+    private float $fastDeathBackoff = 0.0;
+
     /** Field in this host's `metrics:live:{host}` hash that `torque:status` reads. */
     public const string PENDING_RESPAWNS_FIELD = 'pending_respawns';
 
@@ -236,6 +257,9 @@ LUA;
     private Closure $fork;
 
     private readonly string $artisanPath;
+
+    /** The binary a worker is exec'd with: `PHP_BINARY`, replaced by a test to make the exec fail. */
+    private string $phpBinary = PHP_BINARY;
 
     /**
      * @param  array<string, mixed>  $config  Merged Torque config.
@@ -479,6 +503,16 @@ LUA;
      * {main} only (start() and the monitor loop, never a loop callback or a
      * fiber), and the child touches nothing but signal dispositions and its
      * mask before exec, so `Loop::afterFork()` is not needed here.
+     *
+     * When the exec fails (a PHP binary that is gone after an upgrade, a
+     * permission change), the child is still a copy of the master: exit()
+     * would run the master's shutdown functions and destructors a second
+     * time, on connections it shares with the master, and the warning turned
+     * into an exception would unwind it through the master's own code. It
+     * writes one line to stderr, which the master shares, and kills itself
+     * with SIGKILL instead ({@see execOrDie()}).
+     * The master reads that as a worker that died young and respawns it on
+     * the fast-death backoff ({@see handleWorkerExit()}).
      */
     private function spawnWorker(): void
     {
@@ -504,22 +538,48 @@ LUA;
             $queues = implode(',', array_map(Narrow::string(...), (array) ($this->config['queues'] ?? ['default'])));
             $concurrency = (string) Narrow::int($this->config['slots_per_worker'] ?? null, 50);
 
-            pcntl_exec(PHP_BINARY, [
+            self::execOrDie($this->phpBinary, [
                 $this->artisanPath,
                 'torque:worker',
                 "--queues={$queues}",
                 "--concurrency={$concurrency}",
-            ]);
-
-            // pcntl_exec only returns on failure.
-            fwrite(STDERR, '[Torque] pcntl_exec failed: '.pcntl_get_last_error()."\n");
-            exit(1);
+            ], 'Worker');
         }
 
         // Parent process: record the child PID.
         $this->workerPids[$pid] = true;
         $this->workerSpawnedAt[$pid] = time();
         ($this->logger)("Worker spawned with PID {$pid}");
+    }
+
+    /**
+     * Exec in a forked child; when that fails, end the child at once with SIGKILL.
+     *
+     * The child is a copy of the master, so neither exit() nor an exception may
+     * end it. exit() runs the master's shutdown functions and destructors again.
+     * An exception is what the application's error handler makes of the warning
+     * a failed pcntl_exec() raises (Laravel's turns every warning into an
+     * ErrorException): it would unwind the copy through the master's own stack,
+     * its `finally` blocks (removing the master's PID file), the console's error
+     * rendering and an exit with status 0, which reads as an orderly stop. So the
+     * warning is muted here and the reason goes to stderr, which the master shares.
+     *
+     * @param  list<string>  $arguments
+     */
+    private static function execOrDie(string $binary, array $arguments, string $what): never
+    {
+        set_error_handler(static fn (): bool => true);
+
+        try {
+            pcntl_exec($binary, $arguments);
+        } catch (\Throwable) {
+            // Only a handler set before ours could throw; the outcome is the same.
+        }
+
+        @fwrite(STDERR, "[Torque] {$what} exec of {$binary} failed: ".pcntl_strerror(pcntl_get_last_error())."\n");
+        posix_kill((int) getmypid(), SIGKILL);
+
+        exit(1); // Not reached: SIGKILL cannot be handled.
     }
 
     /**
@@ -678,32 +738,10 @@ LUA;
                     continue;
                 }
 
-                $this->forgetWorker($pid);
-
-                if (pcntl_wifexited($status)) {
-                    $exitCode = pcntl_wexitstatus($status);
-                    ($this->logger)("Worker PID {$pid} exited (code {$exitCode})");
-                } elseif (pcntl_wifsignaled($status)) {
-                    $signal = pcntl_wtermsig($status);
-                    ($this->logger)("Worker PID {$pid} killed by signal {$signal} (".match ($signal) {
-                        1 => 'SIGHUP', 2 => 'SIGINT', 6 => 'SIGABRT', 9 => 'SIGKILL',
-                        11 => 'SIGSEGV', 13 => 'SIGPIPE', 15 => 'SIGTERM',
-                        default => 'SIG'.$signal,
-                    }.')');
-                } else {
-                    ($this->logger)("Worker PID {$pid} exited (unknown status)");
-                }
-
-                // Workers being scaled down should not be respawned.
-                if (isset($this->scalingDownPids[$pid])) {
-                    unset($this->scalingDownPids[$pid]);
-                    ($this->logger)("Scaled-down worker PID {$pid} drained and exited.");
-                } elseif (! $this->shouldStop) {
-                    ($this->logger)('Respawning replacement worker...');
-                    $this->respawnWorker();
-                }
+                $this->handleWorkerExit($pid, $status);
             }
 
+            $this->resetFastDeathsOnSurvivor();
             $this->retryPendingRespawns();
 
             $this->superviseLongWaitAlerts();
@@ -737,6 +775,157 @@ LUA;
         ($this->logger)('All workers exited. Master shutting down.');
 
         return 0;
+    }
+
+    /**
+     * Log a reaped worker's end and replace it, on the fast-death backoff when it died young.
+     *
+     * A worker that ends within {@see FAST_DEATH_SECONDS} of its spawn, other than
+     * by an orderly stop (status 0, or 12 for the memory limit) or a kill of this
+     * master's watchdog, is owed instead of respawned at once: the wait starts at
+     * 1 second and doubles per fast death up to {@see RESPAWN_BACKOFF_MAX}, logged
+     * once per step. A fleet whose workers cannot start (a stale PHP binary after
+     * an upgrade, a boot exception, an unusable FLEDGE_EVENT_LOOP in .env) thus
+     * forks a few times a minute instead of ten times a second. After
+     * {@see FAST_DEATHS_BEFORE_ERROR} in a row the master logs an error naming the
+     * last status; it keeps supervising, as it does after failed forks. A job that
+     * times out within the first seconds of a worker also ends it with status 1
+     * and counts as a fast death: the backoff then only slows the replacement.
+     *
+     * The clock is injectable so it can be exercised without the monitor loop.
+     */
+    private function handleWorkerExit(int $pid, int $status, ?float $now = null): void
+    {
+        $now ??= microtime(true);
+        $spawnedAt = $this->workerSpawnedAt[$pid] ?? null;
+        $killedByWatchdog = isset($this->stallKilledPids[$pid]);
+
+        $this->forgetWorker($pid);
+
+        $ending = self::describeExit($status);
+        ($this->logger)("Worker PID {$pid} {$ending}");
+
+        // Workers being scaled down should not be respawned.
+        if (isset($this->scalingDownPids[$pid])) {
+            unset($this->scalingDownPids[$pid]);
+            ($this->logger)("Scaled-down worker PID {$pid} drained and exited.");
+
+            return;
+        }
+
+        if ($this->shouldStop) {
+            return;
+        }
+
+        $age = $spawnedAt === null ? null : $now - $spawnedAt;
+
+        if ($age === null || $age >= self::FAST_DEATH_SECONDS || $killedByWatchdog || self::isOrderlyStop($status)) {
+            if ($age !== null && $age >= self::FAST_DEATH_SECONDS && $spawnedAt >= $this->fastDeathsSince) {
+                $this->resetFastDeaths($pid);
+            }
+
+            ($this->logger)('Respawning replacement worker...');
+            $this->respawnWorker();
+
+            return;
+        }
+
+        if ($this->fastDeaths++ === 0) {
+            $this->fastDeathsSince = (int) $now;
+        }
+
+        $previous = $this->fastDeathBackoff;
+        $this->fastDeathBackoff = clamp($this->fastDeathBackoff * 2, 1.0, self::RESPAWN_BACKOFF_MAX);
+        $this->pendingRespawns++;
+        $this->respawnRetryAt = max($this->respawnRetryAt, $now + $this->fastDeathBackoff);
+
+        if ($this->fastDeathBackoff !== $previous) {
+            ($this->logger)(sprintf(
+                'WARN Worker PID %d %s %.1fs after its spawn; respawning in %ss (doubling per worker that dies within %ds, up to %ss).',
+                $pid, $ending, $age, $this->fastDeathBackoff, self::FAST_DEATH_SECONDS, self::RESPAWN_BACKOFF_MAX,
+            ));
+        }
+
+        if ($this->fastDeaths === self::FAST_DEATHS_BEFORE_ERROR) {
+            ($this->errorLogger ?? $this->logger)(sprintf(
+                '%d workers in a row died within %ds of their spawn; the last, PID %d, %s (%s). Workers are respawned on a backoff of up to %ss until one runs longer.',
+                $this->fastDeaths, self::FAST_DEATH_SECONDS, $pid, $ending, self::fastDeathHint($status), self::RESPAWN_BACKOFF_MAX,
+            ));
+        }
+    }
+
+    /**
+     * End a run of fast deaths once a worker spawned during it has run {@see FAST_DEATH_SECONDS}.
+     *
+     * Only such a worker shows the cause is gone: a worker spawned before the run
+     * started proves nothing about the ones that keep dying.
+     */
+    private function resetFastDeathsOnSurvivor(?float $now = null): void
+    {
+        if ($this->fastDeaths === 0) {
+            return;
+        }
+
+        $now ??= microtime(true);
+
+        foreach ($this->workerPids as $pid => $ignored) {
+            $spawnedAt = $this->workerSpawnedAt[$pid] ?? null;
+
+            if ($spawnedAt !== null && $spawnedAt >= $this->fastDeathsSince && $now - $spawnedAt >= self::FAST_DEATH_SECONDS) {
+                $this->resetFastDeaths($pid);
+
+                return;
+            }
+        }
+    }
+
+    private function resetFastDeaths(int $survivor): void
+    {
+        if ($this->fastDeaths === 0) {
+            return;
+        }
+
+        ($this->logger)("Worker PID {$survivor} ran ".self::FAST_DEATH_SECONDS.'s: workers start again, respawns are immediate.');
+        $this->fastDeaths = 0;
+        $this->fastDeathsSince = 0;
+        $this->fastDeathBackoff = 0.0;
+    }
+
+    /** An end the worker chose: 0 for an orderly stop, 12 for the memory limit. */
+    private static function isOrderlyStop(int $status): bool
+    {
+        return pcntl_wifexited($status)
+            && in_array(pcntl_wexitstatus($status), [Worker::EXIT_SUCCESS, Worker::EXIT_MEMORY_LIMIT], true);
+    }
+
+    /** What the master can tell about a worker that died young, from its status alone. */
+    private static function fastDeathHint(int $status): string
+    {
+        return match (true) {
+            pcntl_wifexited($status) && pcntl_wexitstatus($status) === TorqueWorkerCommand::EXIT_CONFIG => 'the worker refused a setting at boot, for example FLEDGE_EVENT_LOOP; its "[torque:worker] FATAL" line on stderr names it',
+            pcntl_wifsignaled($status) && pcntl_wtermsig($status) === SIGKILL => 'a SIGKILL this master did not send: the exec of the PHP binary failed (a "[Torque] Worker exec" line on stderr says why, for example a PHP_BINARY gone after an upgrade) or the system killed it',
+            default => 'see the worker output on stderr, for example an exception while the app boots',
+        };
+    }
+
+    /** "exited (code N)", "killed by signal N (SIGNAME)" or "exited (unknown status)". */
+    private static function describeExit(int $status): string
+    {
+        if (pcntl_wifexited($status)) {
+            return 'exited (code '.pcntl_wexitstatus($status).')';
+        }
+
+        if (pcntl_wifsignaled($status)) {
+            $signal = pcntl_wtermsig($status);
+
+            return "killed by signal {$signal} (".match ($signal) {
+                1 => 'SIGHUP', 2 => 'SIGINT', 6 => 'SIGABRT', 9 => 'SIGKILL',
+                11 => 'SIGSEGV', 13 => 'SIGPIPE', 15 => 'SIGTERM',
+                default => 'SIG'.$signal,
+            }.')';
+        }
+
+        return 'exited (unknown status)';
     }
 
     /**
@@ -1589,18 +1778,15 @@ LUA;
             pcntl_signal(SIGALRM, SIG_DFL);
             pcntl_alarm($limit + self::LONG_WAIT_ALERT_KILL_SLACK);
 
-            pcntl_exec(PHP_BINARY, [
+            // The master reads a SIGKILL it did not send as a child that never ran.
+            self::execOrDie($this->phpBinary, [
                 $this->artisanPath,
                 'torque:long-wait-alert',
                 $queue,
                 (string) $seconds,
                 (string) $threshold,
                 "--limit={$limit}",
-            ]);
-
-            // Not exit(): that would run the shutdown work of a copy of the master.
-            // The master reads a SIGKILL it did not send as a child that never ran.
-            posix_kill((int) getmypid(), SIGKILL);
+            ], 'Long-wait alert');
         }
 
         $this->longWaitAlerts[$pid] = [
