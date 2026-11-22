@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.4.0] - 2026-11-21
+## [2.4.0] - 2026-11-22
 
 ### Breaking Changes
 - PHP requirement raised to `^8.6`; PHP 8.5 is no longer supported.
@@ -909,7 +909,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.3.2...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/webpatser/torque/compare/v2.3.2...v2.4.0
 [2.3.2]: https://github.com/webpatser/torque/compare/v2.3.1...v2.3.2
 [2.3.1]: https://github.com/webpatser/torque/compare/v2.3.0...v2.3.1
 [2.2.1]: https://github.com/webpatser/torque/compare/v2.2.0...v2.2.1
