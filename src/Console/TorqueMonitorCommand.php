@@ -13,7 +13,7 @@ use Webpatser\Torque\Support\StreamQueueResolver;
 use function Fledge\Async\Redis\createRedisClient;
 
 /**
- * Real-time terminal dashboard for Torque — htop-style monitor.
+ * Real-time terminal dashboard for Torque: htop-style monitor.
  *
  * Usage:
  *   php artisan torque:monitor
@@ -118,7 +118,7 @@ final class TorqueMonitorCommand extends Command
 
         $this->lastLineCount = $currentCount;
 
-        // Single write — minimal I/O, zero flicker.
+        // Single write: minimal I/O, zero flicker.
         $this->output->write($frame);
     }
 

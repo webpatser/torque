@@ -22,7 +22,7 @@ use function Fledge\Async\Redis\createRedisClient;
 | metrics, the pause flag, and the dead-letter stream.
 |
 | If this suite ever fails, it means a new feature introduced a Redis key
-| that is not prefix-scoped — a regression that would corrupt data across
+| that is not prefix-scoped, a regression that would corrupt data across
 | projects on a shared Redis.
 |
 */

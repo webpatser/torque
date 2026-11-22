@@ -8,7 +8,7 @@ use Webpatser\Torque\Torque;
 /**
  * The Torque helper inlines the committed `dist/torque.css` stylesheet into the
  * dashboard layout. The dashboard itself is Livewire 4 + Blade, so there is no
- * JavaScript bundle to ship — Livewire provides the runtime in the host app.
+ * JavaScript bundle to ship, Livewire provides the runtime in the host app.
  */
 function torquePackageRoot(): string
 {

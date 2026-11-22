@@ -356,7 +356,7 @@ LUA;
      * Publish a single worker's metrics to its dedicated Redis hash.
      *
      * Key: `{prefix}worker:{workerId}`
-     * A TTL is set on every publish as a heartbeat — if the worker dies, the
+     * A TTL is set on every publish as a heartbeat, if the worker dies, the
      * key expires and disappears from the dashboard automatically.
      *
      * Two round trips: the hash with its expiry, then the index entry. They
@@ -1763,7 +1763,7 @@ LUA;
      * Aggregate metrics on-the-fly from individual worker hashes.
      *
      * Unlike {@see getAggregatedMetrics()} which reads a pre-computed hash,
-     * this builds a summary directly from `{prefix}worker:*` keys — no
+     * this builds a summary directly from `{prefix}worker:*` keys, no
      * master process required.
      *
      * @param  array<string, array<string, string>>  $workers  Output of {@see getAllWorkerMetrics()}.
@@ -2344,7 +2344,7 @@ LUA;
     /**
      * Lazily create the Redis client on first use.
      *
-     * A single dedicated connection is sufficient — metrics publishing
+     * A single dedicated connection is sufficient, metrics publishing
      * is infrequent and non-blocking.
      *
      * With a read timeout a reply lost to a half-open socket fails the call

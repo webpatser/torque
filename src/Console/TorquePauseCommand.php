@@ -16,7 +16,7 @@ use function Fledge\Async\Redis\createRedisClient;
  * Pause or resume the Torque queue worker.
  *
  * Sets or removes the `{prefix}paused` key in Redis. Workers check this key
- * in their main loop — when set, they skip reading new jobs but keep running
+ * in their main loop, when set, they skip reading new jobs but keep running
  * so in-flight jobs can complete.
  *
  * Resuming additionally force-closes any open circuit breaker, so an operator

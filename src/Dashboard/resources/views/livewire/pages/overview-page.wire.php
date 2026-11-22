@@ -32,7 +32,7 @@ new class extends Component
         } catch (Throwable $e) {
             report($e);
             // Mutating a public property from within a computed is technically
-            // an anti-pattern, but only a terminal error path — Livewire won't
+            // an anti-pattern, but only a terminal error path, Livewire won't
             // loop because the error is idempotent for a given Redis failure.
             $this->activeJobsError = 'Failed to fetch active jobs.';
 

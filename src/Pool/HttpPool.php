@@ -20,7 +20,7 @@ use Fledge\Async\Sync\Semaphore;
  * at most $maxConcurrent requests may be in-flight at the same time.
  *
  * When all slots are taken, `request()` suspends the calling Fiber until
- * a slot opens — no busy-waiting, no exceptions.
+ * a slot opens, no busy-waiting, no exceptions.
  *
  * Usage:
  *

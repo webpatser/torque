@@ -23,7 +23,7 @@ final class MetricsCollector
 
     public private(set) int $activeSlots = 0;
 
-    /** Peak active slots since last snapshot — captures true concurrency. */
+    /** Peak active slots since last snapshot, captures true concurrency. */
     private int $peakActiveSlots = 0;
 
     public private(set) int $totalSlots;

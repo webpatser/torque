@@ -83,7 +83,7 @@ it('respects pool size limit', function () {
         $conn3->release();
     });
 
-    // Give the event loop a tick — the third checkout should still be waiting.
+    // Give the event loop a tick, the third checkout should still be waiting.
     \Fledge\Async\delay(0.05);
     expect($acquired)->toBeFalse();
 

@@ -40,7 +40,7 @@ it('pushes a job to Redis stream', function () {
     $queue = app('queue')->connection('torque');
 
     // This requires a running Redis. If Redis is not available, this test will
-    // throw a connection exception — which is expected for CI without Redis.
+    // throw a connection exception, which is expected for CI without Redis.
     try {
         $messageId = $queue->pushRaw(json_encode([
             'uuid' => 'dispatch-test-1',

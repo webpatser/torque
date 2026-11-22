@@ -20,7 +20,7 @@ use Webpatser\Torque\Support\ProcessInspector;
  * command polls for the PID-file flip and signals the drain as well
  * (idempotent with the master-to-master signal). `--drain` skips the spawn
  * step and only signals; use it when an external supervisor (systemd, k8s
- * preStop, Supervisor) owns spawning the replacement — under a supervisor the
+ * preStop, Supervisor) owns spawning the replacement, under a supervisor the
  * spawned takeover master would escape supervision, so `--drain` is the
  * correct production mode there.
  *

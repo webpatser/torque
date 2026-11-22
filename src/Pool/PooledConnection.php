@@ -28,7 +28,7 @@ final class PooledConnection
     /**
      * Return the connection to the pool and release the semaphore slot.
      *
-     * Safe to call multiple times — subsequent calls are no-ops.
+     * Safe to call multiple times, subsequent calls are no-ops.
      */
     public function release(): void
     {

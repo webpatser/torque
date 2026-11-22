@@ -59,7 +59,7 @@ it('recommends no change when usage is in normal range', function () {
         ['active' => 28, 'total' => 50],
     ]);
 
-    // Average: (25+30+20+28) / 200 = 0.515 — between 0.20 and 0.85
+    // Average: (25+30+20+28) / 200 = 0.515, between 0.20 and 0.85
     expect($decision)->toBe(ScaleDecision::NoChange);
 });
 

@@ -10,7 +10,7 @@ namespace Webpatser\Torque\Job;
  * Laravel singletons (auth guard, request instance, config overrides) are shared
  * across all Fibers in a worker process. Two concurrent jobs could interfere with
  * each other. CoroutineContext provides per-Fiber isolation using a WeakMap keyed
- * by the Fiber instance — when a Fiber is garbage collected, its context is
+ * by the Fiber instance, when a Fiber is garbage collected, its context is
  * automatically cleaned up. No memory leaks.
  *
  * Inspired by Hyperf/Hypervel's coroutine context pattern.
@@ -37,7 +37,7 @@ final class CoroutineContext
         $fiber = \Fiber::getCurrent();
         if ($fiber === null) {
             return;
-        } // Not in a Fiber — no isolation needed.
+        } // Not in a Fiber, no isolation needed.
 
         self::$storage[$fiber] ??= [];
         $data = self::$storage[$fiber];

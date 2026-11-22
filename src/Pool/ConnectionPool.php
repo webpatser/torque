@@ -12,7 +12,7 @@ use SplQueue;
  * Generic async-safe connection pool backed by a LocalSemaphore.
  *
  * When all connections are checked out, `checkout()` suspends the calling
- * Fiber until a slot is freed — no busy-waiting, no exceptions.
+ * Fiber until a slot is freed, no busy-waiting, no exceptions.
  *
  * The factory closure is called lazily: connections are only created when
  * the pool has no idle connections and hasn't hit maxSize yet.
@@ -76,7 +76,7 @@ final class ConnectionPool
     /**
      * Return a raw connection to the idle queue.
      *
-     * Called by PooledConnection::release() — not intended for direct use.
+     * Called by PooledConnection::release(), not intended for direct use.
      *
      * @internal
      */

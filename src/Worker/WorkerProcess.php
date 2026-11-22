@@ -304,7 +304,7 @@ LUA;
     /** hrtime seconds of the last WorkerIdle, so idle slots do not flood listeners. */
     private ?float $lastIdleAt = null;
 
-    /** Limits — set once in run(), checked by timers to know when to cancel. */
+    /** Limits: set once in run(), checked by timers to know when to cancel. */
     private int $maxJobs = 10_000;
 
     private int $maxLifetime = 3600;
@@ -365,7 +365,7 @@ LUA;
     }
 
     /**
-     * Main entry point — blocks until the worker is stopped or limits are reached.
+     * Main entry point: blocks until the worker is stopped or limits are reached.
      *
      * Sets up the event loop callbacks, installs signal handlers, and registers
      * the polling and delayed-job-migration timers.
@@ -1303,7 +1303,7 @@ LUA;
             $this->migrateDelayedJobs($redisPool, $queues, $buildStreamKey);
         });
 
-        // Metrics publishing timer — pushes worker snapshot to Redis for the dashboard.
+        // Metrics publishing timer, pushes worker snapshot to Redis for the dashboard.
         // Keeps publishing while draining so the dashboard does not blink to
         // "0 workers" before the exit. An idle worker now exits within a tick, so
         // this normally publishes once more; it still matters for a worker held
@@ -1450,7 +1450,7 @@ LUA;
         try {
             $metricsPublisher->removeWorkerMetrics($this->consumerId);
         } catch (\Throwable) {
-            // Best-effort cleanup — don't prevent shutdown.
+            // Best-effort cleanup, don't prevent shutdown.
         }
 
         $this->returnUnstartedEntries($streamQueue);
@@ -3855,8 +3855,8 @@ LUA;
      * Determine if the application's exception handler wants this exception to
      * stop job retries (Laravel v13.17.0 dontRetry / dontRetryWhen).
      *
-     * Guarded by method_exists so handlers from older framework versions —
-     * which have no shouldStopRetries() — keep the attempt-count behaviour.
+     * Guarded by method_exists so handlers from older framework versions,
+     * which have no shouldStopRetries(), keep the attempt-count behaviour.
      */
     private function shouldStopRetries(\Throwable $exception): bool
     {

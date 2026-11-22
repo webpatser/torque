@@ -23,7 +23,7 @@ use function Fledge\Async\Redis\createRedisClient;
  * events (queued, started, completed, failed, etc.) plus optional custom events
  * emitted by the job via the {@see Streamable} trait.
  *
- * Events are recorded by listening to Laravel's built-in queue events —
+ * Events are recorded by listening to Laravel's built-in queue events,
  * no changes to WorkerProcess needed.
  */
 final class JobStreamRecorder

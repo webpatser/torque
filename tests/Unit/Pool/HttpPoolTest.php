@@ -58,7 +58,7 @@ it('limits concurrency via the semaphore', function () {
         });
     });
 
-    // Give the event loop a tick — third should still be waiting.
+    // Give the event loop a tick, third should still be waiting.
     \Fledge\Async\delay(0.01);
     expect($thirdAcquired)->toBeFalse();
 

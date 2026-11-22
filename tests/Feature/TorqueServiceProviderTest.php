@@ -82,13 +82,13 @@ it('registers the torque queue connector', function () {
     /** @var QueueManager $manager */
     $manager = app('queue');
 
-    // The connector is registered — attempting to resolve it should not throw
+    // The connector is registered, attempting to resolve it should not throw
     // an "unsupported driver" exception. It will throw a Redis connection error
     // instead, which proves the connector itself is wired up.
     try {
         $manager->connection('torque');
     } catch (RedisException $e) {
-        // Expected — Redis isn't running in CI. The connector resolved.
+        // Expected: Redis isn't running in CI. The connector resolved.
         expect(true)->toBeTrue();
 
         return;

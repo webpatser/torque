@@ -61,7 +61,7 @@ LUA;
     /** @var array<int, true> Map of child PIDs to `true`. */
     public private(set) array $workerPids = [];
 
-    /** @var array<int, true> PIDs being scaled down — should not be respawned on exit. */
+    /** @var array<int, true> PIDs being scaled down, should not be respawned on exit. */
     private array $scalingDownPids = [];
 
     private bool $shouldStop = false;
@@ -727,7 +727,7 @@ LUA;
                 usleep(100_000);
             }
 
-            // Reap every exited child (SIGCHLD coalesces — one delivery may
+            // Reap every exited child (SIGCHLD coalesces, one delivery may
             // cover multiple exits).
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
                 $status = Narrow::int($status);
@@ -2121,8 +2121,8 @@ LUA;
      * - A takeover master acquires the master lock lazily, the moment the
      *   drained old master exits and the kernel releases it.
      * - The PID file self-heals: rewritten when missing, reclaimed when it
-     *   holds a dead or foreign PID, and — the losing side of a clobber
-     *   race — this master self-demotes into a drain when another LIVE
+     *   holds a dead or foreign PID, and, the losing side of a clobber
+     *   race, this master self-demotes into a drain when another LIVE
      *   torque master owns the file.
      */
     private function maintainLease(): void

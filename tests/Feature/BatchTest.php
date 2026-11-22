@@ -12,7 +12,7 @@ it('dispatches multiple jobs for batch processing', function () {
     try {
         $ids = [];
 
-        // Simulate what Bus::batch() does — dispatches multiple jobs individually.
+        // Simulate what Bus::batch() does, dispatches multiple jobs individually.
         for ($i = 0; $i < 3; $i++) {
             $ids[] = $queue->pushRaw(json_encode([
                 'uuid' => "batch-job-{$i}",

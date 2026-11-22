@@ -208,7 +208,7 @@ final class TorqueStopCommand extends Command
             $waited += self::POLL_INTERVAL;
         }
 
-        // Graceful shutdown timed out — escalate to SIGKILL on entire process group.
+        // Graceful shutdown timed out, escalate to SIGKILL on entire process group.
         $this->components->warn(
             "Graceful shutdown timed out after {$gracefulTimeout} seconds. Sending SIGKILL...",
         );

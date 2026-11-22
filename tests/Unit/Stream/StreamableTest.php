@@ -90,7 +90,7 @@ it('does not throw when recorder is not bound', function () {
     $fakeJob = new FakeStreamableJob;
     $fakeJob->job = new FakeQueueJob('some-uuid');
 
-    // Should not throw — silently ignored.
+    // Should not throw, silently ignored.
     $fakeJob->emit('test message');
 
     expect(true)->toBeTrue();
