@@ -28,10 +28,17 @@ $runDir ??= $argv[1];
 
 $boot = static function () use ($runDir): void {
     require_once dirname(__DIR__, 2).'/vendor/autoload.php';
+    require_once __DIR__.'/use-test-redis.php';
+
+    $redis = json_decode((string) file_get_contents($runDir.'/config.json'), true, flags: JSON_THROW_ON_ERROR)['redis'];
+
+    torque_fixture_use_redis($redis['uri'], $redis['prefix']);
 
     $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
     $app->register(LivewireServiceProvider::class);
     $app->register(TorqueServiceProvider::class);
+
+    torque_fixture_assert_redis($redis['uri'], $redis['prefix']);
 
     config([
         'app.key' => 'base64:'.base64_encode(str_repeat('a', 32)),

@@ -25,6 +25,7 @@ use Symfony\Component\Console\Output\StreamOutput;
 use Webpatser\Torque\TorqueServiceProvider;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
+require_once __DIR__.'/use-test-redis.php';
 
 $isWorker = isset($runDir);
 $runDir ??= $argv[1];
@@ -34,11 +35,15 @@ if (! $isWorker) {
     cli_set_process_title('torque:start fleet-fixture');
 }
 
+$settings = json_decode((string) file_get_contents($runDir.'/config.json'), true, flags: JSON_THROW_ON_ERROR);
+
+torque_fixture_use_redis($settings['redis']['uri'], $settings['redis']['prefix']);
+
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
 $app->register(TorqueServiceProvider::class);
 
-$settings = json_decode((string) file_get_contents($runDir.'/config.json'), true, flags: JSON_THROW_ON_ERROR);
+torque_fixture_assert_redis($settings['redis']['uri'], $settings['redis']['prefix']);
 
 config([
     'app.key' => 'base64:'.base64_encode(str_repeat('a', 32)),

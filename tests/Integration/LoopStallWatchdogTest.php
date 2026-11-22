@@ -114,7 +114,8 @@ function torque_stall_redis_proxy(array $ctx): array
 
     torque_stall_wait($ctx, 'the proxy', fn (): bool => (string) @file_get_contents($portFile) !== '', 5);
 
-    return ['process' => $process, 'uri' => 'redis://127.0.0.1:'.file_get_contents($portFile)];
+    // Keep the database of the proxied URI, or the fleet writes to db 0 of the target.
+    return ['process' => $process, 'uri' => 'redis://127.0.0.1:'.file_get_contents($portFile).($target['path'] ?? '')];
 }
 
 /** @param array<string, mixed> $ctx */

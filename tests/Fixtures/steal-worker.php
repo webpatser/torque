@@ -19,12 +19,19 @@ use Webpatser\Torque\TorqueServiceProvider;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
+require_once __DIR__.'/use-test-redis.php';
 
 [, $logFile, $settings] = $argv;
+
+$settings = json_decode($settings, true, flags: JSON_THROW_ON_ERROR);
+
+torque_fixture_use_redis($settings['redis']['uri'], $settings['redis']['prefix']);
 
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
 $app->register(TorqueServiceProvider::class);
+
+torque_fixture_assert_redis($settings['redis']['uri'], $settings['redis']['prefix']);
 
 config([
     'app.key' => 'base64:'.base64_encode(str_repeat('a', 32)),
@@ -46,7 +53,6 @@ Event::listen(JobAttempted::class, static function (JobAttempted $event) use ($l
 });
 
 // Plain assignment for these two: merging would keep the default config's entries.
-$settings = json_decode($settings, true, flags: JSON_THROW_ON_ERROR);
 $config = array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', $settings);
 $config['queues'] = $settings['queues'];
 $config['streams'] = $settings['streams'];

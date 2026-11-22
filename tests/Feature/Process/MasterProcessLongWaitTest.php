@@ -155,6 +155,12 @@ beforeEach(function () {
     mkdir($this->runDir.'/storage/framework', 0777, true);
     file_put_contents($this->runDir.'/artisan', "<?php\n\$runDir = __DIR__;\nrequire ".var_export(dirname(__DIR__, 2).'/Fixtures/long-wait-app.php', true).";\n");
 
+    // The children of an in-process master boot their app from this too, so they
+    // stay on the test Redis; startRealMaster() overwrites it with a full config.
+    file_put_contents($this->runDir.'/config.json', json_encode([
+        'redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix, 'cluster' => false],
+    ], JSON_THROW_ON_ERROR));
+
     $this->master = function (array $waits, ?string $uri = null, array $settings = []): MasterProcess {
         // The master takes its children's script from base_path('artisan').
         app()->setBasePath($this->runDir);

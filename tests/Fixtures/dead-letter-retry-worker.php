@@ -27,14 +27,19 @@ use Webpatser\Torque\Worker\WorkerProcess;
 use function Fledge\Async\Redis\createRedisClient;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
+require_once __DIR__.'/use-test-redis.php';
 
 [, $redisUri, $prefix, $group, $queue, $logFile, $settingsJson] = $argv;
 
 $settings = json_decode($settingsJson, true, flags: JSON_THROW_ON_ERROR);
 
+torque_fixture_use_redis($redisUri, $prefix);
+
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
 $app->register(TorqueServiceProvider::class);
+
+torque_fixture_assert_redis($redisUri, $prefix);
 
 config([
     'app.key' => 'base64:'.base64_encode(str_repeat('a', 32)),

@@ -30,13 +30,18 @@ use Webpatser\Torque\Worker\WorkerProcess;
 use function Fledge\Async\delay;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
+require_once __DIR__.'/use-test-redis.php';
 
 [, $redisUri, $prefix, $group, $queue, $logFile, $maxJobs, $concurrency, $slowReset] = $argv;
 $sharedScopedBindings = $argv[9] ?? '';
 
+torque_fixture_use_redis($redisUri, $prefix);
+
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
 $app->register(TorqueServiceProvider::class);
+
+torque_fixture_assert_redis($redisUri, $prefix);
 
 // A job's dispatch() resolves the torque connection through these, so it has to
 // reach the same Redis and prefix as the worker.

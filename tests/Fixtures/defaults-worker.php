@@ -18,12 +18,17 @@ use Webpatser\Torque\TorqueServiceProvider;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
+require_once __DIR__.'/use-test-redis.php';
 
 [, $redisUri, $prefix, $group, $queue, $statusFile] = $argv;
+
+torque_fixture_use_redis($redisUri, $prefix);
 
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
 $app->register(TorqueServiceProvider::class);
+
+torque_fixture_assert_redis($redisUri, $prefix);
 
 config([
     'app.key' => 'base64:'.base64_encode(str_repeat('a', 32)),

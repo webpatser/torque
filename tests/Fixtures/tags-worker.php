@@ -17,19 +17,17 @@ use Webpatser\Torque\Worker\WorkerProcess;
 
 require dirname(__DIR__, 2).'/vendor/autoload.php';
 require __DIR__.'/TagFixtures.php';
+require_once __DIR__.'/use-test-redis.php';
 
 [, $redisUri, $prefix, $group, $queue, $maxJobs] = $argv;
 
-// The recorder is built when the provider boots, so the test keyspace must be
-// in the environment before the application exists.
-foreach (['TORQUE_REDIS_URI' => $redisUri, 'TORQUE_PREFIX' => $prefix] as $key => $value) {
-    putenv("$key=$value");
-    $_ENV[$key] = $_SERVER[$key] = $value;
-}
+torque_fixture_use_redis($redisUri, $prefix);
 
 $app = Application::create(options: ['extra' => ['dont-discover' => ['*']]]);
 $app->register(LivewireServiceProvider::class);
 $app->register(TorqueServiceProvider::class);
+
+torque_fixture_assert_redis($redisUri, $prefix);
 
 config([
     'app.key' => 'base64:'.base64_encode(str_repeat('a', 32)),
