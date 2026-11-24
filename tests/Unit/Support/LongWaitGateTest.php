@@ -99,3 +99,14 @@ it('keeps only queues with a positive threshold', function () {
         ->toBe(['a' => 60, 'c' => 30])
         ->and(LongWaitGate::thresholds([]))->toBe([]);
 });
+
+it('keeps a numeric queue name, which comes back as an int key the gate takes once cast', function () {
+    $thresholds = LongWaitGate::thresholds(['2' => 60]);
+    $gate = new LongWaitGate;
+
+    expect(array_keys($thresholds))->toBe([2]);
+
+    foreach ($thresholds as $queue => $threshold) {
+        expect($gate->shouldAlert((string) $queue, 90.0, $threshold, 1000.0))->toBeTrue();
+    }
+});

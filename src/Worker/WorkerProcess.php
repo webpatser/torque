@@ -61,6 +61,7 @@ use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Telemetry\OtelBridge;
 use Webpatser\Torque\Torque;
 
 use function Fledge\Async\async;
@@ -1315,9 +1316,16 @@ LUA;
         // tick activated it, and that same activation installed the SIGTERM and
         // SIGINT handlers above, so a worker seen as ready drains on SIGTERM
         // instead of dying of it. Keep the first publish inside the loop.
+        //
+        // The same snapshot feeds the optional OpenTelemetry bridge (null unless
+        // `metrics.otel` is on and fledge-apm binds a MeterProvider): taking a
+        // second one would reset the peak the dashboard reads.
         $metricsInterval = Narrow::float($metricsConfig['publish_interval'] ?? null, 1.0);
-        Loop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics) {
-            $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
+        $otel = OtelBridge::make($this->config);
+        Loop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics, $otel) {
+            $snapshot = $metrics->snapshot();
+            $metricsPublisher->publishWorkerMetrics($this->consumerId, $snapshot);
+            $otel?->recordWorker($snapshot);
         });
 
         // Stalled-job watchdog: log a WARN line for any slot that has been

@@ -544,10 +544,18 @@ return [
     |--------------------------------------------------------------------------
     | `enabled` turns the master's fleet metrics off; `publish_interval` is the
     | seconds between publishes.
+    |
+    | `otel` (TORQUE_OTEL_METRICS) also exports Torque's numbers as
+    | OpenTelemetry metrics through webpatser/fledge-apm: worker slots from each
+    | worker, the worker count, open circuit breakers and long-wait alerts from
+    | the master. It needs fledge-apm with its metrics on (APM_ENABLED and
+    | APM_METRICS_ENABLED), which binds the MeterProvider Torque uses; without
+    | that binding the setting does nothing.
     */
     'metrics' => [
         'enabled' => true,
         'publish_interval' => 1,
+        'otel' => (bool) env('TORQUE_OTEL_METRICS', false),
 
         /*
          * Retention of the minute-resolution history, in seconds. One field per

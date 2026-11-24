@@ -18,11 +18,15 @@
     },
     "suggest": {
         "laravel/slack-notification-channel": "Required for Slack long-wait alerts (Torque::routeSlackNotificationsTo()).",
+        "open-telemetry/api": "Required for OpenTelemetry metrics (TORQUE_OTEL_METRICS=true); fledge-apm brings it.",
+        "webpatser/fledge-apm": "Exports Torque's OpenTelemetry metrics (TORQUE_OTEL_METRICS=true) when its own metrics are on (APM_METRICS_ENABLED=true).",
         "ext-igbinary": "Enables ~2x faster job payload encoding when TORQUE_SERIALIZER=igbinary is set, and globally speeds up PHP serialize() (sessions, cache) when igbinary.compact_strings is on."
     },
     "require-dev": {
         "larastan/larastan": "^3.10",
         "laravel/pint": "^1.29",
+        "open-telemetry/api": "^1.10",
+        "open-telemetry/sdk": "^1.17",
         "orchestra/testbench": "^11.0",
         "pestphp/pest": "^5.0"
     },
@@ -50,7 +54,9 @@
     "config": {
         "sort-packages": true,
         "allow-plugins": {
-            "pestphp/pest-plugin": true
+            "pestphp/pest-plugin": true,
+            "php-http/discovery": false,
+            "tbachert/spi": false
         }
     },
     "minimum-stability": "stable",

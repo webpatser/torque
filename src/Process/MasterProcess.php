@@ -12,6 +12,7 @@ use Fledge\Async\Redis\RedisException;
 use Illuminate\Queue\Worker;
 use Illuminate\Support\ConfigurationUrlParser;
 use Webpatser\Torque\Console\TorqueWorkerCommand;
+use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -26,6 +27,8 @@ use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
+use Webpatser\Torque\Telemetry\OtelBridge;
+use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
 use function Fledge\Async\Redis\createRedisConnector;
@@ -248,6 +251,17 @@ LUA;
 
     /** Master-side client for the pause read and the owed-respawn field. */
     private ?RedisClient $masterRedis = null;
+
+    /** The OpenTelemetry bridge, null while `metrics.otel` is off or fledge-apm binds no MeterProvider. */
+    private ?OtelBridge $otel = null;
+
+    private bool $otelResolved = false;
+
+    /** Clock time of the next breaker read for the circuit gauge, null before the first. */
+    private ?float $otelCircuitsDueAt = null;
+
+    /** Seconds between two breaker reads for the circuit gauge. */
+    private const int OTEL_CIRCUIT_CHECK_INTERVAL = 5;
 
     /**
      * Forks the process: `pcntl_fork()` in production, replaced by a test to play the kernel.
@@ -763,6 +777,7 @@ LUA;
                 $this->publishAggregateMetrics();
                 $this->handleHousekeepingTick();
                 $this->handleLongWaitTick();
+                $this->publishOtelMetrics();
 
                 if ($this->autoScaler !== null) {
                     $this->evaluateAutoscale();
@@ -1720,11 +1735,18 @@ LUA;
             );
 
             foreach ($thresholds as $name => $threshold) {
+                // PHP turns a numeric queue name into an int key.
+                $name = (string) $name;
                 $createdAt = $queue->creationTimeOfOldestPendingJob($name);
                 $age = $createdAt === null ? null : max(0.0, $now - $createdAt);
 
-                if ($gate->shouldAlert($name, $age, $threshold, $now)
-                    && ! $this->alertLongWait($name, (int) floor($age ?? 0), $threshold)) {
+                if (! $gate->shouldAlert($name, $age, $threshold, $now)) {
+                    continue;
+                }
+
+                if ($this->alertLongWait($name, (int) floor($age ?? 0), $threshold)) {
+                    $this->otel()?->recordLongWait($name);
+                } else {
                     $gate->rearm($name);
                 }
             }
@@ -2241,6 +2263,149 @@ LUA;
 
         posix_kill($oldPid, SIGUSR2);
         ($this->logger)("Signalled old master (PID {$oldPid}) to drain.");
+    }
+
+    /**
+     * The OpenTelemetry bridge, resolved once: null while `metrics.otel` is off or
+     * fledge-apm binds no MeterProvider, which leaves the tick one null check.
+     */
+    private function otel(): ?OtelBridge
+    {
+        if (! $this->otelResolved) {
+            $this->otelResolved = true;
+            $this->otel = OtelBridge::make($this->config);
+        }
+
+        return $this->otel;
+    }
+
+    /**
+     * Hand the fleet numbers to the OpenTelemetry bridge and export when due.
+     *
+     * Fleet-wide numbers come from the master only: every worker reporting them
+     * would multiply them by the fleet size when summed. The breaker is read from
+     * Redis, not followed through its events: those fire in whichever worker or
+     * command tripped or closed it, and an open breaker ends by expiry with none.
+     *
+     * Runs on the maintenance tick, whose time the watchdog discounts: the export
+     * is synchronous, at most once per interval and bounded by the OTLP timeouts
+     * ({@see OtelBridge::collectMaster()}). Nothing it does reaches the loop as
+     * an exception.
+     *
+     * The clock is injectable so it can be exercised without the monitor loop.
+     */
+    private function publishOtelMetrics(?float $now = null): void
+    {
+        try {
+            $otel = $this->otel();
+
+            if ($otel === null) {
+                return;
+            }
+
+            $now ??= microtime(true);
+            $circuits = null;
+
+            if ($this->otelCircuitsDueAt === null || $now >= $this->otelCircuitsDueAt) {
+                $this->otelCircuitsDueAt = $now + self::OTEL_CIRCUIT_CHECK_INTERVAL;
+                $circuits = $this->circuitStates();
+            }
+
+            $otel->recordMaster(count($this->workerPids), $circuits);
+            $otel->collectMaster();
+        } catch (\Throwable) {
+            // Telemetry never costs the master its supervision loop.
+        }
+    }
+
+    /**
+     * Breaker state of every configured queue that has a breaker, as the workers
+     * read it: queue => open. Half-open counts as closed, since pickup resumed.
+     * Null when Redis could not be read for every one of them, so the gauge
+     * keeps its last values.
+     *
+     * @return array<string, bool>|null
+     */
+    private function circuitStates(): ?array
+    {
+        $cluster = Narrow::bool($this->configSection('redis')['cluster'] ?? null);
+
+        try {
+            $guarded = self::breakerGuardedQueues($this->config);
+
+            if ($guarded === []) {
+                return [];
+            }
+
+            $breaker = new CircuitBreaker(
+                redisUri: $this->redisUri(),
+                prefix: $this->redisPrefix(),
+                config: $this->configSection('circuit_breaker'),
+                streams: WorkerProcess::bareStreamConfigs(array_map(Narrow::map(...), $this->configSection('streams')), $cluster),
+                cluster: $cluster,
+                client: $this->masterRedis(),
+            );
+
+            $states = self::readCircuitStates($guarded, $breaker->isOpen(...));
+        } catch (\Throwable) {
+            $states = null;
+        }
+
+        if ($states === null) {
+            $this->masterRedis = null;
+        }
+
+        return $states;
+    }
+
+    /**
+     * Queue => open for every guarded queue, or null as soon as one read fails:
+     * a queue that was never read is unknown, not closed. Pure, no Redis.
+     *
+     * @param  list<string>  $guarded
+     * @param  Closure(string): bool  $isOpen  Throws when the state cannot be read.
+     * @return array<string, bool>|null
+     */
+    public static function readCircuitStates(array $guarded, Closure $isOpen): ?array
+    {
+        $states = [];
+
+        try {
+            foreach ($guarded as $queue) {
+                $states[$queue] = $isOpen($queue);
+            }
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $states;
+    }
+
+    /**
+     * The configured queues whose circuit breaker is on, as bare names: the ones
+     * the OpenTelemetry breaker gauge polls. Static and pure, no Redis.
+     *
+     * @param  array<array-key, mixed>  $config  The merged Torque config.
+     * @return list<string>
+     */
+    public static function breakerGuardedQueues(array $config): array
+    {
+        $cluster = Narrow::bool(Narrow::map($config['redis'] ?? null)['cluster'] ?? null);
+        $configured = $config['queues'] ?? ['default'];
+        $queues = array_values(array_unique(array_map(
+            static fn (mixed $queue): string => WorkerProcess::bareQueueName(Narrow::string($queue), $cluster),
+            is_array($configured) ? $configured : [$configured],
+        )));
+
+        // Settings only: the breaker opens no connection until it is asked for state.
+        $breaker = new CircuitBreaker(
+            redisUri: '',
+            config: Narrow::map($config['circuit_breaker'] ?? null),
+            streams: WorkerProcess::bareStreamConfigs(array_map(Narrow::map(...), Narrow::map($config['streams'] ?? null)), $cluster),
+            cluster: $cluster,
+        );
+
+        return array_values(array_filter($queues, static fn (string $queue): bool => $breaker->settingsFor($queue) !== null));
     }
 
     /**

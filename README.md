@@ -386,6 +386,7 @@ All options are in `config/torque.php`. Key settings:
 | `takeover_ready_timeout_seconds` | 30 | Seconds a takeover replacement waits for its own workers' first heartbeat before aborting the reload and leaving the old master untouched |
 | `metrics.enabled` | true | Master publishes the aggregated fleet metrics hash (real throughput from counter deltas) every `metrics.publish_interval` seconds, with a TTL so a dead publisher reads as no data |
 | `metrics.retention` | 86400 | Seconds of per-minute history kept (about 20 bytes per minute) |
+| `metrics.otel` | false | Also export Torque's numbers as OpenTelemetry metrics through `webpatser/fledge-apm` (`TORQUE_OTEL_METRICS`). Needs fledge-apm with its metrics on; see OpenTelemetry metrics |
 | `metrics.rollups.hourly_days` / `daily_days` | 90 / 730 | Days of hourly and daily `processed,failed` rollups kept, cluster-wide and per stream. Roughly 60 KB in total plus the same per stream; `daily_days` `0` keeps them forever (~7 KB a year) |
 | `dashboard.enabled` | false | The dashboard is off by default; `TORQUE_DASHBOARD=true` turns it on |
 | `dashboard.gauge_max` | null | Scale of the overview gauge in jobs/min; `null` fits it to the busiest minute of the last hour |
@@ -462,6 +463,23 @@ Override per stream, or opt a stream out entirely:
 ```
 
 State is shared across the whole fleet through Redis (every key carries an expiry) and an open breaker is expressed as a paused queue, exactly like `php artisan queue:pause <name>`. Listen for `QueueCircuitOpened` / `QueueCircuitClosed` to alert on it, check `torque:status` for a line per tripped stream, and force one closed with `php artisan torque:pause continue` or `php artisan queue:resume torque:<queue>` once the upstream problem is fixed.
+
+### OpenTelemetry metrics
+
+With [`webpatser/fledge-apm`](https://github.com/webpatser/fledge-apm) installed and its metrics on (`APM_ENABLED=true`, `APM_METRICS_ENABLED=true`), `TORQUE_OTEL_METRICS=true` exports Torque's own numbers next to fledge-apm's queue and HTTP metrics. Torque only uses the `MeterProviderInterface` fledge-apm binds in the container: without that binding, or without `open-telemetry/api`, the setting does nothing and nothing is built. Per-job metrics (processing time, wait time, retries, failures) come from fledge-apm itself, since Torque fires the stock queue events.
+
+| Instrument | Kind, unit | Reported by | Attributes |
+|---|---|---|---|
+| `torque.worker.slots.active` | observable gauge, `{slot}` | each worker | `laravel.queue.connection` |
+| `torque.worker.slots.limit` | observable gauge, `{slot}` | each worker | `laravel.queue.connection` |
+| `torque.worker.slots.usage` | observable gauge, `1` (0 to 1) | each worker | `laravel.queue.connection` |
+| `torque.master.workers` | observable gauge, `{worker}` | the master | `laravel.queue.connection` |
+| `torque.queue.circuit.open` | observable gauge, `{circuit}` (1 open, 0 closed or half-open) | the master | `laravel.queue.connection`, `messaging.destination.name` |
+| `torque.queue.long_waits` | counter, `{alert}` (alerts started, including retries and repeats) | the master | `laravel.queue.connection`, `messaging.destination.name` |
+
+Every process exports under its own `service.instance.id`; the fleet-wide numbers come from the master only. Across a fleet, sum `slots.active` and `slots.limit`, but never sum `slots.usage`: average it, or divide the sum of `slots.active` by the sum of `slots.limit`. The slot gauges read the snapshot each worker already publishes for the dashboard, and `slots.active` is the peak of the last `metrics.publish_interval` (1 second by default) as sampled at collect time, so the peaks of different workers need not coincide and their sum can overstate the slots busy at any one moment. The master reads the breaker state from Redis every 5 seconds, for queues with a breaker. `torque.queue.long_waits` counts long-wait alerts started, not distinct long waits: the 300 second retry of a failed alert and the 900 second repeat of a wait that continues each count again (the `LongWaitDetected` listeners run in a short-lived child that exports nothing).
+
+Workers mark themselves long-running for fledge-apm with the role `torque` from inside their event loop, and fledge-apm's timer exports for them every `APM_METRICS_INTERVAL`. The master's supervision loop turns only about once a second, too seldom for an asynchronous export, so it exports from its maintenance tick instead: synchronously, at most once per interval, bounded by the OTLP timeouts (about 2 seconds by default) and left out of the stall watchdog's clock. That needs a fledge-apm that provides `Metrics::collectDue()`; with an older one the master's instruments export only when it shuts down.
 
 ## Dashboard
 
@@ -879,6 +897,7 @@ Fledge's async layer started as a port of [amphp](https://amphp.org) and its eve
 - `webpatser/fledge-fiber-database`: Async MySQL for `MysqlPool`
 - `webpatser/fledge-fiber-http`: Async HTTP for `HttpPool`
 - `ext-igbinary`: ~2x faster payload encoding when `TORQUE_SERIALIZER=igbinary` is set. See [Performance](#performance).
+- `webpatser/fledge-apm` (brings `open-telemetry/api`): OpenTelemetry metrics with `TORQUE_OTEL_METRICS=true`. See [OpenTelemetry metrics](#opentelemetry-metrics).
 
 ## License
 

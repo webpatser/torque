@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional OpenTelemetry metrics through `webpatser/fledge-apm`: `metrics.otel` config key (`TORQUE_OTEL_METRICS`, default false). Each worker reports `torque.worker.slots.active`, `torque.worker.slots.limit` (`{slot}`) and `torque.worker.slots.usage` (`1`, 0 to 1) as observable gauges, read from the snapshot its publish timer already builds; the master reports `torque.master.workers` (`{worker}`) and `torque.queue.circuit.open` (`{circuit}`, 1 or 0 per queue with a breaker, read from Redis every 5 seconds) as observable gauges and `torque.queue.long_waits` (`{alert}`) as a counter of long-wait alerts started, not distinct long waits: the 300 second retry of a failed alert and the 900 second repeat of a continuing wait each count again. Attributes are `laravel.queue.connection` and, per queue, `messaging.destination.name`. Torque depends only on the `MeterProviderInterface` fledge-apm binds while its metrics are on (`APM_METRICS_ENABLED=true`); without that binding or without `open-telemetry/api` nothing is built. Workers call fledge-apm's `Metrics::markLongRunning('torque')` from inside their event loop and export on fledge-apm's timer. The master marks itself from outside the event loop and exports from its maintenance tick through fledge-apm's `Metrics::collectDue()`: synchronously, at most once per interval, bounded by the OTLP timeouts and discounted by the stall watchdog. With a fledge-apm that lacks `collectDue()` the master's instruments export only at shutdown. Across a fleet, average `torque.worker.slots.usage` (or divide summed active by summed limit) rather than summing it. `open-telemetry/api` and `webpatser/fledge-apm` are in `suggest`; `open-telemetry/api` and `open-telemetry/sdk` are dev dependencies for the tests.
+
 ## [2.4.0] - 2026-11-22
 
 ### Breaking Changes

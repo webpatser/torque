@@ -23,10 +23,11 @@ final class LongWaitGate
     /**
      * The queues with a positive threshold, as queue => seconds.
      *
-     * 0, a negative value or a non-numeric one means off.
+     * 0, a negative value or a non-numeric one means off. PHP stores a numeric
+     * queue name as an int key, so cast a key to string before using it.
      *
      * @param  array<array-key, mixed>  $waits  The `waits` config.
-     * @return array<string, int>
+     * @return array<array-key, int>
      */
     public static function thresholds(array $waits): array
     {

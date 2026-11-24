@@ -268,6 +268,20 @@ LUA;
     }
 
     /**
+     * Whether this queue's breaker is open. Unlike {@see openQueues()} a Redis
+     * failure is thrown rather than swallowed, for callers that must tell closed
+     * from unknown.
+     *
+     * @throws \Throwable When Redis cannot be read.
+     */
+    #[\NoDiscard]
+    public function isOpen(string $queue): bool
+    {
+        return $this->settingsFor($queue) !== null
+            && Narrow::int($this->redis()->execute('EXISTS', $this->key($queue, 'state'))) === 1;
+    }
+
+    /**
      * Force a breaker closed and reset its window (operator override).
      *
      * Returns true when the stream actually had an open or half-open breaker.
