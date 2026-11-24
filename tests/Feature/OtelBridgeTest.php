@@ -100,14 +100,19 @@ final class OtelBridgeApmFixture
 
     public static int $collects = 0;
 
+    /** @var list<string> */
+    public static array $calls = [];
+
     public static function markLongRunning(string $role): void
     {
         self::$marks[] = $role;
+        self::$calls[] = "mark:{$role}";
     }
 
     public static function collectDue(): bool
     {
         self::$collects++;
+        self::$calls[] = 'collectDue';
 
         return true;
     }
@@ -148,6 +153,7 @@ afterEach(function () {
 
     OtelBridgeApmFixture::$marks = [];
     OtelBridgeApmFixture::$collects = 0;
+    OtelBridgeApmFixture::$calls = [];
     OtelBridgeApmWithoutCollect::$marks = [];
 });
 
@@ -304,18 +310,22 @@ it('collects on the master tick without fledge-apm installed', function () {
     expect(fn () => $bridge?->collectMaster())->not->toThrow(Throwable::class);
 });
 
-it('marks the master once and asks fledge-apm to collect on every tick', function () {
+it('collects once before marking the master, then once per tick', function () {
     otelBridgeProvider();
     otelBridgeApm(OtelBridgeApmFixture::class);
     $bridge = OtelBridge::make(otelBridgeConfig(true));
 
     $bridge?->recordMaster(2);
     $bridge?->collectMaster();
+
+    expect(OtelBridgeApmFixture::$calls)->toBe(['collectDue', 'mark:torque', 'collectDue']);
+
     $bridge?->collectMaster();
     $bridge?->collectMaster();
 
-    expect(OtelBridgeApmFixture::$marks)->toBe(['torque'])
-        ->and(OtelBridgeApmFixture::$collects)->toBe(3);
+    expect(OtelBridgeApmFixture::$calls)->toBe(['collectDue', 'mark:torque', 'collectDue', 'collectDue', 'collectDue'])
+        ->and(OtelBridgeApmFixture::$marks)->toBe(['torque'])
+        ->and(OtelBridgeApmFixture::$collects)->toBe(4);
 });
 
 it('only marks the master when fledge-apm has no collectDue()', function () {

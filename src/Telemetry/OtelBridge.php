@@ -192,23 +192,36 @@ final class OtelBridge
      *
      * The master's monitor loop is synchronous and turns about once a second, too
      * seldom to carry an asynchronous export, so the master never runs
-     * fledge-apm's loop timer. The first call marks the process long-running from
-     * outside the event loop, which starts no timer; every call then asks
-     * fledge-apm's `Metrics::collectDue()` (0.6.0 and later), which collects at
-     * most once per export interval and waits for that export, bounded by the
-     * OTLP timeouts. Without that method the master's instruments export only at
-     * shutdown. Never throws.
+     * fledge-apm's loop timer. The first call calls `collectDue()` once before
+     * marking the process long-running, because fledge-apm treats a process as
+     * self-driven from its first `collectDue()` and only starts its backlog and
+     * loop observers on the mark when it is not; the mark itself starts no timer.
+     * Every call then asks fledge-apm's `Metrics::collectDue()` (0.6.0 and later),
+     * which collects at most once per export interval and waits for that export,
+     * bounded by the OTLP timeouts. Without that method the master's instruments
+     * export only at shutdown. Never throws.
      */
     public function collectMaster(): void
     {
-        $this->markLongRunning();
-
         $collect = [self::$apmMetrics, 'collectDue'];
+        $callable = class_exists(self::$apmMetrics) && is_callable($collect);
 
-        if (! class_exists(self::$apmMetrics) || ! is_callable($collect)) {
-            return;
+        if (! $this->marked && $callable) {
+            $this->collectGuarded($collect);
         }
 
+        $this->markLongRunning();
+
+        if ($callable) {
+            $this->collectGuarded($collect);
+        }
+    }
+
+    /**
+     * @param  callable(): mixed  $collect
+     */
+    private function collectGuarded(callable $collect): void
+    {
         try {
             $collect();
         } catch (Throwable) {
