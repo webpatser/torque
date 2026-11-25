@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-11-25
+
+### Fixed
+- The leading master now renews its leader lease after housekeeping and before the long-wait check. A slow housekeeping pass that outlived the lease could let two masters both send the same long-wait alert.
+- Three name patterns no longer accept a trailing newline: the metrics host name, the queue name in `torque:flush` and the queue name on dead-letter retry.
+
 ## [2.5.0] - 2026-11-25
 
 ### Added
@@ -935,7 +941,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.5.1...HEAD
+[2.5.1]: https://github.com/webpatser/torque/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/webpatser/torque/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/webpatser/torque/compare/v2.3.2...v2.4.0
 [2.3.2]: https://github.com/webpatser/torque/compare/v2.3.1...v2.3.2

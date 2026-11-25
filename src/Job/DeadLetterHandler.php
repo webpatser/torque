@@ -160,7 +160,7 @@ final class DeadLetterHandler
         // Structural check: keep Redis key space sane even when no explicit
         // whitelist is configured (e.g. when the handler is instantiated
         // outside the service provider).
-        if (preg_match('/^[a-zA-Z0-9_\-.:]+$/', $queue) !== 1) {
+        if (preg_match('/^[a-zA-Z0-9_\-.:]+$/D', $queue) !== 1) {
             throw new \RuntimeException("Invalid queue name: [{$queue}].");
         }
 

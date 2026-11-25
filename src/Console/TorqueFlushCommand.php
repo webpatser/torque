@@ -108,7 +108,7 @@ final class TorqueFlushCommand extends Command
             }
 
             foreach ($queues as $queue) {
-                if (! preg_match('/^[a-zA-Z0-9_\-.:{}]+$/', $queue)) {
+                if (! preg_match('/^[a-zA-Z0-9_\-.:{}]+$/D', $queue)) {
                     $this->components->error("Invalid queue name: {$queue}");
 
                     return self::FAILURE;

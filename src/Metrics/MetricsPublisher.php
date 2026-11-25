@@ -2301,7 +2301,7 @@ LUA;
     #[\NoDiscard]
     public static function normaliseHost(string $host): string
     {
-        if (preg_match('/^[A-Za-z0-9._-]{1,48}(~[0-9a-f]{6})?$/', $host) === 1) {
+        if (preg_match('/^[A-Za-z0-9._-]{1,48}(~[0-9a-f]{6})?$/D', $host) === 1) {
             return $host;
         }
 

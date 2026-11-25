@@ -1539,6 +1539,15 @@ it('makes a hostname safe to use inside a colon-delimited field', function () {
         ->and(strlen(MetricsPublisher::normaliseHost(str_repeat('h', 200))))->toBeLessThanOrEqual(56);
 });
 
+it('sanitises a hostname with a trailing newline instead of passing it through', function () {
+    // Without the D modifier, $ matches before a final newline and the raw
+    // name would be returned as is.
+    $normalised = MetricsPublisher::normaliseHost("web\n");
+
+    expect($normalised)->not->toContain("\n")
+        ->and($normalised)->toBe('web~'.substr(sha1("web\n"), 0, 6));
+});
+
 it('leaves an already normalised hostname unchanged', function (string $host) {
     // Index members are stored normalised and read back through the series
     // readers, which normalise again; a second pass must not mint a new name.

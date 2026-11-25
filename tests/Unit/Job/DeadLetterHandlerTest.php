@@ -69,6 +69,36 @@ it('retries a dead-lettered job', function () {
     }
 });
 
+it('rejects a dead-lettered queue name with a trailing newline on retry', function () {
+    try {
+        $uniquePrefix = 'torque-test-dl-newline-'.bin2hex(random_bytes(4)).':';
+        $handler = new DeadLetterHandler(
+            redisUri: env('TORQUE_TEST_REDIS_URI', 'redis://127.0.0.1:6379/15'),
+            prefix: $uniquePrefix,
+            allowedQueues: [],
+        );
+
+        $handler->handle(
+            queue: "name\n",
+            payload: '{"uuid":"newline-1","job":"TestJob"}',
+            messageId: '1680000000000-2',
+            exception: new RuntimeException('Newline test'),
+        );
+
+        $entries = $handler->list(count: 10);
+        $last = end($entries);
+
+        try {
+            expect(fn () => $handler->retry($last['id']))
+                ->toThrow(RuntimeException::class, 'Invalid queue name');
+        } finally {
+            $handler->purge($last['id']);
+        }
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
 it('purges a dead-lettered entry', function () {
     try {
         $uniquePrefix = 'torque-test-dl-purge-'.bin2hex(random_bytes(4)).':';
