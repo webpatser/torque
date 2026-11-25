@@ -2147,8 +2147,10 @@ LUA;
      * the long-wait alerts, which would otherwise fire once per host.
      *
      * Reads the leadership {@see maintainLeadership()} decided this tick.
-     * Alert children a former leader started stay supervised by its monitor
-     * loop regardless.
+     * Housekeeping has no read timeout and can outlast the lease, so the
+     * lease is renewed once more before the long-wait check: a master that
+     * lost it meanwhile skips the alerts and demotes itself. Alert children
+     * a former leader started stay supervised by its monitor loop regardless.
      */
     public function handleClusterDuties(?float $now = null): void
     {
@@ -2157,7 +2159,36 @@ LUA;
         }
 
         $this->handleHousekeepingTick();
+
+        if (! $this->confirmLeadership()) {
+            return;
+        }
+
         $this->handleLongWaitTick($now);
+    }
+
+    /**
+     * Extend the lease only while this master still holds it, in one
+     * check-and-extend step. A lost lease, or a Redis error, sets
+     * {@see $isLeader} false so the rest of the tick and the next one run
+     * as a follower until {@see maintainLeadership()} takes the lease again.
+     */
+    private function confirmLeadership(): bool
+    {
+        try {
+            $this->isLeader = new LeaderLease($this->masterRedis(), $this->redisPrefix())->renew($this->masterId());
+
+            if (! $this->isLeader) {
+                ($this->logger)('Leader lease lost: another master runs housekeeping and long-wait alerts now.');
+            }
+
+            $this->clusterDutyRecovered('Leader lease');
+        } catch (\Throwable $e) {
+            $this->isLeader = false;
+            $this->clusterDutyFailed('Leader lease', $e, 'treating this master as not leader');
+        }
+
+        return $this->isLeader;
     }
 
     /**

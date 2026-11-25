@@ -786,6 +786,29 @@ it('delivers through the real Slack package on both route types', function () {
         && str_contains((string) $request['text'], 'queue emails'));
 });
 
+it('skips the long-wait alert and demotes itself when the lease is lost during housekeeping', function () {
+    ($this->push)('emails');
+    $master = ($this->master)(['emails' => 60]);
+
+    expect($master->maintainLeadership())->toBeTrue();
+
+    // Housekeeping outlasted the lease and another master took it over.
+    $other = 'host-b-'.getmypid().'-12345678';
+    $this->redis->execute('SET', $this->prefix.'leader', $other, 'EX', '15');
+
+    $master->handleClusterDuties(microtime(true) + 120);
+
+    expect($master->isLeader)->toBeFalse()
+        ->and($master->longWaitAlerts)->toBe([])
+        ->and((new ReflectionProperty($master, 'longWaitDueAt'))->getValue($master))->toBeNull()
+        ->and(implode("\n", $this->logs))->not->toContain('Long wait on queue emails')
+        ->and(implode("\n", $this->logs))->toContain('Leader lease lost')
+        ->and($this->redis->execute('GET', $this->prefix.'leader'))->toBe($other);
+
+    // The next tick runs as a follower.
+    expect($master->maintainLeadership())->toBeFalse();
+});
+
 it('does not fire while the oldest job is under the threshold', function () {
     ($this->push)('emails');
     $master = ($this->master)(['emails' => 60]);
