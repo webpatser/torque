@@ -4,10 +4,14 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Console;
 
+use Fledge\Async\Redis\RedisClient;
 use Illuminate\Console\Command;
+use Webpatser\Torque\Control\MasterRegistry;
+use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\StreamQueueResolver;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -91,9 +95,12 @@ final class TorqueMonitorCommand extends Command
 
         // Check pause state.
         $paused = false;
+        $nodeCount = 0;
+        $nodePaused = false;
         try {
             $redis = createRedisClient($redisUri);
             $paused = (bool) $redis->execute('EXISTS', $prefix.'paused');
+            ['nodes' => $nodeCount, 'paused' => $nodePaused] = $this->readNodeState($redis, $prefix);
         } catch (\Throwable) {
         }
 
@@ -101,7 +108,7 @@ final class TorqueMonitorCommand extends Command
         $this->renderMetrics($metrics);
         $this->renderWorkers($workers);
         $this->renderQueues($config);
-        $this->renderFooter($metrics, $paused, (int) $this->option('refresh'));
+        $this->renderFooter($metrics, $paused, (int) $this->option('refresh'), $nodeCount, $nodePaused);
 
         // Build frame: cursor home, each line clears to EOL, then wipe leftover lines.
         $frame = "\033[H";
@@ -308,18 +315,42 @@ final class TorqueMonitorCommand extends Command
     /**
      * @param  array<string, mixed>  $metrics
      */
-    private function renderFooter(array $metrics, bool $paused, int $refreshMs): void
+    private function renderFooter(array $metrics, bool $paused, int $refreshMs, int $nodeCount, bool $nodePaused): void
     {
         $this->bufferLine();
 
         $pausedStr = $paused ? "\033[33mYes\033[0m" : "\033[32mNo\033[0m";
+        $nodePausedStr = $nodePaused ? "\033[33mYes\033[0m" : "\033[32mNo\033[0m";
         $failedCount = Narrow::int($metrics['jobs_failed'] ?? null);
         $failedStr = $failedCount > 0 ? "\033[31m{$failedCount}\033[0m" : "\033[32m0\033[0m";
 
         $uptime = $this->formatUptime();
 
         $this->bufferLine("  Failed: {$failedStr} in dead letter  │  Paused: {$pausedStr}  │  Uptime: {$uptime}");
+        $this->bufferLine("  Nodes: \033[1m{$nodeCount}\033[0m  │  This node (".NodeName::current().") paused: {$nodePausedStr}");
         $this->bufferLine("  \033[2mPress Ctrl+C to exit  │  Refresh: {$refreshMs}ms\033[0m");
+    }
+
+    /**
+     * The number of distinct nodes with a live master, and whether this
+     * machine's node is paused through `torque:pause --node`.
+     *
+     * @return array{nodes: int, paused: bool}
+     */
+    private function readNodeState(RedisClient $redis, string $prefix): array
+    {
+        $nodes = [];
+
+        foreach (new MasterRegistry($redis, $prefix)->all() as $record) {
+            $nodes[$record['node']] = true;
+        }
+
+        $scopes = new PauseScopes($redis, $prefix)->all();
+
+        return [
+            'nodes' => count($nodes),
+            'paused' => isset($scopes['nodes'][NodeName::current()]),
+        ];
     }
 
     private function formatUptime(): string

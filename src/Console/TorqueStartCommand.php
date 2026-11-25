@@ -10,6 +10,8 @@ use Illuminate\Console\Command;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeConfig;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\ProcessInspector;
 
 /**
@@ -28,6 +30,7 @@ final class TorqueStartCommand extends Command
         {--workers= : Number of worker processes}
         {--concurrency= : Coroutine slots per worker}
         {--queues= : Comma-separated queue names}
+        {--node= : Node name (defaults to TORQUE_NODE, then the hostname); selects the nodes block}
         {--replace : Absorb a running master via the takeover handshake instead of refusing to start (use as the supervisor program command)}
         {--takeover= : Internal: replace the running master with this PID (used by torque:reload)}';
 
@@ -40,6 +43,18 @@ final class TorqueStartCommand extends Command
 
         if ($this->option('replace') && $takeoverPid !== null) {
             $this->components->error('--replace and --takeover are mutually exclusive.');
+
+            return self::FAILURE;
+        }
+
+        try {
+            $node = NodeName::resolve(
+                is_string($this->option('node')) ? $this->option('node') : null,
+                Narrow::map(config('torque')),
+            );
+            NodeName::setCurrent($node);
+        } catch (\InvalidArgumentException|\LogicException $e) {
+            $this->components->error($e->getMessage());
 
             return self::FAILURE;
         }
@@ -79,6 +94,90 @@ final class TorqueStartCommand extends Command
             }
         }
 
+        // Node block over flat keys; CLI options below win over both.
+        try {
+            $config = NodeConfig::resolve(Narrow::map(config('torque')), $node);
+        } catch (\InvalidArgumentException $e) {
+            $this->components->error($e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        // Configured worker groups decide how --workers and --concurrency apply.
+        $configuredGroups = is_array($config['groups'] ?? null) ? $config['groups'] : [];
+        $groupNames = implode(', ', array_map(strval(...), array_keys($configuredGroups)));
+        $groupSizeOverride = $this->option('queues') === null
+            && ($this->option('workers') !== null || $this->option('concurrency') !== null);
+
+        if ($groupSizeOverride && count($configuredGroups) > 1) {
+            $this->components->error("--workers and --concurrency cannot be used with several worker groups ({$groupNames}). Pass --queues to replace the groups, or set the numbers per group in the nodes config.");
+
+            return self::FAILURE;
+        }
+
+        // Apply CLI overrides.
+        if ($this->option('workers') !== null) {
+            $config['workers'] = (int) $this->option('workers');
+        }
+
+        if ($this->option('concurrency') !== null) {
+            $config['slots_per_worker'] = (int) $this->option('concurrency');
+        }
+
+        // With exactly one configured group the overrides apply to that group.
+        if ($groupSizeOverride && count($configuredGroups) === 1) {
+            $only = array_key_first($configuredGroups);
+            $block = Narrow::map($configuredGroups[$only]);
+
+            if ($this->option('workers') !== null) {
+                $block['workers'] = (int) $this->option('workers');
+            }
+
+            if ($this->option('concurrency') !== null) {
+                $block['slots_per_worker'] = (int) $this->option('concurrency');
+            }
+
+            $configuredGroups[$only] = $block;
+            $config['groups'] = $configuredGroups;
+        }
+
+        // Resolve queue names: CLI option > node block > config stream keys > fallback.
+        if ($this->option('queues') !== null) {
+            $config['queues'] = array_map('trim', explode(',', $this->option('queues')));
+
+            foreach ($config['queues'] as $queue) {
+                if (! preg_match('/^[a-zA-Z0-9_\-.:]+$/D', $queue)) {
+                    $this->components->error("Invalid queue name: {$queue}");
+
+                    return self::FAILURE;
+                }
+            }
+
+            if ($configuredGroups !== []) {
+                unset($config['groups']);
+                $this->components->info("--queues replaces the configured worker groups ({$groupNames}) with one group named default.");
+            }
+        } elseif (! is_array($config['queues'] ?? null) || $config['queues'] === []) {
+            // Queues set by the node block are already validated against streams.
+            $config['queues'] = is_array($config['streams'] ?? null) ? array_keys($config['streams']) : ['default'];
+        }
+
+        try {
+            $config['groups'] = NodeConfig::groups($config);
+        } catch (\InvalidArgumentException $e) {
+            $this->components->error($e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        // A missing igbinary is a config refusal, so it comes before the sweep;
+        // the serializer info lines follow the start banner.
+        if (Narrow::string($config['serializer'] ?? null, 'json') === 'igbinary' && ! extension_loaded('igbinary')) {
+            $this->components->error('TORQUE_SERIALIZER=igbinary but ext-igbinary is not loaded. Install with: pecl install igbinary');
+
+            return self::FAILURE;
+        }
+
         // Sweep orphaned workers: a master killed with SIGKILL (OOM,
         // supervisor stop failure) leaves no master process behind, only its
         // reparented workers, and those must not survive into the new fleet
@@ -87,7 +186,8 @@ final class TorqueStartCommand extends Command
         // release on the same host) is never touched. The first pattern
         // character is bracketed so the `sh -c` wrapper PHP spawns for
         // exec(), whose own argv contains the pattern text, never matches
-        // itself.
+        // itself. It runs only once every option and config refusal above
+        // has passed, so a refused start has no side effect.
         $workerOutput = [];
         exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
         $orphanWorkers = array_filter(
@@ -117,41 +217,29 @@ final class TorqueStartCommand extends Command
             usleep(200_000);
         }
 
-        $config = Narrow::map(config('torque'));
-
-        // Apply CLI overrides.
-        if ($this->option('workers') !== null) {
-            $config['workers'] = (int) $this->option('workers');
-        }
-
-        if ($this->option('concurrency') !== null) {
-            $config['slots_per_worker'] = (int) $this->option('concurrency');
-        }
-
-        // Resolve queue names: CLI option > config stream keys > fallback.
-        if ($this->option('queues') !== null) {
-            $config['queues'] = array_map('trim', explode(',', $this->option('queues')));
-
-            foreach ($config['queues'] as $queue) {
-                if (! preg_match('/^[a-zA-Z0-9_\-.:]+$/', $queue)) {
-                    $this->components->error("Invalid queue name: {$queue}");
-
-                    return self::FAILURE;
-                }
-            }
-        } elseif (isset($config['streams']) && is_array($config['streams'])) {
-            $config['queues'] = array_keys($config['streams']);
-        } else {
-            $config['queues'] = ['default'];
-        }
+        $groups = $config['groups'];
+        $grouped = count($groups) > 1 || $groups[0]['name'] !== NodeConfig::DEFAULT_GROUP;
 
         $workers = Narrow::int($config['workers'] ?? null, 4);
         $concurrency = Narrow::int($config['slots_per_worker'] ?? null, 50);
-        $queues = implode(', ', $config['queues']);
+        $queues = implode(', ', array_map(strval(...), array_filter((array) $config['queues'], is_scalar(...))));
+
+        if ($grouped) {
+            $workers = array_sum(array_column($groups, 'workers'));
+            $concurrency = max([1, ...array_column($groups, 'slots_per_worker')]);
+            $queues = implode(', ', array_unique(array_merge(...array_column($groups, 'queues'))));
+        }
 
         $version = InstalledVersions::getPrettyVersion('webpatser/torque') ?? 'dev';
         $this->components->info("Torque {$version} starting with {$workers} workers x {$concurrency} coroutines");
         $this->components->info("Queues: {$queues}");
+
+        if ($grouped) {
+            foreach ($groups as $group) {
+                $slots = $group['workers'] * $group['slots_per_worker'];
+                $this->components->info("Group {$group['name']}: queues ".implode(', ', $group['queues'])."; {$group['workers']} workers x {$group['slots_per_worker']} coroutines ({$slots} slots)");
+            }
+        }
         $redisUri = Narrow::string(Narrow::map($config['redis'] ?? null)['uri'] ?? null, 'redis://127.0.0.1:6379');
         $this->components->info('Redis: '.preg_replace('/:([^@]+)@/', ':***@', $redisUri));
 
@@ -160,12 +248,6 @@ final class TorqueStartCommand extends Command
         // confirmation when ext is present and configured.
         $serializer = Narrow::string($config['serializer'] ?? null, 'json');
         $hasIgbinary = extension_loaded('igbinary');
-
-        if ($serializer === 'igbinary' && ! $hasIgbinary) {
-            $this->components->error('TORQUE_SERIALIZER=igbinary but ext-igbinary is not loaded. Install with: pecl install igbinary');
-
-            return self::FAILURE;
-        }
 
         if ($serializer === 'igbinary') {
             $this->components->info('Serializer: igbinary');

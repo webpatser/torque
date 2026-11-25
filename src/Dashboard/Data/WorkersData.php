@@ -4,9 +4,14 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Data;
 
+use Webpatser\Torque\Control\MasterRegistry;
+use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Metrics\MetricsPublisher;
+use Webpatser\Torque\Support\Narrow;
 use Webpatser\Torque\Support\WorkerId;
+
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Per-host read-model for the workers screen.
@@ -24,7 +29,43 @@ use Webpatser\Torque\Support\WorkerId;
  */
 final class WorkersData
 {
-    public function __construct(private readonly MetricsPublisher $metrics) {}
+    /**
+     * @param  string|null  $redisUri  Defaults to `torque.redis.uri`.
+     * @param  string|null  $prefix  Defaults to `torque.redis.prefix`.
+     */
+    public function __construct(
+        private readonly MetricsPublisher $metrics,
+        private readonly ?string $redisUri = null,
+        private readonly ?string $prefix = null,
+    ) {}
+
+    /**
+     * Node state per host: pause, drain, version and supervision. Read-only
+     * and best effort; a Redis failure or an older master without a registry
+     * record leaves every host at the defaults and the page renders as before.
+     *
+     * @return array{paused: array<string, int>, masters: array<string, list<array<string, mixed>>>}
+     */
+    private function nodeState(): array
+    {
+        $state = ['paused' => [], 'masters' => []];
+
+        try {
+            $uri = $this->redisUri ?? Narrow::string(config('torque.redis.uri', 'redis://127.0.0.1:6379'));
+            $prefix = $this->prefix ?? Narrow::string(config('torque.redis.prefix', 'torque:'));
+            $redis = createRedisClient($uri);
+
+            $state['paused'] = (new PauseScopes($redis, $prefix))->all()['nodes'];
+
+            foreach ((new MasterRegistry($redis, $prefix))->all() as $record) {
+                $state['masters'][MetricsPublisher::normaliseHost($record['node'])][] = $record;
+            }
+        } catch (\Throwable) {
+            return ['paused' => [], 'masters' => []];
+        }
+
+        return $state;
+    }
 
     /**
      * @param  string  $range  A {@see Range} key; scopes the counter columns.
@@ -53,9 +94,12 @@ final class WorkersData
             MetricsPublisher::GAUGE_HOST_WORKER_MEMORY_PEAK,
         ], $names, $window->tier, $window->count);
 
+        $nodeState = $this->nodeState();
         $hosts = [];
 
         foreach ($names as $host) {
+            $masters = $nodeState['masters'][$host] ?? [];
+            $primary = $masters[0] ?? null;
             $workers = $live[$host] ?? [];
             $series = $counters[$host] ?? [];
 
@@ -75,6 +119,7 @@ final class WorkersData
             $hosts[] = [
                 'host' => $host,
                 'workers' => $workers,
+                'groups' => self::groupWorkers($workers),
                 // A host in the index with no heartbeat ran in this range but
                 // is not running now; it stays in the list so the range is
                 // honest about what did the work.
@@ -96,6 +141,10 @@ final class WorkersData
                 'slotHistory' => self::gaugeAverages($hostGauges[MetricsPublisher::GAUGE_HOST_TOTAL_SLOTS] ?? []),
                 'pools' => null,
                 'uptime' => null,
+                'paused' => isset($nodeState['paused'][$host]),
+                'draining' => array_any($masters, static fn (array $m): bool => $m['state'] === 'draining'),
+                'version' => $primary['version'] ?? null,
+                'supervised' => $primary['supervised'] ?? null,
             ];
         }
 
@@ -142,10 +191,44 @@ final class WorkersData
                 'failed' => (int) ($w['jobs_failed'] ?? 0),
                 'latencyMs' => (float) ($w['avg_latency_ms'] ?? 0),
                 'status' => 'active',
+                'group' => self::groupName($w['group'] ?? null),
             ];
         }
 
         return $hosts;
+    }
+
+    private static function groupName(mixed $value): string
+    {
+        $name = is_scalar($value) ? trim((string) $value) : '';
+
+        return $name !== '' ? $name : 'default';
+    }
+
+    /**
+     * A host's workers split by worker group: sorted by name with `default`
+     * first, each with its worker count.
+     *
+     * @param  list<array<string, mixed>>  $workers
+     * @return list<array{name: string, count: int, workers: list<array<string, mixed>>}>
+     */
+    private static function groupWorkers(array $workers): array
+    {
+        $byGroup = [];
+
+        foreach ($workers as $worker) {
+            $byGroup[self::groupName($worker['group'] ?? null)][] = $worker;
+        }
+
+        uksort($byGroup, static fn (string $a, string $b): int => [$a !== 'default', $a] <=> [$b !== 'default', $b]);
+
+        $groups = [];
+
+        foreach ($byGroup as $name => $members) {
+            $groups[] = ['name' => (string) $name, 'count' => count($members), 'workers' => $members];
+        }
+
+        return $groups;
     }
 
     /**

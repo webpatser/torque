@@ -92,6 +92,29 @@ it('generates config with correct worker count from option', function () {
     expect($content)->toContain('--workers=12');
 });
 
+it('writes the node into the command line when given', function () {
+    $this->artisan('torque:supervisor', ['--node' => 'web-1'])->assertSuccessful();
+
+    $content = file_get_contents(storage_path('torque-supervisor.conf'));
+
+    expect($content)->toContain('torque:start --replace --workers=')
+        ->and($content)->toContain(' --node=web-1');
+});
+
+it('leaves the command line unchanged without a node', function () {
+    $this->artisan('torque:supervisor')->assertSuccessful();
+
+    $content = file_get_contents(storage_path('torque-supervisor.conf'));
+
+    expect($content)->not->toContain('--node');
+});
+
+it('refuses an invalid node name', function () {
+    $this->artisan('torque:supervisor', ['--node' => 'bad node"'])->assertFailed();
+
+    expect(file_exists(storage_path('torque-supervisor.conf')))->toBeFalse();
+});
+
 it('generates config with correct worker count from config default', function () {
     $expectedPath = storage_path('torque-supervisor.conf');
 
@@ -124,6 +147,20 @@ it('generates valid supervisor config with required directives', function () {
         ->toContain('redirect_stderr=true')
         ->toContain('stopasgroup=true')
         ->toContain('killasgroup=true');
+});
+
+it('marks the program as supervised through an environment line', function () {
+    $this->artisan('torque:supervisor')->assertSuccessful();
+
+    $lines = explode("\n", (string) file_get_contents(storage_path('torque-supervisor.conf')));
+
+    $environment = array_values(array_filter(
+        array_map('trim', $lines),
+        fn (string $line): bool => str_starts_with($line, 'environment='),
+    ));
+
+    expect($environment)->toHaveCount(1)
+        ->and($environment[0])->toContain('TORQUE_SUPERVISED="1"');
 });
 
 it('scales stopwaitsecs with drain_grace_seconds', function () {

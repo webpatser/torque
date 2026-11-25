@@ -36,6 +36,18 @@
                             @else
                                 <span class="badge s-completed tiny"><span class="bdot"></span>active</span>
                             @endif
+                            @if (! empty($h['paused']))
+                                <span class="badge s-retrying tiny"><span class="bdot"></span>paused</span>
+                            @endif
+                            @if (! empty($h['draining']))
+                                <span class="badge s-retrying tiny"><span class="bdot"></span>draining</span>
+                            @endif
+                            @if (($h['version'] ?? null) !== null)
+                                <span class="mono faint" style="font-size: 11px;">v{{ ltrim((string) $h['version'], 'v') }}</span>
+                            @endif
+                            @if (($h['supervised'] ?? null) !== null)
+                                <span class="mono faint" style="font-size: 11px;">{{ $h['supervised'] ? 'supervised' : 'unsupervised' }}</span>
+                            @endif
                             @if ($h['stalled'] > 0)
                                 <span class="badge s-retrying tiny"><span class="bdot"></span>{{ $h['stalled'] }} slot stalled</span>
                             @endif
@@ -43,7 +55,15 @@
                                 {{ count($h['workers']) }} {{ Str::plural('worker', count($h['workers'])) }}@if ($h['uptime'] !== null) · up {{ Format::dur($h['uptime']) }}@endif
                             </span>
                         </div>
-                        @foreach ($h['workers'] as $w)
+                        @php
+                            $groups = $h['groups'] ?? [];
+                            $showGroups = count($groups) > 1 || array_any($groups, fn ($g) => $g['name'] !== 'default');
+                        @endphp
+                        @foreach ($groups as $group)
+                            @if ($showGroups)
+                                <span class="mono faint" style="font-size: 11px; font-weight: 600;">{{ $group['name'] }} · {{ $group['count'] }} {{ Str::plural('worker', $group['count']) }}</span>
+                            @endif
+                        @foreach ($group['workers'] as $w)
                             <div class="row gap12 wrap">
                                 <span class="mono faint" style="font-size: 11px; min-width: 74px;">pid {{ $w['pid'] ?? '–' }}</span>
                                 <x-torque::viz.slot-strip :busy="$w['busy']" :slots="$w['slots']" :stalled="$w['stalled']"/>
@@ -56,6 +76,7 @@
                                     @endforeach
                                 @endif
                             </div>
+                        @endforeach
                         @endforeach
                         @if ($h['workers'] === [])
                             <span class="mono faint" style="font-size: 11px;">no live workers on this host</span>

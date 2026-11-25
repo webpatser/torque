@@ -2,6 +2,52 @@
 
 Torque keeps upgrades boring: the master records the installed version in Redis (`{prefix}version`) and, on the first `torque:start` after a deploy, runs the data steps for every version between the recorded one and the installed one. Nothing is required from you unless a section below says so, and a stored version below the oldest release you can upgrade from (1.4.0 since 2.0.0) refuses to start. `torque:status` shows the recorded data version next to the installed one.
 
+## 2.5.0: multi-host
+
+No data step, no data migration and no required config change: a single-host install keeps working as it is. New config keys (`node`, `nodes`, `control`) fall back to defaults when your published config lacks them. Read on if you run Torque on more than one host.
+
+### New and changed Redis keys
+
+All keys live under `{prefix}`.
+
+| Key | Type, TTL | Status |
+|---|---|---|
+| `masters` | sorted set of master id to heartbeat epoch, 60 s TTL, entries older than 30 s pruned on write | new |
+| `master:{masterId}` | hash: node, pid, started_at, version, supervised, queues, workers, slots, state, groups; 30 s TTL | new |
+| `control:{masterId}` | list of JSON commands, 120 s TTL set by the issuer | new |
+| `control:ack:{commandId}` | JSON `{master, action, accepted, at}`, 300 s TTL | new |
+| `pauses` | hash with fields `node:{node}` and `queue:{queue}`, value is the epoch, no TTL | new |
+| `drain:{masterId}` | string, TTL of the drain pause | new |
+| `leader` | string holding the leader's master id, 15 s TTL | new |
+| `upgrade:lock` | string, `SET NX EX 300` | new |
+| `paused` | the global pause, unchanged; new masters no longer write `drain:<pid>` into it, the legacy value is still read | changed |
+| `worker:{id}` | the id is `{node}-{pid}-{hex8}`; new fields `master` and `group` | changed |
+| `metrics:live:{host}` | `{host}` is the node name; identical to the hostname until you set a node name | changed |
+
+Each master now drains through its own `{prefix}drain:{masterId}` key. A drain no longer replaces the global pause, two reloads at once no longer lose a pause, and a master starting on another host no longer deletes a live drain. Workers and masters count only workers whose `master` field is their own master id, so equal PIDs on different hosts (containers) no longer mix up autoscaling, readiness and the aggregate metrics.
+
+### Rolling deploy
+
+- A new master still honours a legacy `drain:<pid>` value in `{prefix}paused`, and a new worker still honours it for its parent PID. A new master deletes a legacy value as stale only when `{prefix}metrics:live` lists no host other than its own.
+- Workers started by an older release have no `master` field. A new master falls back to host and PID: such a worker counts as its own when its host equals the node name and its PID is one of the master's children.
+- An older master ignores `{prefix}pauses` and cannot be reached by remote stop or reload, so a node pause or a remote command does nothing on a host that is not upgraded yet. Deploy first, then use the new commands.
+- Leader-only duties (dead-letter trim, consumer sweep, redelivery prune, long-wait alerts) run on a new master only when it holds the lease; an older master still runs them itself until it is upgraded, so alerts can repeat during the rollout.
+
+### Node names
+
+- The node name is `--node`, then `TORQUE_NODE`, then the hostname, normalised if it has characters outside `[A-Za-z0-9._-]` or is longer than 48 (invalid characters become `-`, a long name is shortened and gets a short hash suffix). An explicit invalid `--node` or `TORQUE_NODE` makes `torque:start` refuse.
+- Renaming a node, or a hostname that now normalises differently, starts a new per-host metrics history row. The old row stays as history and drops out of the live sums after 30 seconds. Set `TORQUE_NODE` before the upgrade if you want to keep the name you have.
+
+### Supervisor configs and remote reload
+
+`torque:reload --node` and `--all` refuse a master that is not supervised, because a drain would stop it without a replacement. A master counts as supervised only when `TORQUE_SUPERVISED` is `1`, `true` or `yes` in its environment. Regenerate existing Supervisor configs with `torque:supervisor` (the new config sets `environment=TORQUE_SUPERVISED="1"`), or add that line to the program section yourself. For systemd add `Environment=TORQUE_SUPERVISED=1`. Without it, local `torque:reload` is unaffected and remote reload is refused with a hint to use `torque:stop`.
+
+### Config
+
+- `node` (`TORQUE_NODE`), `nodes`, `control.enabled` (`TORQUE_REMOTE_CONTROL`, default true) and `control.command_ttl_seconds` (default 60). A published config without them uses these defaults; see the README's multi-host section.
+- Keep `redis_uri` of the `torque` queue connection equal to `torque.redis.uri` on every host.
+- Set `TORQUE_REMOTE_CONTROL=false` on a host that must not accept remote stop or drain commands.
+
 ## Unreleased: fleet metrics per host
 
 No data step and no config change. The Redis layout of the fleet aggregate and the cluster gauges changes; only tooling that reads those keys directly has to follow.

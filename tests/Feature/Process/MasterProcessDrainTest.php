@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
 use Webpatser\Torque\Process\MasterProcess;
@@ -122,25 +123,26 @@ it('does not re-promote drainRequested while a drain is already in progress', fu
     expect(getMasterPrivate($master, 'drainStartedAt'))->toBe($startedAt);
 });
 
-it('sets the paused key with an expiry so a drained-away master cannot leave the queue paused forever', function () {
+it('sets its own drain key with an expiry so a drained-away master cannot leave its fleet paused forever', function () {
     $master = makeMasterUnderTest(['reload_pause_seconds' => 3, 'drain_grace_seconds' => 2]);
     setMasterPrivate($master, 'drainRequested', true);
 
     $master->handleDrainTick();
 
     $redis = \Fledge\Async\Redis\createRedisClient('redis://127.0.0.1:6379/15');
-    $ttl = (int) $redis->execute('TTL', 'torque-drain-test:paused');
-    $value = (string) $redis->execute('GET', 'torque-drain-test:paused');
+    $drainKey = PauseScopes::drainKey('torque-drain-test:', $master->masterId());
+    $ttl = (int) $redis->execute('TTL', $drainKey);
 
-    // pause (3s) + grace (2s) + 60s buffer; TTL counts down, so anything in (62, 65]
-    // is correct, and over 62 proves the pause is in it.
-    expect($ttl)->toBeGreaterThan(62)->toBeLessThanOrEqual(65)
-        // The value scopes the pause to this master's own fleet: workers
-        // compare the embedded PID against their parent and ignore a drain
-        // that is not theirs (see WorkerProcess::shouldPauseFor()).
-        ->and($value)->toBe('drain:'.getmypid());
-
-    $redis->execute('DEL', 'torque-drain-test:paused');
+    try {
+        // pause (3s) + grace (2s) + 60s buffer; TTL counts down, so anything in (62, 65]
+        // is correct, and over 62 proves the pause is in it.
+        expect($ttl)->toBeGreaterThan(62)->toBeLessThanOrEqual(65)
+            // The key is scoped to this master's own fleet; the global switch
+            // is never written by a drain.
+            ->and((int) $redis->execute('EXISTS', 'torque-drain-test:paused'))->toBe(0);
+    } finally {
+        $redis->execute('DEL', $drainKey);
+    }
 });
 
 /*
@@ -215,6 +217,8 @@ it('sees an idle fleet through the metrics publisher', function () {
     $master = makeMasterUnderTest([
         'redis' => ['uri' => 'redis://127.0.0.1:6379/15', 'prefix' => $prefix],
         'reload_pause_seconds' => 7200,
+        // The heartbeat carries no master id, so the host must be ours.
+        'node' => 'testhost',
     ]);
     setMasterPrivate($master, 'metricsPublisher', $publisher);
     setMasterPrivate($master, 'workerPids', [4242 => true]);

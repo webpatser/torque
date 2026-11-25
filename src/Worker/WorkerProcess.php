@@ -41,6 +41,8 @@ use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Queue\Worker;
 use Illuminate\Queue\WorkerOptions;
 use Illuminate\Queue\WorkerStopReason;
+use Webpatser\Torque\Control\MasterRegistry;
+use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
 use Webpatser\Torque\Job\AttemptAuthManager;
 use Webpatser\Torque\Job\AttemptContextRepository;
@@ -61,6 +63,8 @@ use Webpatser\Torque\Queue\StreamQueue;
 use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeConfig;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Telemetry\OtelBridge;
 use Webpatser\Torque\Torque;
 
@@ -327,8 +331,18 @@ LUA;
      */
     private CacheRepository|false|null $crashCache = null;
 
-    /** This worker's XREADGROUP consumer name (`{host}-{pid}-{hex}`). */
+    /** This worker's XREADGROUP consumer name (`{node}-{pid}-{hex8}`). */
     public private(set) string $consumerId;
+
+    /**
+     * The id of the master that spawned this worker (`master_id` in the
+     * config, from `--master-id`); null when an older master started it
+     * without one, which leaves only the legacy `drain:<pid>` path.
+     */
+    public private(set) ?string $masterId;
+
+    /** The worker group this worker belongs to, for display only. */
+    public private(set) string $group;
 
     /**
      * Exceptions already handed to the exception handler, so one object that
@@ -362,7 +376,12 @@ LUA;
         $this->config = $config;
         $this->reported = new \WeakMap;
         $this->failureReasons = new \WeakMap;
-        $this->consumerId = gethostname().'-'.getmypid().'-'.bin2hex(random_bytes(4));
+        $this->consumerId = NodeName::current().'-'.getmypid().'-'.bin2hex(random_bytes(4));
+
+        $masterId = Narrow::nullableString($config['master_id'] ?? null);
+        $this->masterId = $masterId !== null && MasterRegistry::isValidMasterId($masterId) ? $masterId : null;
+        $group = Narrow::string($config['group'] ?? null);
+        $this->group = $group !== '' ? $group : NodeConfig::DEFAULT_GROUP;
     }
 
     /**
@@ -631,8 +650,10 @@ LUA;
         // metrics timer below writes, from inside the loop.
 
         $masterPidForPause = posix_getppid();
+        $masterIdForPause = $this->masterId;
+        $nodeForPause = NodeName::current();
         $pauseFetchFailed = false;
-        Loop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queueManager, $queues, $circuitBreaker, $streamQueue, $cluster, &$pauseFetchFailed) {
+        Loop::repeat($timerPeriod('pause_check_seconds', 2.0), function () use ($redisPool, $prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $masterIdForPause, $nodeForPause, $queueManager, $queues, $circuitBreaker, $streamQueue, $cluster, &$pauseFetchFailed) {
             // Framework pause state (queue:pause / queue:pause --all) lives in
             // the cache store, read synchronously outside the pool callback so
             // pool-connection hold time is unchanged. On a failed read we keep
@@ -663,25 +684,33 @@ LUA;
             // A tripped circuit breaker is expressed as a paused queue, so it
             // reaches the reader fibers through the same set the framework's
             // per-queue pauses use: only that stream stops being polled, and
-            // a worker serving nothing else pauses fully.
+            // a worker serving nothing else pauses fully. Queue pauses from
+            // torque:pause --queue join the same set; until the read below
+            // succeeds the last known ones stand.
+            $circuitOpen = $circuitBreaker->openQueues($queues);
             $pauseState->pausedQueues = self::mergePausedQueues(
-                $pauseState->frameworkPausedQueues,
-                $circuitBreaker->openQueues($queues),
+                self::mergePausedQueues($pauseState->frameworkPausedQueues, $circuitOpen),
+                $pauseState->scopePausedQueues,
             );
 
-            $redisPool->use(function (mixed $connection) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $queues) {
-                $redis = self::pooledClient($connection);
-                $value = $redis->execute('GET', $prefix.'paused');
-                $ttl = Narrow::int($redis->execute('TTL', $prefix.'paused'));
-
-                $torquePaused = self::shouldPauseFor(
-                    Narrow::nullableString($value),
-                    $ttl,
+            $redisPool->use(function (mixed $connection) use ($prefix, $pauseState, $events, $connectionName, $primaryQueue, $masterPidForPause, $masterIdForPause, $nodeForPause, $queues, $circuitOpen) {
+                $decision = self::readPauseDecision(
+                    self::pooledClient($connection),
+                    $prefix,
+                    $nodeForPause,
+                    $queues,
+                    $masterIdForPause,
                     $masterPidForPause,
                 );
 
+                $pauseState->scopePausedQueues = $decision['pausedQueues'];
+                $pauseState->pausedQueues = self::mergePausedQueues(
+                    self::mergePausedQueues($pauseState->frameworkPausedQueues, $circuitOpen),
+                    $decision['pausedQueues'],
+                );
+
                 self::applyPauseTransition(
-                    self::shouldFullyPause($torquePaused, $pauseState->pausedQueues, $queues),
+                    self::shouldFullyPause($decision['pauseFully'], $pauseState->pausedQueues, $queues),
                     $pauseState,
                     $events,
                     $connectionName,
@@ -1324,7 +1353,7 @@ LUA;
         $otel = OtelBridge::make($this->config);
         Loop::repeat($metricsInterval, function () use ($metricsPublisher, $metrics, $otel) {
             $snapshot = $metrics->snapshot();
-            $metricsPublisher->publishWorkerMetrics($this->consumerId, $snapshot);
+            $metricsPublisher->publishWorkerMetrics($this->consumerId, $snapshot, $this->masterId, $this->group);
             $otel?->recordWorker($snapshot);
         });
 
@@ -1411,7 +1440,7 @@ LUA;
                 $this->announceStopping($events, $workerOptions, $connectionName, $primaryQueue);
 
                 try {
-                    $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot());
+                    $metricsPublisher->publishWorkerMetrics($this->consumerId, $metrics->snapshot(), $this->masterId, $this->group);
                     $metricsPublisher->removeWorkerMetrics($this->consumerId);
                 } catch (\Throwable) {
                     // Best-effort cleanup; do not block the hard exit.
@@ -2491,19 +2520,51 @@ LUA;
      * - A TTL-less key is a deliberate `torque:pause` and pauses every fleet.
      *
      * Static and pure for unit testing. `$ttl` uses Redis semantics: -2 key
-     * missing, -1 no expiry, >0 seconds remaining.
+     * missing, -1 no expiry, >0 seconds remaining. The global key alone;
+     * {@see readPauseDecision()} adds the node, queue and drain scopes.
      */
     public static function shouldPauseFor(?string $value, int $ttl, int $masterPid): bool
     {
-        if ($value === null || $ttl === -2) {
-            return false;
-        }
+        return PauseScopes::decide($value, $ttl, false, [], null, $masterPid)['pauseFully'];
+    }
 
-        if ($ttl === -1) {
-            return true;
-        }
+    /**
+     * Read every pause source that applies to this worker and decide.
+     *
+     * Four round trips on one connection: GET and TTL of the global
+     * `{prefix}paused`, one HMGET of the node and queue scopes, and one GET of
+     * the own master's drain key. Without a master id (a worker started by an
+     * older master) the drain key is not read and only the legacy
+     * `drain:<pid>` value in `{prefix}paused` can drain this worker; with a
+     * master id that legacy value is ignored, since a foreign master on
+     * another host can share the parent's PID. A foreign master's drain key
+     * is never read, so it never pauses this worker.
+     *
+     * @param  list<string>  $queues
+     * @return array{pauseFully: bool, pausedQueues: list<string>}
+     */
+    public static function readPauseDecision(
+        RedisClient $redis,
+        string $prefix,
+        string $node,
+        array $queues,
+        ?string $masterId,
+        int $parentPid,
+    ): array {
+        $value = Narrow::nullableString($redis->execute('GET', $prefix.'paused'));
+        $ttl = Narrow::int($redis->execute('TTL', $prefix.'paused'));
 
-        return $value === 'drain:'.$masterPid;
+        $scopes = new PauseScopes($redis, $prefix);
+        $view = $scopes->workerView($node, $queues);
+        $drain = $masterId !== null ? $scopes->drainValue($masterId) : null;
+
+        // A master with an id never writes the legacy `drain:<pid>` value, so
+        // its workers must not match one: during a rolling deploy an old
+        // master on another host may share this parent's PID. PID 0 is never
+        // a master's PID, so `drain:0` is never written.
+        $legacyPid = $masterId === null ? $parentPid : 0;
+
+        return PauseScopes::decide($value, $ttl, $view['nodePaused'], $view['pausedQueues'], $drain, $legacyPid);
     }
 
     /**
@@ -2576,7 +2637,7 @@ LUA;
      * inline, analysis would pin them to their initial literal values inside
      * the timer and reader closures.
      *
-     * @return \stdClass&object{paused: bool, frameworkPausedQueues: list<string>, pausedQueues: list<string>}
+     * @return \stdClass&object{paused: bool, frameworkPausedQueues: list<string>, scopePausedQueues: list<string>, pausedQueues: list<string>}
      */
     private static function newPauseState(): \stdClass
     {
@@ -2586,6 +2647,8 @@ LUA;
             // Framework-paused queue names (queue:pause / queue:pause --all), kept
             // fresh by the same 2s timer that polls Torque's own pause key.
             'frameworkPausedQueues' => [],
+            // Queues paused through torque:pause --queue, the last ones read.
+            'scopePausedQueues' => [],
             // The effective per-queue pause set the reader fibers consume: the
             // framework's paused queues plus any stream whose circuit breaker is
             // open. One representation, one code path, whatever the source.

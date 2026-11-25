@@ -11,6 +11,7 @@ use Fledge\Async\Redis\RedisException;
 use Webpatser\Torque\Dashboard\Data\JobMetricsData;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Metrics\WorkerSnapshot;
+use Webpatser\Torque\Support\NodeName;
 
 use function Fledge\Async\Redis\createRedisConnector;
 
@@ -492,6 +493,32 @@ it('publishes pid and host fields derived from the worker id', function () {
     } catch (RedisException $e) {
         $this->markTestSkipped('Redis not available: '.$e->getMessage());
     }
+});
+
+it('publishes the master and group fields when known', function () {
+    $prefix = 'torque-master-field-test:';
+    $publisher = createPublisher($prefix);
+
+    try {
+        $publisher->publishWorkerMetrics('web-01-5123-a1b2c3d4', makeSnapshot(), 'web-01-77-0badf00d', 'imports');
+        $publisher->publishWorkerMetrics('web-01-5124-a1b2c3d5', makeSnapshot());
+
+        $known = $publisher->getWorkerMetrics('web-01-5123-a1b2c3d4');
+        $unknown = $publisher->getWorkerMetrics('web-01-5124-a1b2c3d5');
+
+        expect($known['master'])->toBe('web-01-77-0badf00d')
+            ->and($known['group'])->toBe('imports')
+            ->and($unknown)->not->toHaveKey('master')
+            ->and($unknown)->not->toHaveKey('group');
+
+        cleanupRedisKeys($publisher, $prefix, ['web-01-5123-a1b2c3d4', 'web-01-5124-a1b2c3d5']);
+    } catch (RedisException $e) {
+        $this->markTestSkipped('Redis not available: '.$e->getMessage());
+    }
+});
+
+it('names the local host after the node', function () {
+    expect(MetricsPublisher::localHost())->toBe(NodeName::current());
 });
 
 it('publishes a precomputed aggregate with an expiry', function () {

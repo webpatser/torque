@@ -3,6 +3,9 @@
 declare(strict_types=1);
 
 use Webpatser\Torque\Console\TorqueStopCommand;
+use Webpatser\Torque\Control\ControlChannel;
+use Webpatser\Torque\Control\MasterRegistry;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\ProcessInspector;
 
 beforeEach(function () {
@@ -255,4 +258,234 @@ it('force-kills without waiting out the derived window', function () {
         posix_kill($pid, SIGKILL);
         pcntl_waitpid($pid, $status);
     }
+});
+
+/*
+ * Remote stop: --node and --all send the fixed `stop` action through the
+ * control channel against real Redis under a random prefix. The test plays
+ * the master's part between two polls through the sleeper seam: it pops the
+ * command, acks it and removes the master record as a clean exit would.
+ */
+
+describe('remote stop', function () {
+    beforeEach(function () {
+        $this->redis = torqueRedis();
+        $this->prefix = 'torque-test-remote-stop-'.bin2hex(random_bytes(4)).':';
+
+        config()->set('torque.redis.uri', torqueRedisUri());
+        config()->set('torque.redis.prefix', $this->prefix);
+        config()->set('torque.control.enabled', true);
+        config()->set('torque.control.command_ttl_seconds', 60);
+
+        $this->registry = new MasterRegistry($this->redis, $this->prefix);
+        $this->channel = new ControlChannel($this->redis, $this->prefix);
+
+        $this->publish = function (string $node, int $pid = 4321): string {
+            $id = sprintf('%s-%d-%s', $node, $pid, bin2hex(random_bytes(4)));
+
+            $this->registry->publish($id, [
+                'node' => $node,
+                'pid' => $pid,
+                'started_at' => time(),
+                'version' => '2.5.0',
+                'supervised' => true,
+                'queues' => ['default'],
+                'workers' => 1,
+                'slots' => 10,
+                'state' => 'running',
+            ]);
+
+            return $id;
+        };
+
+        $this->queued = fn (string $id): array => array_map(
+            static fn (string $raw): array => json_decode($raw, true, 512, JSON_THROW_ON_ERROR),
+            (array) $this->redis->execute('LRANGE', $this->channel->listKey($id), '0', '-1'),
+        );
+
+        // Plays the master: pop, ack with the given verdict, optionally exit.
+        $this->playMaster = fn (array $ids, bool $accept = true, bool $exit = true): Closure => function () use ($ids, $accept, $exit): void {
+            foreach ($ids as $id) {
+                foreach ($this->channel->receive($id) as $received) {
+                    $this->channel->ack((string) $received['id'], $id, $received['command']['action'] ?? null, $accept);
+
+                    if ($exit && $accept) {
+                        $this->registry->remove($id);
+                    }
+                }
+            }
+
+            usleep(20_000);
+        };
+    });
+
+    afterEach(function () {
+        TorqueStopCommand::$remoteSleeper = null;
+
+        $cursor = '0';
+
+        do {
+            [$cursor, $keys] = $this->redis->execute('SCAN', $cursor, 'MATCH', $this->prefix.'*', 'COUNT', '1000');
+            $cursor = (string) $cursor;
+
+            if ($keys !== []) {
+                $this->redis->execute('DEL', ...$keys);
+            }
+        } while ($cursor !== '0');
+    });
+
+    it('sends stop only to the masters on the named node', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+
+        $this->artisan('torque:stop', ['--node' => ['host-a'], '--timeout' => 0])
+            ->assertFailed()
+            ->expectsOutputToContain("Sent stop to master {$a}")
+            ->expectsOutputToContain('timed out');
+
+        $commands = ($this->queued)($a);
+
+        expect($commands)->toHaveCount(1)
+            ->and($commands[0]['action'])->toBe('stop')
+            ->and($commands[0]['issuer'])->toBe('cli@'.NodeName::current())
+            ->and(($this->queued)($b))->toBe([]);
+    });
+
+    it('accepts repeated options and comma lists', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+        $c = ($this->publish)('host-c');
+        $d = ($this->publish)('host-d');
+
+        $this->artisan('torque:stop', ['--node' => ['host-a, host-b', 'host-c'], '--timeout' => 0])
+            ->assertFailed();
+
+        expect(($this->queued)($a))->toHaveCount(1)
+            ->and(($this->queued)($b))->toHaveCount(1)
+            ->and(($this->queued)($c))->toHaveCount(1)
+            ->and(($this->queued)($d))->toBe([]);
+    });
+
+    it('reports acknowledged and stopped once the master exits', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+        TorqueStopCommand::$remoteSleeper = ($this->playMaster)([$a]);
+
+        $this->artisan('torque:stop', ['--node' => ['host-a'], '--timeout' => 5])
+            ->assertSuccessful()
+            ->expectsOutputToContain("Master {$a} acknowledged the stop command")
+            ->expectsOutputToContain("Master {$a} stopped");
+
+        expect($this->registry->find($a))->toBeNull()
+            ->and($this->registry->find($b))->not->toBeNull();
+    });
+
+    it('fails for a node without a live master but still stops the others', function () {
+        $a = ($this->publish)('host-a');
+        TorqueStopCommand::$remoteSleeper = ($this->playMaster)([$a]);
+
+        $this->artisan('torque:stop', ['--node' => ['host-a,host-zz'], '--timeout' => 5])
+            ->assertFailed()
+            ->expectsOutputToContain('No live Torque master on node [host-zz]')
+            ->expectsOutputToContain("Master {$a} stopped");
+    });
+
+    it('refuses an invalid node name before sending anything', function () {
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:stop', ['--node' => ['host-a,bad name!'], '--timeout' => 0])
+            ->assertFailed()
+            ->expectsOutputToContain('Nothing was sent');
+
+        expect(($this->queued)($a))->toBe([]);
+    });
+
+    it('times out on a master that acknowledged but keeps running', function () {
+        $a = ($this->publish)('host-a');
+        TorqueStopCommand::$remoteSleeper = ($this->playMaster)([$a], exit: false);
+
+        $this->artisan('torque:stop', ['--node' => ['host-a'], '--timeout' => 1])
+            ->assertFailed()
+            ->expectsOutputToContain("Master {$a} acknowledged the stop command")
+            ->expectsOutputToContain("Master {$a} did not stop within 1s");
+    });
+
+    it('fails when the master rejects the command', function () {
+        $a = ($this->publish)('host-a');
+        TorqueStopCommand::$remoteSleeper = ($this->playMaster)([$a], accept: false);
+
+        $this->artisan('torque:stop', ['--node' => ['host-a'], '--timeout' => 5])
+            ->assertFailed()
+            ->expectsOutputToContain("Master {$a} rejected the stop command");
+    });
+
+    it('asks for confirmation with --all and sends nothing when declined', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+
+        $this->artisan('torque:stop', ['--all' => true, '--timeout' => 0])
+            ->expectsConfirmation('Stop all 2 live Torque master(s) on nodes host-a, host-b?', 'no')
+            ->assertFailed()
+            ->expectsOutputToContain('Aborted');
+
+        expect(($this->queued)($a))->toBe([])
+            ->and(($this->queued)($b))->toBe([]);
+    });
+
+    it('stops every master with --all once confirmed', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+        TorqueStopCommand::$remoteSleeper = ($this->playMaster)([$a, $b]);
+
+        $this->artisan('torque:stop', ['--all' => true, '--timeout' => 5])
+            ->expectsConfirmation('Stop all 2 live Torque master(s) on nodes host-a, host-b?', 'yes')
+            ->assertSuccessful()
+            ->expectsOutputToContain("Master {$a} stopped")
+            ->expectsOutputToContain("Master {$b} stopped");
+    });
+
+    it('skips the confirmation with --all --force', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+
+        $this->artisan('torque:stop', ['--all' => true, '--force' => true, '--timeout' => 0])
+            ->assertFailed();
+
+        expect(($this->queued)($a))->toHaveCount(1)
+            ->and(($this->queued)($b))->toHaveCount(1);
+    });
+
+    it('refuses --force with --node', function () {
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:stop', ['--node' => ['host-a'], '--force' => true])
+            ->assertFailed()
+            ->expectsOutputToContain('--force cannot be combined with --node');
+
+        expect(($this->queued)($a))->toBe([]);
+    });
+
+    it('refuses --all together with --node', function () {
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:stop', ['--node' => ['host-a'], '--all' => true])
+            ->assertFailed();
+
+        expect(($this->queued)($a))->toBe([]);
+    });
+
+    it('refuses the remote forms when remote control is disabled', function () {
+        config()->set('torque.control.enabled', false);
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:stop', ['--node' => ['host-a']])
+            ->assertFailed()
+            ->expectsOutputToContain('Remote control is disabled');
+
+        $this->artisan('torque:stop', ['--all' => true, '--force' => true])
+            ->assertFailed()
+            ->expectsOutputToContain('Remote control is disabled');
+
+        expect(($this->queued)($a))->toBe([]);
+    });
 });

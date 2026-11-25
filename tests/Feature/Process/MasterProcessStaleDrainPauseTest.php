@@ -6,10 +6,12 @@ use Webpatser\Torque\Process\MasterProcess;
 
 /*
  * `MasterProcess::clearStaleDrainPause()` is the boot half-step that stops a
- * dead reload from parking the fleet: a `drain:<pid>` key belongs to one
- * master, so when that PID is gone the pause has no owner and the next master
- * deletes it instead of honouring the rest of its TTL (grace + 60, which is
- * over two hours where `drain_grace_seconds` is 7200).
+ * dead reload from parking the fleet: a legacy `drain:<pid>` key (written by
+ * masters before 2.5.0) belongs to one master, so when that PID is gone the
+ * pause has no owner and the next master deletes it instead of honouring the
+ * rest of its TTL (grace + 60, which is over two hours where
+ * `drain_grace_seconds` is 7200). While another host is live the value is
+ * kept, see MasterProcessMultiHostTest.
  *
  * Driven directly against real Redis rather than through start(), which would
  * fork a fleet. The liveness probe is injected so the decision does not depend
@@ -22,11 +24,15 @@ beforeEach(function () {
     $this->pausedKey = $this->prefix.'paused';
     $this->logged = [];
 
+    $this->pausesKey = $this->prefix.'pauses';
+    $this->liveKey = $this->prefix.'metrics:live';
+
     $this->master = fn (): MasterProcess => new MasterProcess([
         'redis' => ['uri' => torqueRedisUri(), 'prefix' => $this->prefix],
         'consumer_group' => 'torque-test',
         'streams' => ['default' => []],
         'drain_grace_seconds' => 7200,
+        'node' => 'host-a',
     ], function (string $message) {
         $this->logged[] = $message;
     });
@@ -55,7 +61,36 @@ beforeEach(function () {
 });
 
 afterEach(function () {
-    $this->redis->execute('DEL', $this->pausedKey);
+    $this->redis->execute('DEL', $this->pausedKey, $this->pausesKey, $this->liveKey);
+});
+
+it('clears a dead legacy drain while only its own node is listed as live', function () {
+    ($this->seedPause)('drain:424242', 7260);
+    $this->redis->execute('ZADD', $this->liveKey, (string) time(), 'host-a');
+
+    expect(($this->master)()->clearStaleDrainPause($this->dead))->toBeTrue()
+        ->and((int) $this->redis->execute('EXISTS', $this->pausedKey))->toBe(0);
+});
+
+it('warns about a pause of its own node at boot', function () {
+    $this->redis->execute('HSET', $this->pausesKey, 'node:host-a', (string) time());
+
+    $master = ($this->master)();
+    (new ReflectionMethod($master, 'warnIfPaused'))->invoke($master);
+
+    expect(implode("\n", $this->logged))
+        ->toContain('Node host-a is PAUSED')
+        ->toContain('torque:pause continue --node=host-a')
+        ->not->toContain('Queue is PAUSED');
+});
+
+it('says nothing about a pause of another node', function () {
+    $this->redis->execute('HSET', $this->pausesKey, 'node:host-b', (string) time());
+
+    $master = ($this->master)();
+    (new ReflectionMethod($master, 'warnIfPaused'))->invoke($master);
+
+    expect($this->logged)->toBe([]);
 });
 
 it('clears a drain pause whose master is no longer running', function () {

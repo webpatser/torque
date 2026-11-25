@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Artisan;
 use Webpatser\Torque\Console\TorqueReloadCommand;
+use Webpatser\Torque\Control\ControlChannel;
+use Webpatser\Torque\Control\MasterRegistry;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Support\NodeName;
 
 /*
  * `torque:reload` orchestrates the zero-downtime swap: it reads the PID
@@ -347,6 +350,203 @@ it('succeeds quietly with --if-running when no PID file is present', function ()
 
     expect($exit)->toBe(0)
         ->and(Artisan::output())->toContain('nothing to reload');
+});
+
+/*
+ * Remote reload: --node and --all send the fixed `drain` action through the
+ * control channel against real Redis under a random prefix and wait for the
+ * ack. The test plays the master's part between two polls through the
+ * sleeper seam.
+ */
+
+describe('remote reload', function () {
+    beforeEach(function () {
+        $this->redis = torqueRedis();
+        $this->prefix = 'torque-test-remote-reload-'.bin2hex(random_bytes(4)).':';
+
+        config()->set('torque.redis.uri', torqueRedisUri());
+        config()->set('torque.redis.prefix', $this->prefix);
+        config()->set('torque.control.enabled', true);
+        config()->set('torque.control.command_ttl_seconds', 60);
+
+        $this->registry = new MasterRegistry($this->redis, $this->prefix);
+        $this->channel = new ControlChannel($this->redis, $this->prefix);
+
+        $this->publish = function (string $node, bool $supervised = true): string {
+            $id = sprintf('%s-%d-%s', $node, 4321, bin2hex(random_bytes(4)));
+
+            $this->registry->publish($id, [
+                'node' => $node,
+                'pid' => 4321,
+                'started_at' => time(),
+                'version' => '2.5.0',
+                'supervised' => $supervised,
+                'queues' => ['default'],
+                'workers' => 1,
+                'slots' => 10,
+                'state' => 'running',
+            ]);
+
+            return $id;
+        };
+
+        $this->queued = fn (string $id): array => array_map(
+            static fn (string $raw): array => json_decode($raw, true, 512, JSON_THROW_ON_ERROR),
+            (array) $this->redis->execute('LRANGE', $this->channel->listKey($id), '0', '-1'),
+        );
+
+        // Plays the master: pop and ack with the given verdict.
+        $this->playMaster = fn (array $ids, bool $accept = true): Closure => function () use ($ids, $accept): void {
+            foreach ($ids as $id) {
+                foreach ($this->channel->receive($id) as $received) {
+                    $this->channel->ack((string) $received['id'], $id, $received['command']['action'] ?? null, $accept);
+                }
+            }
+
+            usleep(20_000);
+        };
+    });
+
+    afterEach(function () {
+        TorqueReloadCommand::$remoteSleeper = null;
+
+        $cursor = '0';
+
+        do {
+            [$cursor, $keys] = $this->redis->execute('SCAN', $cursor, 'MATCH', $this->prefix.'*', 'COUNT', '1000');
+            $cursor = (string) $cursor;
+
+            if ($keys !== []) {
+                $this->redis->execute('DEL', ...$keys);
+            }
+        } while ($cursor !== '0');
+    });
+
+    it('sends drain only to the master on the named node and waits for the ack', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+
+        $seen = [];
+        TorqueReloadCommand::$remoteSleeper = function () use ($a, &$seen): void {
+            foreach ($this->channel->receive($a) as $received) {
+                $seen[] = $received['command'];
+                $this->channel->ack((string) $received['id'], $a, 'drain', true);
+            }
+
+            usleep(20_000);
+        };
+
+        $this->artisan('torque:reload', ['--node' => ['host-a'], '--timeout' => 5])
+            ->assertSuccessful()
+            ->expectsOutputToContain("Sent drain to master {$a}")
+            ->expectsOutputToContain("Master {$a} acknowledged the drain");
+
+        expect($seen)->toHaveCount(1)
+            ->and($seen[0]['action'])->toBe('drain')
+            ->and($seen[0]['issuer'])->toBe('cli@'.NodeName::current())
+            ->and(($this->queued)($b))->toBe([]);
+    });
+
+    it('accepts repeated options and comma lists', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+        $c = ($this->publish)('host-c');
+
+        $this->artisan('torque:reload', ['--node' => ['host-a, host-b'], '--timeout' => 0])
+            ->assertFailed();
+
+        expect(($this->queued)($a))->toHaveCount(1)
+            ->and(($this->queued)($b))->toHaveCount(1)
+            ->and(($this->queued)($c))->toBe([]);
+    });
+
+    it('refuses an unsupervised master while a supervised one on another node is sent', function () {
+        $a = ($this->publish)('host-a', supervised: false);
+        $b = ($this->publish)('host-b');
+
+        $this->artisan('torque:reload', ['--node' => ['host-a,host-b'], '--timeout' => 0])
+            ->assertFailed()
+            ->expectsOutputToContain('is not supervised')
+            ->expectsOutputToContain('torque:stop --node=host-a')
+            ->expectsOutputToContain("Sent drain to master {$b}");
+
+        expect(($this->queued)($a))->toBe([])
+            ->and(($this->queued)($b))->toHaveCount(1)
+            ->and(($this->queued)($b)[0]['action'])->toBe('drain');
+    });
+
+    it('times out when no ack arrives', function () {
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:reload', ['--node' => ['host-a'], '--timeout' => 0])
+            ->assertFailed()
+            ->expectsOutputToContain("Master {$a} timed out");
+    });
+
+    it('fails when the master rejects the command', function () {
+        $a = ($this->publish)('host-a');
+        TorqueReloadCommand::$remoteSleeper = ($this->playMaster)([$a], accept: false);
+
+        $this->artisan('torque:reload', ['--node' => ['host-a'], '--timeout' => 5])
+            ->assertFailed()
+            ->expectsOutputToContain("Master {$a} rejected the drain command");
+    });
+
+    it('drains every supervised master with --all', function () {
+        $a = ($this->publish)('host-a');
+        $b = ($this->publish)('host-b');
+        TorqueReloadCommand::$remoteSleeper = ($this->playMaster)([$a, $b]);
+
+        $this->artisan('torque:reload', ['--all' => true, '--timeout' => 5])
+            ->assertSuccessful()
+            ->expectsOutputToContain("Master {$a} acknowledged the drain")
+            ->expectsOutputToContain("Master {$b} acknowledged the drain");
+    });
+
+    it('fails for a node without a live master, unless --if-running', function () {
+        $this->artisan('torque:reload', ['--node' => ['host-zz'], '--timeout' => 0])
+            ->assertFailed()
+            ->expectsOutputToContain('No live Torque master on node [host-zz]');
+
+        $this->artisan('torque:reload', ['--node' => ['host-zz'], '--if-running' => true, '--timeout' => 0])
+            ->assertSuccessful()
+            ->expectsOutputToContain('nothing to reload there');
+    });
+
+    it('refuses an invalid node name before sending anything', function () {
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:reload', ['--node' => ['host-a,bad name!']])
+            ->assertFailed()
+            ->expectsOutputToContain('Nothing was sent');
+
+        expect(($this->queued)($a))->toBe([]);
+    });
+
+    it('refuses --force with the remote forms', function () {
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:reload', ['--node' => ['host-a'], '--force' => true])
+            ->assertFailed()
+            ->expectsOutputToContain('--force cannot be combined');
+
+        expect(($this->queued)($a))->toBe([]);
+    });
+
+    it('refuses the remote forms when remote control is disabled', function () {
+        config()->set('torque.control.enabled', false);
+        $a = ($this->publish)('host-a');
+
+        $this->artisan('torque:reload', ['--node' => ['host-a']])
+            ->assertFailed()
+            ->expectsOutputToContain('Remote control is disabled');
+
+        $this->artisan('torque:reload', ['--all' => true])
+            ->assertFailed()
+            ->expectsOutputToContain('Remote control is disabled');
+
+        expect(($this->queued)($a))->toBe([]);
+    });
 });
 
 it('succeeds quietly with --if-running when the PID file is stale', function () {

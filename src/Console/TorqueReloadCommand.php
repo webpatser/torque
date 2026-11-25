@@ -6,10 +6,15 @@ namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
 use Symfony\Component\Console\Attribute\AsCommand;
+use Webpatser\Torque\Control\ControlChannel;
+use Webpatser\Torque\Control\MasterRegistry;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\ProcessInspector;
+
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Zero-downtime reload of the Torque master.
@@ -23,6 +28,11 @@ use Webpatser\Torque\Support\ProcessInspector;
  * preStop, Supervisor) owns spawning the replacement, under a supervisor the
  * spawned takeover master would escape supervision, so `--drain` is the
  * correct production mode there.
+ *
+ * `--node` and `--all` send the fixed `drain` action to remote masters
+ * through the control channel instead and wait for the acks. That is the
+ * remote form of `--drain`: nothing is spawned, so a master whose record
+ * says it is not supervised is refused (`torque:stop` is the honest verb).
  *
  * Unlike Resonate, Torque has no socket to share. Two masters running
  * briefly during the swap is harmless: the Redis queue claims jobs
@@ -40,10 +50,12 @@ final class TorqueReloadCommand extends Command
 {
     /** @var string */
     protected $signature = 'torque:reload
+        {--node=* : Send drain to the live supervised masters on these nodes through the control channel (repeatable, comma lists allowed)}
+        {--all : Send drain to every live supervised master in the fleet through the control channel}
         {--drain : Only signal the running master to drain; do not spawn a replacement}
         {--if-running : Exit successfully when no master is running instead of failing (for deploy scripts)}
-        {--force : Spawn a takeover master even when the running master is supervised}
-        {--timeout= : Seconds to wait for the old master to exit after the drain signal (default: the drain worst case, reload_pause_seconds + drain_grace_seconds + slack)}
+        {--force : Spawn a takeover master even when the running master is supervised (local only)}
+        {--timeout= : Seconds to wait for the old master to exit after the drain signal (default: the drain worst case, reload_pause_seconds + drain_grace_seconds + slack). Remote: seconds to wait for the acks (default: the command TTL)}
         {--health-timeout=45 : Seconds to wait for the new master to take over the PID file (covers its worker-heartbeat readiness gate)}';
 
     /** @var string */
@@ -88,8 +100,30 @@ final class TorqueReloadCommand extends Command
      */
     private const int SIGNAL_SLACK_SECONDS = 5;
 
+    /**
+     * Test seam: replaces the usleep() between polls while waiting for remote
+     * acks, so a test can play the master's part between two polls.
+     *
+     * @internal
+     *
+     * @var (\Closure(int): void)|null
+     */
+    public static ?\Closure $remoteSleeper = null;
+
+    /**
+     * Polling interval in microseconds while waiting for remote acks.
+     */
+    private const int REMOTE_POLL_INTERVAL = 250_000;
+
     public function handle(): int
     {
+        $nodes = $this->listOption('node');
+        $all = (bool) $this->option('all');
+
+        if ($nodes !== [] || $all) {
+            return $this->reloadRemote($nodes, $all);
+        }
+
         if (windows_os() || ! function_exists('posix_kill')) {
             $this->components->error('torque:reload requires posix extensions and is not supported on Windows.');
 
@@ -111,9 +145,206 @@ final class TorqueReloadCommand extends Command
         }
     }
 
+    /**
+     * Drain remote masters through the control channel: send the fixed
+     * `drain` action to every live supervised master on the named nodes (or
+     * the whole fleet with --all) and wait for the acks. A remote reload
+     * never spawns, so a master without a supervisor to respawn it is
+     * refused: draining it would only stop it.
+     *
+     * @param  list<string>  $nodes
+     */
+    private function reloadRemote(array $nodes, bool $all): int
+    {
+        if ($all && $nodes !== []) {
+            $this->components->error('--all cannot be combined with --node.');
+
+            return self::FAILURE;
+        }
+
+        if ($this->option('force')) {
+            $this->components->error(
+                '--force cannot be combined with --node or --all: a remote reload only drains and never spawns a takeover master.',
+            );
+
+            return self::FAILURE;
+        }
+
+        $config = Narrow::map(config('torque'));
+        $control = Narrow::map($config['control'] ?? null);
+
+        if (! Narrow::bool($control['enabled'] ?? null, true)) {
+            $this->components->error(
+                'Remote control is disabled (torque.control.enabled is false). Nothing was sent; run torque:reload on the node itself.',
+            );
+
+            return self::FAILURE;
+        }
+
+        foreach ($nodes as $node) {
+            try {
+                NodeName::validate($node);
+            } catch (\InvalidArgumentException $e) {
+                $this->components->error('Nothing was sent: '.$e->getMessage());
+
+                return self::FAILURE;
+            }
+        }
+
+        $commandTtl = Narrow::int($control['command_ttl_seconds'] ?? null, 60);
+        $redisConfig = Narrow::map($config['redis'] ?? null);
+        $redis = createRedisClient(Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379'));
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
+
+        try {
+            $channel = new ControlChannel($redis, $prefix, $commandTtl);
+        } catch (\InvalidArgumentException $e) {
+            $this->components->error('Nothing was sent: '.$e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $masters = new MasterRegistry($redis, $prefix)->all();
+        $ifRunning = (bool) $this->option('if-running');
+        $failed = false;
+
+        if ($all) {
+            if ($masters === []) {
+                if ($ifRunning) {
+                    $this->components->warn('No live Torque master found in the fleet; nothing to reload.');
+
+                    return self::SUCCESS;
+                }
+
+                $this->components->error('No live Torque master found in the fleet. Nothing was sent.');
+
+                return self::FAILURE;
+            }
+
+            $targets = $masters;
+        } else {
+            $targets = [];
+
+            foreach ($nodes as $node) {
+                $onNode = array_values(array_filter($masters, static fn (array $master): bool => $master['node'] === $node));
+
+                if ($onNode === []) {
+                    if ($ifRunning) {
+                        $this->components->warn("No live Torque master on node [{$node}]; nothing to reload there.");
+                    } else {
+                        $this->components->error("No live Torque master on node [{$node}].");
+                        $failed = true;
+                    }
+
+                    continue;
+                }
+
+                array_push($targets, ...$onNode);
+            }
+        }
+
+        $issuer = 'cli@'.NodeName::current();
+
+        /** @var array<string, string> $sent master id to command id */
+        $sent = [];
+
+        foreach ($targets as $master) {
+            if (! $master['supervised']) {
+                $this->components->error(
+                    "Master {$master['master_id']} is not supervised: a drain would stop it without a replacement. Nothing was sent to it.",
+                );
+                $this->line("  Use torque:stop --node={$master['node']} to stop it, or reload it on that node itself.");
+                $failed = true;
+
+                continue;
+            }
+
+            $command = $channel->send($master['master_id'], ControlChannel::ACTION_DRAIN, $issuer);
+            $sent[$master['master_id']] = $command['id'];
+            $this->components->info("Sent drain to master {$master['master_id']} on node [{$master['node']}] (PID {$master['pid']}).");
+        }
+
+        if ($sent !== []) {
+            $timeoutOption = $this->option('timeout');
+            $timeout = $timeoutOption === null ? $commandTtl : max(0, Narrow::int($timeoutOption));
+
+            if (! $this->awaitRemoteAcks($channel, $sent, $timeout)) {
+                $failed = true;
+            }
+        }
+
+        return $failed ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * Wait for every master to ack its drain command. Returns false when a
+     * master rejected it or no ack arrived within the timeout.
+     *
+     * @param  array<string, string>  $pending  master id to command id
+     */
+    private function awaitRemoteAcks(ControlChannel $channel, array $pending, int $timeout): bool
+    {
+        $ok = true;
+        $deadline = microtime(true) + $timeout;
+
+        while (true) {
+            foreach ($pending as $masterId => $commandId) {
+                $ack = $channel->readAck($commandId);
+
+                if ($ack === null) {
+                    continue;
+                }
+
+                unset($pending[$masterId]);
+
+                if (! $ack['accepted'] || $ack['master'] !== $masterId) {
+                    $this->components->error("Master {$masterId} rejected the drain command.");
+                    $ok = false;
+
+                    continue;
+                }
+
+                $this->components->info("Master {$masterId} acknowledged the drain; its supervisor starts the replacement once it exits.");
+            }
+
+            if ($pending === [] || microtime(true) >= $deadline) {
+                break;
+            }
+
+            self::$remoteSleeper !== null
+                ? (self::$remoteSleeper)(self::REMOTE_POLL_INTERVAL)
+                : usleep(self::REMOTE_POLL_INTERVAL);
+        }
+
+        foreach (array_keys($pending) as $masterId) {
+            $this->components->error("Master {$masterId} timed out: no acknowledgement within {$timeout} seconds.");
+            $ok = false;
+        }
+
+        return $ok;
+    }
+
+    /**
+     * A repeatable option with comma lists flattened, trimmed and deduplicated.
+     * Empty entries are kept so validation refuses them.
+     *
+     * @return list<string>
+     */
+    private function listOption(string $name): array
+    {
+        $values = [];
+
+        foreach ((array) $this->option($name) as $raw) {
+            foreach (explode(',', Narrow::string($raw, '')) as $value) {
+                $values[] = trim($value);
+            }
+        }
+
+        return array_values(array_unique($values));
+    }
+
     private function reload(): int
     {
-
         $oldPid = MasterProcess::readPid();
 
         if ($oldPid === null) {

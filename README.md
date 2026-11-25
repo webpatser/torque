@@ -77,6 +77,8 @@ Set it as default in `.env`:
 QUEUE_CONNECTION=torque
 ```
 
+Keep `redis_uri` of this queue connection equal to `torque.redis.uri` (`TORQUE_REDIS_URI`). The queue connection decides where jobs are written and the master and workers read from `torque.redis`; with several hosts, a mismatch on one of them splits the fleet across two Redis instances without any error.
+
 ## Usage
 
 ### Starting the worker
@@ -90,6 +92,8 @@ Options:
 ```bash
 php artisan torque:start --workers=8 --concurrency=100 --queues=emails,notifications
 ```
+
+`--node=` sets the node name and selects the `nodes` block of the [multi-host config](#multi-host). `--workers`, `--concurrency` and `--queues` win over that block.
 
 ### Dispatching jobs
 
@@ -358,16 +362,16 @@ If your queue names already contain hash tags (e.g., `{myqueue}`), Torque will n
 | Command | Description |
 |---------|-------------|
 | `torque:start` | Start the master + worker processes |
-| `torque:stop` | Graceful shutdown (SIGTERM). Use `--force` for SIGKILL. Like Horizon's `horizon:terminate`, it exits 0 when no master is running, also on a stale PID file whose number now belongs to an unrelated process (warned, not signalled, file left in place, orphaned workers swept). Exits 1 on a symlinked PID file or a live process whose command line cannot be read, or when SIGTERM cannot be sent |
-| `torque:status` | Show worker metrics, throughput, and queue depths |
-| `torque:monitor` | Live htop-style terminal dashboard |
+| `torque:stop` | Graceful shutdown (SIGTERM). Use `--force` for SIGKILL. `--node=` and `--all` stop masters on other hosts through the control channel (see [Multi-host](#multi-host)). Like Horizon's `horizon:terminate`, it exits 0 when no master is running, also on a stale PID file whose number now belongs to an unrelated process (warned, not signalled, file left in place, orphaned workers swept). Exits 1 on a symlinked PID file or a live process whose command line cannot be read, or when SIGTERM cannot be sent |
+| `torque:status` | Show worker metrics, throughput, and queue depths, plus a masters table (node, PID, state, version, supervised, leader), the active pause scopes and a groups table for masters with several worker groups. `--node=` limits it to one node |
+| `torque:monitor` | Live htop-style terminal dashboard. The footer shows the number of live nodes and whether this node is paused |
 | `torque:tail` | Tail a job's event stream in real-time |
-| `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener |
-| `torque:pause continue` | Resume processing. Dispatches `WorkerResuming` |
-| `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn) |
+| `torque:pause` | Pause job processing (in-flight jobs complete). Dispatches `WorkerPausing` to any registered listener. `--node=` and `--queue=` (repeatable) pause one node or one queue instead of the whole fleet |
+| `torque:pause continue` | Resume processing. Dispatches `WorkerResuming`. `--all` also lifts every node and queue pause |
+| `torque:reload` | Zero-downtime reload via the takeover handshake: spawns `torque:start --takeover`, whose fleet must heartbeat before it claims the PID file and drains the old master. `--drain` for supervisor-driven setups (the supervisor owns the respawn). `--node=` and `--all` drain supervised masters on other hosts (see [Multi-host](#multi-host)) |
 | `torque:prune` | Trim the dead-letter stream (TTL + cap) and delete stale stream consumers. `--dead-letter-max` defaults to `dead_letter.max_entries`; `--consumer-idle` (whole seconds, 0 or more, default 3600, also with `--deep`) sets how long a consumer without pending work must be idle before it is deleted, and each delete re-checks the pending list atomically so a job taken in between is not lost. `--deep` also sweeps orphaned job streams, stale index members and stale worker hashes; `--dry-run` to preview |
 | `torque:forget {id?} {--all} {--queue=} {--force}` | Delete a dead-letter entry by its stream id (like `1700000000000-0`, shown by the dashboard and `torque:tail`), or with `--all` every entry; uuids and `queue:failed` ids are rejected. `--queue` limits `--all` to one queue, `--force` skips the confirmation. Only `database-uuids` `failed_jobs` rows are removed with the entry; `--all` leaves rows that have no dead-letter entry. Horizon's `horizon:forget` |
-| `torque:supervisor` | Generate a Supervisor config file. `--php` sets the PHP binary (default `PHP_BINARY`), `--app-path` overrides the app path (a Deployer `releases/N` path uses the `current` symlink automatically), `--stdout` prints the config instead of writing it |
+| `torque:supervisor` | Generate a Supervisor config file. `--php` sets the PHP binary (default `PHP_BINARY`), `--app-path` overrides the app path (a Deployer `releases/N` path uses the `current` symlink automatically), `--stdout` prints the config instead of writing it, `--node` writes a node name into the `command=` line |
 
 ## Configuration
 
@@ -481,6 +485,99 @@ Every process exports under its own `service.instance.id`; the fleet-wide number
 
 Workers mark themselves long-running for fledge-apm with the role `torque` from inside their event loop, and fledge-apm's timer exports for them every `APM_METRICS_INTERVAL`. The master's supervision loop turns only about once a second, too seldom for an asynchronous export, so it exports from its maintenance tick instead: synchronously, at most once per interval, bounded by the OTLP timeouts (about 2 seconds by default) and left out of the stall watchdog's clock. That needs a fledge-apm that provides `Metrics::collectDue()`; with an older one the master's instruments export only when it shuts down.
 
+## Multi-host
+
+Torque runs on several hosts against one Redis: every host runs its own `torque:start`, and the hosts share the queues, the dashboard and the metrics. A host is a node, and Torque 2.5.0 adds per-node settings, scoped pauses and remote stop and reload on top of that.
+
+### Setup
+
+- Point every host at the same Redis (`torque.redis.uri` and `torque.redis.prefix`). Keep `redis_uri` of the queue connection in `config/queue.php` equal to `torque.redis.uri` on every host.
+- Run one `torque:start` per host. A second master on the same host is refused as before.
+- Name the node with `--node=`, then `TORQUE_NODE` (`torque.node`), then the hostname. A name matches `[A-Za-z0-9._-]{1,48}`; an explicit name that does not match makes `torque:start` refuse. A hostname that is too long or has other characters is normalised instead (invalid characters become `-`, a long one is shortened and gets a short hash suffix), so existing installs keep starting. Set `TORQUE_NODE` when you want a stable, readable name.
+- Renaming a node (or a hostname that now normalises differently) starts a new per-host metrics history row; the old one ages out.
+- Masters and workers get ids of the form `{node}-{pid}-{hex8}`, so two hosts with the same PIDs no longer collide, and each master only counts, scales and drains its own workers.
+
+### Per-node config
+
+`nodes` in `config/torque.php` is keyed by node name or an `fnmatch` pattern:
+
+```php
+'nodes' => [
+    'web-*' => ['queues' => ['default', 'emails'], 'workers' => 2],
+    'batch-1' => ['queues' => ['imports', 'default'], 'workers' => 8, 'slots_per_worker' => 20,
+        'autoscale' => ['enabled' => true, 'max_workers' => 16]],
+],
+```
+
+- **Matching:** an exact name wins; otherwise the first pattern that matches, in declaration order. No match means the flat config applies.
+- **Precedence:** CLI options (`--workers`, `--concurrency`, `--queues`), then the node block, then the flat keys.
+- **Allowlist:** `queues` (each must be a key of `streams`, otherwise start refuses), `workers`, `slots_per_worker`, `autoscale` (deep merged over the global one), `max_jobs_per_worker`, `max_worker_lifetime`, `memory_limit` and `groups`. Anything else in a block is refused at start. `streams`, `redis`, `waits`, `dead_letter` and `consumer_group` stay global.
+
+### Worker groups
+
+`groups` splits one node into several worker groups under one master, each with its own queues, worker count and autoscaler:
+
+```php
+'nodes' => ['batch-*' => ['slots_per_worker' => 20, 'autoscale' => ['enabled' => true], 'groups' => [
+    'imports' => ['queues' => ['imports'], 'workers' => 2, 'autoscale' => ['min_workers' => 2, 'max_workers' => 12]],
+    'mail' => ['queues' => ['emails', 'default'], 'workers' => 2, 'slots_per_worker' => 100, 'autoscale' => ['enabled' => false]],
+]]],
+```
+
+- A group name matches `[a-z0-9_-]{1,32}` and is unique within the node. A group takes `queues` (required, non-empty, keys of `streams`), `workers`, `slots_per_worker` and `autoscale`; the node block's own keys are its defaults. `max_jobs_per_worker`, `max_worker_lifetime` and `memory_limit` stay node level.
+- A node without `groups` is one implicit group named `default`, so single-group installs behave as before. A single host uses the pattern `'*'`.
+- Each group respawns, backs off and scales on its own: a crash loop in one group does not delay another, and a scale-down only picks workers of that group. A group does not scale up under a global or node pause, or when all of its queues are paused.
+- CLI: `--queues` replaces all configured groups with one group named `default` and says so in the log. The option only checks the name format; the keys-of-`streams` rule applies to queues in a `nodes` block and its `groups`. `--workers` or `--concurrency` without `--queues` is refused when more than one group is configured, because it is ambiguous which group it means.
+- There is no pause per group: pause the group's queues. A queue shared by two groups pauses in both. With several groups (or a group not named `default`) `torque:status` adds a groups table, log lines carry `[group name]` and the dashboard groups workers by node and then by group.
+
+### Pausing a node or a queue
+
+```bash
+php artisan torque:pause pause --node=web-1
+php artisan torque:pause pause --queue=imports --queue=emails,default
+php artisan torque:pause continue --node=web-1
+php artisan torque:pause continue --all
+```
+
+- Without options `torque:pause` is the global pause as before. `--node` and `--queue` are repeatable and accept comma lists; workers pick them up within about two seconds. A node pause pauses every worker on that node, a queue pause pauses that queue on every node.
+- `continue --all` lifts the global pause, every node pause and every queue pause, and closes the circuit breakers. A scoped `continue` leaves breakers alone. `pause --all` equals the global pause; `toggle --all` is refused.
+- A reload's drain pause is a separate per-master key and never replaces a deliberate pause.
+
+### Remote stop and reload
+
+```bash
+php artisan torque:stop --node=web-2 --timeout=120
+php artisan torque:stop --all            # asks for confirmation, --force skips it
+php artisan torque:reload --node=web-1 --node=web-2
+php artisan torque:reload --all --timeout=60
+```
+
+- `torque:stop --node=` (repeatable, comma lists allowed) or `--all` sends a `stop` command to each live master and waits for its record to disappear, up to `--timeout`. `--force` with `--node` is refused (there is no remote SIGKILL); with `--all` it only skips the confirmation. `--all` cannot be combined with `--node`.
+- `torque:reload --node=` or `--all` sends `drain` to each live master and waits for the acknowledgements (`--timeout`, default the command TTL). The master drains and exits; its supervisor starts the replacement. A remote reload never spawns a process. `--force` is local only, and `--all` cannot be combined with `--node`.
+- **Unsupervised masters are refused.** A drain would stop an unsupervised master without a replacement, so `torque:reload` reports it and sends nothing; use `torque:stop --node=` instead, or reload on that host itself. A master counts as supervised only when `TORQUE_SUPERVISED` is `1`, `true` or `yes` in its environment. `torque:supervisor` writes `environment=TORQUE_SUPERVISED="1"` into the generated config; for systemd use `Environment=TORQUE_SUPERVISED=1`.
+- `torque:reload --all` drains every supervised master at the same time, so job pickup pauses across the cluster until the supervisors have restarted them. Reload node by node with `--node` for a rolling reload.
+- A timeout from a remote stop or reload does not prove the command failed: the master may still have applied it when the acknowledgement was lost. Check `torque:status`.
+- A node without a live master is an error for both commands; `torque:reload --if-running` only warns for it.
+
+### Cluster duties
+
+One master holds a leader lease (`{prefix}leader`, 15 second TTL, renewed every tick) and runs the duties that should happen once per cluster: dead-letter trimming, the consumer sweep, the redelivery prune and long-wait alerts. A draining or stopping master releases the lease at once and another takes it over. Delayed-job migration runs in the workers and is unchanged. `torque:status` marks the leader in the masters table.
+
+### Status and monitoring
+
+`torque:status` lists every live master (node, PID, state, version, supervised, leader), the active node and queue pauses and, with several groups, a table per master; `--node=` filters it. `torque:monitor` shows the number of live nodes and whether this node is paused. The dashboard's workers page shows the same node state, read-only.
+
+### Remote control and trust
+
+Remote control uses one Redis list per master. Commands are JSON with a fixed action (`stop` or `drain`), an id, an issuer and an expiry; a master reads them in its maintenance tick, logs each one, acknowledges it and drops unknown or expired ones.
+
+Redis write access already means code execution (job payloads are serialized) and denial of service. Remote control adds two fixed actions without arguments; a remote reload only drains and never spawns anything; commands expire after 60 seconds; and Redis ACLs are the boundary. Commands carry an expiry set by the issuing host's clock and checked by the master's clock, and master records are judged stale by the reader's clock, so keep host clocks in sync (NTP); skew larger than `control.command_ttl_seconds` makes every remote command arrive as expired. Keep Redis on a private network or behind TLS plus an ACL user, and give only trusted tooling write access.
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `control.enabled` (`TORQUE_REMOTE_CONTROL`) | `true` | `false` makes this master ignore remote commands. It still appears in the masters table and honours pauses |
+| `control.command_ttl_seconds` | `60` | How long a command stays valid before a master drops it unread |
+
 ## Dashboard
 
 Torque includes a self-contained dashboard at `/torque` (configurable). It is built with **Livewire 4** and plain Blade + Tailwind, served Horizon/Pulse-style: a set of full-page Livewire components share one Blade layout, and the compiled `dist/torque.css` is inlined into it. Livewire (a hard dependency) ships its own runtime and bundled Alpine through your app, so there is **no React, no Flux, no paid UI library, no host Tailwind or Vite build, and no `npm` step in your application**. The dashboard is off by default as of 2.0. Enable it with `TORQUE_DASHBOARD=true` or in config:
@@ -494,7 +591,7 @@ Torque includes a self-contained dashboard at `/torque` (configurable). It is bu
 Features:
 - Real-time metrics (throughput, latency, concurrent jobs, memory) with a damped throughput gauge: the needle shows a smoothed five-minute jobs/min figure plus the exact count for the last hour, so a burst of 1500 jobs every five minutes reads as 300/min instead of 0 and then 90K
 - Long-term history: minute, hour and day rollups (cluster-wide and per stream) power the 1h / 24h / 7d / 90d throughput chart and the processed / failed today columns on the Queues page
-- Worker table with coroutine slot usage bars
+- Worker table with coroutine slot usage bars, grouped by node and worker group, with each node's paused or draining state, version and supervised flag (read-only: pausing, stopping and reloading stay on the CLI)
 - Jobs page: throughput, average and peak runtime, and fail rate per job class over 1h / 24h / 7d / 90d
 - Stream/queue overview with pending and delayed counts
 - Failed jobs list with retry and delete actions (cursor-paginated)
@@ -684,7 +781,7 @@ Slack needs `laravel/slack-notification-channel`. Every route gets a Block Kit m
 - The event and the notifications run in a short-lived child process that boots the app fresh, so register listeners and routes in a service provider.
 - One alert can take up to 60 seconds (`long_wait_alert_seconds`), shared across its steps. A throwing listener can run again for the same episode.
 - Failures appear in the master's output and the app log.
-- Each host's master alerts separately, and a master restart may re-fire once for an ongoing episode.
+- Only the master holding the cluster leader lease raises long-wait alerts, so one episode alerts once per cluster instead of once per host. When the leader goes away the lease moves to another master within about 15 seconds, and a leader change may re-fire once for an ongoing episode.
 
 ### Tags and silenced jobs
 
@@ -764,7 +861,7 @@ php artisan torque:reload
 
 The reload spawns `torque:start --takeover=<oldPid>`, which boots its fleet in its own session, waits for its own workers' first metrics heartbeat (`takeover_ready_timeout_seconds`, default 30 s), and only then claims the PID file and signals the old master to drain. A replacement whose fleet never becomes healthy aborts the takeover with the old master untouched, so a broken deploy stays a failed reload instead of an outage; the replacement's output is surfaced by the reload command on failure.
 
-During the swap the old master's drain pause is scoped to its own workers (the pause key carries the master PID and a TTL), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. For takeover restarts, keep `drain_grace_seconds` (`TORQUE_DRAIN_GRACE`, derived by default) below the stream `retry_after` so the brief overlap cannot double-claim jobs. `--drain` restarts are unaffected by this, and long-running streams may exceed `retry_after` there. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
+During the swap the old master's drain pause is scoped to its own workers (each master has its own `{prefix}drain:{masterId}` key with a TTL, so other hosts and a deliberate `torque:pause` are never touched), so the new fleet keeps consuming throughout. In-flight jobs finish naturally on the old master; the Redis queue handles claim-once semantics across both fleets. For takeover restarts, keep `drain_grace_seconds` (`TORQUE_DRAIN_GRACE`, derived by default) below the stream `retry_after` so the brief overlap cannot double-claim jobs. `--drain` restarts are unaffected by this, and long-running streams may exceed `retry_after` there. One accepted risk on unsupervised hosts: a takeover master SIGKILLed after claiming the PID file leaves nothing to respawn it, which is inherent to running without a supervisor.
 
 #### Two clocks, one ceiling
 

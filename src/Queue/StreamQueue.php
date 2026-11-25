@@ -20,6 +20,7 @@ use Webpatser\Torque\Redis\StreamHousekeeper;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 use Webpatser\Torque\Stream\JobTagExtractor;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Worker\WorkerProcess;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -232,7 +233,7 @@ LUA;
         $this->redis = $readTimeout !== null && $readTimeout > 0
             ? new RedisClient(new ReconnectingRedisLink(createRedisConnector($this->redisUri), readTimeout: $readTimeout))
             : createRedisClient($this->redisUri);
-        $this->consumerId = gethostname().'-'.getmypid();
+        $this->consumerId = NodeName::current().'-'.getmypid();
     }
 
     // -------------------------------------------------------------------------

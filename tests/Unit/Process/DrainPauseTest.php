@@ -5,11 +5,13 @@ declare(strict_types=1);
 use Webpatser\Torque\Process\DrainPause;
 
 /*
- * `DrainPause::isStale()` decides whether a `{prefix}paused` key is a drain
- * left behind by a master that is gone. The rule, in order:
+ * `DrainPause::isStale()` decides whether a `{prefix}paused` key is a legacy
+ * drain (written by masters before 2.5.0) left behind by a master that is
+ * gone. The rule, in order:
  *
  *   - not a `drain:<pid>` value  -> keep (a manual `torque:pause` is an
  *                                   operator decision, never cleared for them)
+ *   - another host is live       -> keep (the PID may be a master over there)
  *   - our own PID                -> stale (a master writes its drain key only
  *                                   while draining, so this is a recycled PID)
  *   - the PID is not a live master -> stale
@@ -62,6 +64,38 @@ it('never asks the probe about a value it will not clear', function () {
     });
 
     expect($asked)->toBe([]);
+});
+
+it('keeps a legacy drain while another host is live, whatever the probe says', function () use ($dead) {
+    // The PID can only be checked here; over there it may be a draining master.
+    expect(DrainPause::isStale('drain:4242', 99, $dead, ['host-a', 'host-b'], ['host-a']))->toBeFalse()
+        ->and(DrainPause::isStale('drain:4242', 4242, $dead, ['host-b'], ['host-a']))->toBeFalse();
+});
+
+it('judges a legacy drain on the PID when only this host is live', function () use ($dead, $alive) {
+    expect(DrainPause::isStale('drain:4242', 99, $dead, ['host-a'], ['host-a', 'machine']))->toBeTrue()
+        ->and(DrainPause::isStale('drain:4242', 99, $dead, ['machine'], ['host-a', 'machine']))->toBeTrue()
+        ->and(DrainPause::isStale('drain:4242', 99, $alive, ['host-a'], ['host-a']))->toBeFalse()
+        ->and(DrainPause::isStale('drain:4242', 99, $dead, [], ['host-a']))->toBeTrue();
+});
+
+it('never asks the probe while another host is live', function () {
+    $asked = [];
+
+    DrainPause::isStale('drain:4242', 99, function (int $pid) use (&$asked): bool {
+        $asked[] = $pid;
+
+        return false;
+    }, ['host-b'], ['host-a']);
+
+    expect($asked)->toBe([]);
+});
+
+it('tells whether any live host is not one of ours', function () {
+    expect(DrainPause::otherHostLive([], ['host-a']))->toBeFalse()
+        ->and(DrainPause::otherHostLive(['host-a'], ['host-a']))->toBeFalse()
+        ->and(DrainPause::otherHostLive(['host-a', 'host-b'], ['host-a']))->toBeTrue()
+        ->and(DrainPause::otherHostLive(['host-b'], []))->toBeTrue();
 });
 
 it('reads the owning master PID out of a drain value', function () {

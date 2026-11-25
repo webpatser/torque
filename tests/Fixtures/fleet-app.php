@@ -16,6 +16,19 @@ declare(strict_types=1);
  * storage/. The process title carries "torque:start" so the orphan sweeps of
  * torque:start know the workers have a live master, but never "artisan
  * torque:start", so the sweeps of other tests never target it.
+ *
+ * A `node` in config.json becomes torque.node and the --node of torque:start,
+ * so two run directories with different nodes are two hosts on one prefix
+ * (tests/Integration/MultiHostTest.php). Without it, nothing changes.
+ *
+ * A `nodes` block in config.json (node patterns with their `groups`) becomes
+ * torque.nodes as written, and torque:start then gets no --workers,
+ * --concurrency or --queues, so the node block and its worker groups decide
+ * (tests/Integration/WorkerGroupsTest.php). Without it, nothing changes.
+ *
+ * With more arguments after the run directory, this file runs that command
+ * line instead (`fleet-app.php <dir> torque:stop --node=b`), on the same
+ * config and Redis, in the caller's process group and without a master title.
  */
 
 use Illuminate\Support\Facades\Artisan;
@@ -29,8 +42,9 @@ require_once __DIR__.'/use-test-redis.php';
 
 $isWorker = isset($runDir);
 $runDir ??= $argv[1];
+$commandLine = $isWorker ? '' : implode(' ', array_slice($argv, 2));
 
-if (! $isWorker) {
+if (! $isWorker && $commandLine === '') {
     posix_setpgid(0, 0);
     cli_set_process_title('torque:start fleet-fixture');
 }
@@ -53,6 +67,13 @@ config([
     'torque' => array_replace_recursive(config('torque'), require __DIR__.'/baseline-limits.php', $settings),
 ]);
 
+// The node blocks as written: a recursive merge would keep keys of other blocks.
+$hasNodes = isset($settings['nodes']) && is_array($settings['nodes']);
+
+if ($hasNodes) {
+    config(['torque.nodes' => $settings['nodes']]);
+}
+
 $app->setBasePath($runDir);
 $app->useStoragePath($runDir.'/storage');
 
@@ -69,8 +90,15 @@ if ($isWorker) {
     exit(Artisan::call('torque:worker', $options, $output));
 }
 
+if ($commandLine !== '') {
+    exit(Artisan::call($commandLine, [], $output));
+}
+
 exit(Artisan::call('torque:start', [
-    '--workers' => (string) config('torque.workers'),
-    '--concurrency' => (string) config('torque.slots_per_worker'),
-    '--queues' => implode(',', config('torque.queues')),
+    ...($hasNodes ? [] : [
+        '--workers' => (string) config('torque.workers'),
+        '--concurrency' => (string) config('torque.slots_per_worker'),
+        '--queues' => implode(',', config('torque.queues')),
+    ]),
+    ...(isset($settings['node']) ? ['--node' => (string) $settings['node']] : []),
 ], $output));

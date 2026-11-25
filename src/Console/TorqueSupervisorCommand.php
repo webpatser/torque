@@ -8,6 +8,7 @@ use Illuminate\Console\Command;
 use Symfony\Component\Console\Output\OutputInterface;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 
 /**
  * Generate a Supervisor configuration file for running Torque in production.
@@ -26,6 +27,7 @@ final class TorqueSupervisorCommand extends Command
         {--stdout : Print the config to stdout instead of writing a file}
         {--user= : Process user}
         {--workers= : Number of worker processes}
+        {--node= : Node name written into the command= line as --node}
         {--php= : PHP binary for the command= line (defaults to the running PHP binary)}
         {--app-path= : Application root for artisan and logs (defaults to the Deployer current symlink or base_path())}';
 
@@ -54,6 +56,19 @@ final class TorqueSupervisorCommand extends Command
             $this->components->error('The --app-path value must be an absolute path (starting with /).');
 
             return self::FAILURE;
+        }
+
+        $nodeArgument = '';
+        $nodeOption = $this->option('node');
+
+        if (is_string($nodeOption) && $nodeOption !== '') {
+            try {
+                $nodeArgument = ' --node='.NodeName::validate($nodeOption);
+            } catch (\InvalidArgumentException $e) {
+                $this->components->error($e->getMessage());
+
+                return self::FAILURE;
+            }
         }
 
         $root = $this->resolveAppRoot();
@@ -103,12 +118,13 @@ final class TorqueSupervisorCommand extends Command
         $config = <<<INI
         [program:torque]
         process_name=%(program_name)s
-        command="{$php}" "{$artisanPath}" torque:start --replace --workers={$workers}
+        command="{$php}" "{$artisanPath}" torque:start --replace --workers={$workers}{$nodeArgument}
         autostart=true
         autorestart=true
         startretries=10
         stopwaitsecs={$stopWaitSecs}
         user={$user}
+        environment=TORQUE_SUPERVISED="1"
         redirect_stderr=true
         stdout_logfile="{$logPath}"
         stopasgroup=true

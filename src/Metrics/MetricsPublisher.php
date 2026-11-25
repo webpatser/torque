@@ -8,6 +8,7 @@ use Fledge\Async\Redis\Connection\ReconnectingRedisLink;
 use Fledge\Async\Redis\RedisClient;
 use Illuminate\Support\Arr;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\WorkerId;
 
 use function Fledge\Async\async;
@@ -362,17 +363,36 @@ LUA;
      * Two round trips: the hash with its expiry, then the index entry. They
      * stay two scripts because the keys can sit in different cluster slots,
      * and the index goes second so a failed hash write never adds a member.
+     *
+     * `master` is the id of the master that spawned the worker, which is how a
+     * master tells its own workers from another master's on the same node;
+     * it is left out when unknown (a worker started by an older master), so
+     * readers fall back to host and PID. `group` is the worker group, for
+     * display only.
      */
-    public function publishWorkerMetrics(string $workerId, WorkerSnapshot $snapshot): void
+    public function publishWorkerMetrics(string $workerId, WorkerSnapshot $snapshot, ?string $master = null, ?string $group = null): void
     {
         $redis = $this->getRedis();
         $key = $this->prefix.'worker:'.$workerId;
         $parsed = WorkerId::parse($workerId);
 
+        $identity = [];
+
+        if ($master !== null && $master !== '') {
+            $identity[] = 'master';
+            $identity[] = $master;
+        }
+
+        if ($group !== null && $group !== '') {
+            $identity[] = 'group';
+            $identity[] = $group;
+        }
+
         $redis->eval(self::LUA_HSET_EXPIRE, [$key], [
             (string) self::HEARTBEAT_TTL_SECONDS,
             'pid', (string) ($parsed->pid ?? getmypid()),
             'host', $parsed->host,
+            ...$identity,
             'jobs_processed', (string) $snapshot->jobsProcessed,
             'jobs_failed', (string) $snapshot->jobsFailed,
             'active_slots', (string) $snapshot->activeSlots,
@@ -540,14 +560,13 @@ LUA;
     }
 
     /**
-     * This machine's name, the same one its workers put in their ids.
+     * This machine's node name, the same one its workers put in their ids.
+     * Identical to the hostname while no node name is configured.
      */
     #[\NoDiscard]
     public static function localHost(): string
     {
-        $host = gethostname();
-
-        return $host === false || $host === '' ? 'unknown' : $host;
+        return NodeName::current();
     }
 
     /**

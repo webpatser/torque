@@ -12,8 +12,11 @@ use Fledge\Async\Redis\RedisException;
 use Illuminate\Queue\Worker;
 use Illuminate\Support\ConfigurationUrlParser;
 use Webpatser\Torque\Console\TorqueWorkerCommand;
+use Webpatser\Torque\Control\ControlChannel;
+use Webpatser\Torque\Control\LeaderLease;
+use Webpatser\Torque\Control\MasterRegistry;
+use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Job\CircuitBreaker;
-use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Manager\ScaleDecision;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Queue\StreamQueue;
@@ -24,6 +27,8 @@ use Webpatser\Torque\Support\EventLoopDriver;
 use Webpatser\Torque\Support\LegacyConfig;
 use Webpatser\Torque\Support\LongWaitGate;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeConfig;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
@@ -80,7 +85,78 @@ LUA;
 
     private ?float $drainStartedAt = null;
 
-    private ?AutoScaler $autoScaler = null;
+    /** Whether {@see beginDrain()} wrote this master's drain key, which {@see endDrain()} removes. */
+    private bool $drainKeyWritten = false;
+
+    /** This master's node name, resolved once, see {@see node()}. */
+    private ?string $node = null;
+
+    /** This master's id, generated once, see {@see masterId()}. */
+    private ?string $masterId = null;
+
+    /** Seconds a host stays in `{prefix}metrics:live`, as {@see MetricsPublisher} writes it. */
+    private const int LIVE_HOST_WINDOW_SECONDS = 30;
+
+    /** Registry `state` values, see {@see registryState()}. */
+    public const string STATE_STARTING = 'starting';
+
+    public const string STATE_RUNNING = 'running';
+
+    public const string STATE_DRAINING = 'draining';
+
+    public const string STATE_STOPPING = 'stopping';
+
+    /** Environment variable a supervisor sets to mark this master as supervised, see {@see supervisedFromEnvironment()}. */
+    public const string SUPERVISED_ENV = 'TORQUE_SUPERVISED';
+
+    /** Seconds between two registry heartbeats while the state does not change; the record lives {@see MasterRegistry::RECORD_TTL_SECONDS}. */
+    private const int REGISTRY_PUBLISH_INTERVAL = 5;
+
+    /** Unix time this master started, for the registry record. */
+    private ?int $startedAt = null;
+
+    /** Whether the monitor loop has been entered: before that the record reads `starting`. */
+    private bool $monitoring = false;
+
+    /** Unix time of the next registry heartbeat, null before the first. */
+    private ?int $registryDueAt = null;
+
+    /** The state written by the last registry publish. */
+    private ?string $publishedState = null;
+
+    /** Whether a supervisor owns this master's respawn, resolved once. */
+    private ?bool $supervised = null;
+
+    /** The installed Torque version, resolved once. */
+    private ?string $version = null;
+
+    /**
+     * Whether this master held the fleet-wide leader lease at its last
+     * maintenance tick. Only the leader runs the cluster duties
+     * ({@see handleClusterDuties()}); a Redis error reads as not leader.
+     */
+    public private(set) bool $isLeader = false;
+
+    /** @var array<string, true> Cluster duties whose last Redis call failed, logged once per outage. */
+    private array $failingClusterDuties = [];
+
+    /**
+     * This master's worker groups by name, built once from the config, see
+     * {@see groups()}. Each carries its queues, target, slots, autoscaler and
+     * its own respawn, backoff and fast-death state.
+     *
+     * @var non-empty-array<string, WorkerGroup>|null
+     */
+    private ?array $groups = null;
+
+    /**
+     * Child PID => name of its group. The master decides a worker's group
+     * from this map, never from Redis. A PID missing here (none in production)
+     * counts toward the first group.
+     *
+     * @var array<int, string>
+     */
+    public private(set) array $workerGroup = [];
 
     private ?MetricsPublisher $metricsPublisher = null;
 
@@ -204,38 +280,15 @@ LUA;
     }
 
     /**
-     * Respawns owed after a failed fork (EAGAIN, ENOMEM), retried from the
-     * monitor tick. A transient fork failure must not end supervision.
-     */
-    private int $pendingRespawns = 0;
-
-    /** Clock time of the next respawn retry. */
-    private float $respawnRetryAt = 0.0;
-
-    /** Seconds to wait before the next retry, doubled per failure. */
-    private float $respawnBackoff = 0.0;
-
-    /** Longest wait between two respawn retries, in seconds. */
-    private const float RESPAWN_BACKOFF_MAX = 30.0;
-
-    /**
      * A worker that ends within this many seconds of its spawn, other than by an
      * orderly stop, died young: the exec failed, the app threw while booting, or
      * a setting it cannot start on. Respawning it at once would only repeat that.
+     * Counted per group, see {@see WorkerGroup::recordExit()}.
      */
-    public const int FAST_DEATH_SECONDS = 10;
+    public const int FAST_DEATH_SECONDS = WorkerGroup::FAST_DEATH_SECONDS;
 
-    /** Consecutive fast deaths, across the fleet, after which the master logs an error. */
-    public const int FAST_DEATHS_BEFORE_ERROR = 3;
-
-    /** Workers in a row that died young, reset once a worker spawned since then runs {@see FAST_DEATH_SECONDS}. */
-    private int $fastDeaths = 0;
-
-    /** Unix time of the first fast death of the current run of them. */
-    private int $fastDeathsSince = 0;
-
-    /** Seconds the next respawn after a fast death waits, doubled per fast death. */
-    private float $fastDeathBackoff = 0.0;
+    /** Consecutive fast deaths, within one group, after which the master logs an error. */
+    public const int FAST_DEATHS_BEFORE_ERROR = WorkerGroup::FAST_DEATHS_BEFORE_ERROR;
 
     /** Field in this host's `metrics:live:{host}` hash that `torque:status` reads. */
     public const string PENDING_RESPAWNS_FIELD = 'pending_respawns';
@@ -300,6 +353,42 @@ LUA;
         return Narrow::map($this->config[$key] ?? null);
     }
 
+    /**
+     * The node this master runs as: the `node` key of the resolved config
+     * `torque:start` hands in, else the process-wide {@see NodeName::current()}.
+     * Read once, so the name cannot change under a running master.
+     */
+    public function node(): string
+    {
+        if ($this->node !== null) {
+            return $this->node;
+        }
+
+        $configured = trim(Narrow::string($this->config['node'] ?? null));
+
+        return $this->node = $configured !== '' && NodeName::isValid($configured)
+            ? $configured
+            : NodeName::current();
+    }
+
+    /**
+     * This master's id, `{node}-{pid}-{hex8}`, generated on first use and
+     * fixed for the process lifetime. Its workers carry it in the `master`
+     * field of their hash, which is how this master tells its own fleet from
+     * another host's whose PIDs happen to collide.
+     */
+    public function masterId(): string
+    {
+        if ($this->masterId !== null) {
+            return $this->masterId;
+        }
+
+        $id = $this->node().'-'.(int) getmypid().'-'.bin2hex(random_bytes(4));
+        assert(MasterRegistry::isValidMasterId($id));
+
+        return $this->masterId = $id;
+    }
+
     private function redisUri(): string
     {
         return Narrow::string($this->configSection('redis')['uri'] ?? null, 'redis://127.0.0.1:6379');
@@ -308,6 +397,171 @@ LUA;
     private function redisPrefix(): string
     {
         return Narrow::string($this->configSection('redis')['prefix'] ?? null, 'torque:');
+    }
+
+    /**
+     * This master's worker groups by name, in declaration order, built once.
+     *
+     * From the `groups` key `torque:start` hands in (the `NodeConfig::groups()`
+     * list). Without it, one implicit group named `default` over the flat
+     * `queues`, `workers`, `slots_per_worker` and `autoscale`, so a master
+     * configured the way it was before groups existed runs exactly as before.
+     *
+     * @return non-empty-array<string, WorkerGroup>
+     */
+    private function groups(): array
+    {
+        if ($this->groups !== null) {
+            return $this->groups;
+        }
+
+        $groups = [];
+
+        foreach ($this->groupConfigs() as $group) {
+            $groups[$group['name']] = WorkerGroup::fromConfig($group, $this->redisUri());
+        }
+
+        return $this->groups = $groups;
+    }
+
+    /**
+     * @return non-empty-list<array{name: string, queues: list<string>, workers: int, slots_per_worker: int, autoscale: array<string, mixed>}>
+     */
+    private function groupConfigs(): array
+    {
+        $configured = $this->config['groups'] ?? null;
+
+        if (is_array($configured) && $configured !== [] && ! array_is_list($configured)) {
+            // The validated map of NodeConfig::resolve() rather than the list.
+            $configured = NodeConfig::groups($this->config);
+        }
+
+        if (! is_array($configured) || $configured === []) {
+            return [[
+                'name' => NodeConfig::DEFAULT_GROUP,
+                'queues' => self::queueList($this->config['queues'] ?? null),
+                'workers' => Narrow::int($this->config['workers'] ?? null, 4),
+                'slots_per_worker' => Narrow::int($this->config['slots_per_worker'] ?? null, 50),
+                'autoscale' => $this->configSection('autoscale'),
+            ]];
+        }
+
+        $groups = [];
+
+        foreach ($configured as $entry) {
+            $entry = Narrow::map($entry);
+            $name = Narrow::string($entry['name'] ?? null);
+
+            if (preg_match(NodeConfig::GROUP_NAME_PATTERN, $name) !== 1 || isset($groups[$name])) {
+                throw new \InvalidArgumentException("Invalid or duplicate worker group name [{$name}].");
+            }
+
+            $groups[$name] = [
+                'name' => $name,
+                'queues' => self::queueList($entry['queues'] ?? null),
+                'workers' => max(0, Narrow::int($entry['workers'] ?? null, 4)),
+                'slots_per_worker' => Narrow::int($entry['slots_per_worker'] ?? null, 50),
+                'autoscale' => Narrow::map($entry['autoscale'] ?? null),
+            ];
+        }
+
+        return array_values($groups);
+    }
+
+    /**
+     * A `queues` setting as a list of names: entries may hold several names
+     * separated by commas, as `--queues` passes them. Nothing reads as `default`.
+     *
+     * @return non-empty-list<string>
+     */
+    private static function queueList(mixed $value): array
+    {
+        $queues = [];
+
+        foreach ((array) ($value ?? ['default']) as $entry) {
+            foreach (explode(',', Narrow::string($entry)) as $queue) {
+                $queue = trim($queue);
+
+                if ($queue !== '') {
+                    $queues[] = $queue;
+                }
+            }
+        }
+
+        $queues = array_values(array_unique($queues));
+
+        return $queues === [] ? ['default'] : $queues;
+    }
+
+    /** The group a PID was spawned into; a PID missing from the map counts toward the first. */
+    private function groupOf(int $pid): WorkerGroup
+    {
+        return $this->groups()[$this->workerGroup[$pid] ?? ''] ?? $this->firstGroup();
+    }
+
+    /** The first group, which a caller that names none means: the only one on a master without groups. */
+    private function firstGroup(): WorkerGroup
+    {
+        $groups = $this->groups();
+
+        return $groups[array_key_first($groups)];
+    }
+
+    /**
+     * The live children of one group.
+     *
+     * @return array<int, true>
+     */
+    private function groupPids(WorkerGroup $group): array
+    {
+        return array_filter(
+            $this->workerPids,
+            fn (int $pid): bool => $this->groupOf($pid) === $group,
+            ARRAY_FILTER_USE_KEY,
+        );
+    }
+
+    /** Respawns owed across all groups. */
+    private function pendingRespawns(): int
+    {
+        return array_sum(array_map(static fn (WorkerGroup $group): int => $group->pendingRespawns, $this->groups()));
+    }
+
+    /** Whether any group autoscales. */
+    private function autoscaleEnabled(): bool
+    {
+        return array_any($this->groups(), static fn (WorkerGroup $group): bool => $group->autoScaler !== null);
+    }
+
+    /**
+     * A log line about one group: tagged with the group's name once the master
+     * has more than one group or one not named `default`, so a master without
+     * groups logs exactly what it did before. A `WARN ` prefix stays first.
+     */
+    private function groupMessage(WorkerGroup $group, string $message): string
+    {
+        if (! $this->labelsGroups()) {
+            return $message;
+        }
+
+        $tag = "[group {$group->name}]";
+
+        return str_starts_with($message, 'WARN ')
+            ? 'WARN '.$tag.' '.substr($message, 5)
+            : $tag.' '.$message;
+    }
+
+    /** Whether this master has more than one group or one not named `default`. */
+    private function labelsGroups(): bool
+    {
+        $groups = $this->groups();
+
+        return count($groups) > 1 || array_key_first($groups) !== NodeConfig::DEFAULT_GROUP;
+    }
+
+    private function logGroup(WorkerGroup $group, string $message): void
+    {
+        ($this->logger)($this->groupMessage($group, $message));
     }
 
     /** Seconds a master-side Redis read waits when `redis.read_timeout_seconds` is not set, as in a worker. */
@@ -374,6 +628,11 @@ LUA;
      */
     public function start(): int
     {
+        // Fixed before anything forks or writes to Redis; an invalid group
+        // config throws here, before a lock or a PID file exists.
+        $this->masterId();
+        $this->groups();
+
         $this->warnIfLegacyConfig();
 
         // First of all: the check only reads, so a refusal leaves no lock, PID
@@ -407,13 +666,11 @@ LUA;
 
         // Graceful shutdown: forward signal to all children.
         pcntl_signal(SIGTERM, function () {
-            $this->shouldStop = true;
-            $this->signalChildren(SIGTERM);
+            $this->requestStop();
         });
 
         pcntl_signal(SIGINT, function () {
-            $this->shouldStop = true;
-            $this->signalChildren(SIGTERM);
+            $this->requestStop();
         });
 
         // Graceful drain: stop pickup, wait reload_pause_seconds for in-flight
@@ -425,18 +682,43 @@ LUA;
             $this->drainRequested = true;
         });
 
+        // From here on this master is listed in the registry; every way out
+        // of start() removes the record and gives up the leader lease.
+        $this->startedAt = time();
+        $this->handleRegistryTick();
+
+        try {
+            return $this->startFleet();
+        } finally {
+            $this->leaveCluster();
+        }
+    }
+
+    /**
+     * The part of {@see start()} after the lock, the PID file and the signal
+     * handlers: spawn the fleet, run the takeover handshake and supervise.
+     */
+    private function startFleet(): int
+    {
         $this->warnIfPaused();
         $this->runDataUpgrade();
 
         $this->prepareHeartbeatDirectory();
         $this->warnIfCacheCanStall();
 
-        $numWorkers = Narrow::int($this->config['workers'] ?? null, 4);
+        $groups = $this->groups();
+        $numWorkers = array_sum(array_map(static fn (WorkerGroup $group): int => $group->target, $groups));
 
         ($this->logger)("Starting {$numWorkers} worker processes...");
 
-        for ($i = 0; $i < $numWorkers; $i++) {
-            $this->spawnWorker();
+        foreach ($groups as $group) {
+            if ($this->labelsGroups()) {
+                $this->logGroup($group, "{$group->target} worker(s) on ".implode(',', $group->queues)." with {$group->slots} slots each.");
+            }
+
+            for ($i = 0; $i < $group->target; $i++) {
+                $this->spawnWorker($group);
+            }
         }
 
         if ($this->takeoverPid !== null) {
@@ -463,27 +745,18 @@ LUA;
             $this->metricsPublisher = $this->makeMetricsPublisher();
         }
 
-        $autoscaleConfig = $this->configSection('autoscale');
-
-        if ($autoscaleConfig['enabled'] ?? false) {
-            $redisUri = $this->redisUri();
-
-            $this->autoScaler = new AutoScaler(
-                redisUri: $redisUri,
-                minWorkers: Narrow::int($autoscaleConfig['min_workers'] ?? null, 2),
-                maxWorkers: Narrow::int($autoscaleConfig['max_workers'] ?? null, 8),
-                scaleUpThreshold: Narrow::float($autoscaleConfig['scale_up_threshold'] ?? null, 0.85),
-                scaleDownThreshold: Narrow::float($autoscaleConfig['scale_down_threshold'] ?? null, 0.20),
-                cooldownSeconds: Narrow::int($autoscaleConfig['cooldown'] ?? null, 30),
-            );
-
+        // Each group that autoscales carries its own scaler, built with the
+        // group (see WorkerGroup::fromConfig()), with its own bounds and cooldown.
+        if ($this->autoscaleEnabled()) {
             // Autoscale reads worker metrics, so it needs the publisher even
             // when the aggregate publishing itself was disabled.
             $this->metricsPublisher ??= $this->makeMetricsPublisher();
 
-            ($this->logger)('Autoscaling enabled ('
-                .Narrow::string($autoscaleConfig['min_workers'] ?? null).'-'.Narrow::string($autoscaleConfig['max_workers'] ?? null)
-                .' workers)');
+            foreach ($this->groups() as $group) {
+                if ($group->autoScaler !== null) {
+                    $this->logGroup($group, "Autoscaling enabled ({$group->minWorkers}-{$group->maxWorkers} workers)");
+                }
+            }
         }
 
         // No global worker-metrics wipe after the loop: workers delete their own
@@ -495,7 +768,8 @@ LUA;
     }
 
     /**
-     * {@see monitor()}, with the PID file removed however the loop ends.
+     * {@see monitor()}, with the PID file and this master's drain key removed
+     * however the loop ends.
      *
      * The master lock needs no cleanup: the kernel releases it on exit.
      */
@@ -505,6 +779,7 @@ LUA;
             return $this->monitor();
         } finally {
             $this->removePidFile();
+            $this->endDrain();
         }
     }
 
@@ -528,8 +803,13 @@ LUA;
      * The master reads that as a worker that died young and respawns it on
      * the fast-death backoff ({@see handleWorkerExit()}).
      */
-    private function spawnWorker(): void
+    private function spawnWorker(?WorkerGroup $group = null): void
     {
+        $group ??= $this->firstGroup();
+
+        // Built in the parent, so the child never generates an id of its own.
+        $arguments = $this->workerArguments($group);
+
         $pid = ($this->fork)();
 
         if ($pid === -1) {
@@ -549,21 +829,39 @@ LUA;
 
             // Child: immediately replace process image with a fresh PHP process.
             // This avoids inheriting any fiber, event loop or Redis state from the parent.
-            $queues = implode(',', array_map(Narrow::string(...), (array) ($this->config['queues'] ?? ['default'])));
-            $concurrency = (string) Narrow::int($this->config['slots_per_worker'] ?? null, 50);
-
-            self::execOrDie($this->phpBinary, [
-                $this->artisanPath,
-                'torque:worker',
-                "--queues={$queues}",
-                "--concurrency={$concurrency}",
-            ], 'Worker');
+            self::execOrDie($this->phpBinary, $arguments, 'Worker');
         }
 
         // Parent process: record the child PID.
         $this->workerPids[$pid] = true;
+        $this->workerGroup[$pid] = $group->name;
         $this->workerSpawnedAt[$pid] = time();
-        ($this->logger)("Worker spawned with PID {$pid}");
+        $this->logGroup($group, "Worker spawned with PID {$pid}");
+    }
+
+    /**
+     * The `artisan torque:worker` command line of one worker of a group.
+     *
+     * `--node` and `--master-id` give the worker this master's identity, so
+     * its consumer id carries the node and its hash names the master it
+     * belongs to (see {@see isOwnWorker()}). `--group` only labels its hash;
+     * the master knows the group from its own PID map.
+     *
+     * @return list<string>
+     */
+    private function workerArguments(?WorkerGroup $group = null): array
+    {
+        $group ??= $this->firstGroup();
+
+        return [
+            $this->artisanPath,
+            'torque:worker',
+            '--queues='.implode(',', $group->queues),
+            "--concurrency={$group->slots}",
+            '--node='.$this->node(),
+            '--master-id='.$this->masterId(),
+            '--group='.$group->name,
+        ];
     }
 
     /**
@@ -601,13 +899,13 @@ LUA;
      *
      * Only the initial spawn in {@see start()} lets the failure end the process.
      */
-    private function trySpawnWorker(): bool
+    private function trySpawnWorker(WorkerGroup $group): bool
     {
         try {
-            $this->spawnWorker();
+            $this->spawnWorker($group);
         } catch (\RuntimeException) {
             $errno = pcntl_get_last_error();
-            ($this->logger)('WARN Worker fork failed ('.($errno === 0 ? 'no error code' : pcntl_strerror($errno)).'); the master keeps supervising.');
+            $this->logGroup($group, 'WARN Worker fork failed ('.($errno === 0 ? 'no error code' : pcntl_strerror($errno)).'); the master keeps supervising.');
 
             return false;
         }
@@ -616,39 +914,45 @@ LUA;
     }
 
     /**
-     * Add a worker (a replacement or a scale-up), or owe it when the fork fails.
+     * Add a worker to a group (a replacement or a scale-up), or owe it when
+     * the fork fails. Without a group, the first (on a master without groups,
+     * the only one).
      *
-     * While respawns are already owed the new one joins the queue, so the
-     * backoff that is running is kept.
+     * While the group already owes respawns the new one joins its queue, so
+     * the backoff that is running is kept.
      */
-    private function respawnWorker(): void
+    private function respawnWorker(?WorkerGroup $group = null): void
     {
-        if ($this->pendingRespawns > 0) {
-            $this->pendingRespawns++;
+        $group ??= $this->firstGroup();
+
+        if ($group->hasPendingRespawns()) {
+            $group->oweRespawn();
 
             return;
         }
 
-        if (! $this->trySpawnWorker()) {
-            $this->pendingRespawns++;
-            $this->deferRespawn(microtime(true));
+        if (! $this->trySpawnWorker($group)) {
+            $group->oweRespawn();
+            $this->deferRespawn($group, microtime(true));
         }
     }
 
     /**
-     * Retry owed respawns once their backoff has passed, one fork per tick.
+     * Retry owed respawns once their backoff has passed, at most one fork per
+     * group per tick, so a group in a crash loop never delays another.
      *
      * The clock is injectable so it can be exercised without the monitor loop.
      */
     private function retryPendingRespawns(?float $now = null): void
     {
-        if ($this->pendingRespawns === 0) {
+        if ($this->pendingRespawns() === 0) {
             return;
         }
 
         if ($this->shouldStop) {
-            $this->pendingRespawns = 0;
-            $this->respawnBackoff = 0.0;
+            foreach ($this->groups() as $group) {
+                $group->dropPendingRespawns();
+            }
 
             return;
         }
@@ -661,25 +965,25 @@ LUA;
 
         $now ??= microtime(true);
 
-        if ($now < $this->respawnRetryAt) {
-            return;
+        foreach ($this->groups() as $group) {
+            if (! $group->respawnDue($now)) {
+                continue;
+            }
+
+            if (! $this->trySpawnWorker($group)) {
+                $this->deferRespawn($group, $now);
+
+                continue;
+            }
+
+            $group->recordRespawn();
         }
-
-        if (! $this->trySpawnWorker()) {
-            $this->deferRespawn($now);
-
-            return;
-        }
-
-        $this->pendingRespawns--;
-        $this->respawnBackoff = 0.0;
     }
 
-    private function deferRespawn(float $now): void
+    private function deferRespawn(WorkerGroup $group, float $now): void
     {
-        $this->respawnBackoff = clamp($this->respawnBackoff * 2, 1.0, self::RESPAWN_BACKOFF_MAX);
-        $this->respawnRetryAt = $now + $this->respawnBackoff;
-        ($this->logger)("{$this->pendingRespawns} worker respawn(s) owed; retrying in {$this->respawnBackoff}s.");
+        $backoff = $group->deferRespawn($now);
+        $this->logGroup($group, "{$group->pendingRespawns} worker respawn(s) owed; retrying in {$backoff}s.");
     }
 
     /**
@@ -690,7 +994,7 @@ LUA;
      */
     private function forgetWorker(int $pid): void
     {
-        unset($this->workerPids[$pid], $this->workerSpawnedAt[$pid], $this->stallKilledPids[$pid]);
+        unset($this->workerPids[$pid], $this->workerGroup[$pid], $this->workerSpawnedAt[$pid], $this->stallKilledPids[$pid]);
 
         if (self::loopStallKillSeconds($this->config) > 0) {
             @unlink(self::heartbeatPath($pid));
@@ -711,6 +1015,7 @@ LUA;
         // (sigtimedwait was never implemented there), so fall back to async
         // signals + usleep on platforms that don't have it.
         $syncSignals = function_exists('pcntl_sigtimedwait');
+        $this->monitoring = true;
 
         if ($syncSignals) {
             pcntl_async_signals(false);
@@ -723,14 +1028,13 @@ LUA;
 
         // Owed respawns keep the loop alive: a fork failure on the last worker
         // must not end supervision.
-        while (! empty($this->workerPids) || ($this->pendingRespawns > 0 && ! $this->shouldStop)) {
+        while (! empty($this->workerPids) || ($this->pendingRespawns() > 0 && ! $this->shouldStop)) {
             if ($syncSignals) {
                 $info = [];
                 $sig = \pcntl_sigtimedwait([SIGTERM, SIGINT, SIGCHLD, SIGUSR2], $info, 0, 100_000_000);
 
                 if ($sig === SIGTERM || $sig === SIGINT) {
-                    $this->shouldStop = true;
-                    $this->signalChildren(SIGTERM);
+                    $this->requestStop();
                 } elseif ($sig === SIGUSR2) {
                     $this->drainRequested = true;
                 }
@@ -774,12 +1078,21 @@ LUA;
                 $maintenanceMonotonic = hrtime(true);
 
                 $this->maintainLease();
+
+                // Leader lease first, then remote commands, so a stop or drain
+                // received now already shows in the record published next.
+                // Cluster duties right after the lease decision: the control,
+                // registry and aggregate ticks can each block up to the Redis
+                // read timeout, longer than the lease lives.
+                $this->maintainLeadership();
+                $this->handleClusterDuties();
+                $this->handleControlTick();
+                $this->handleRegistryTick();
+
                 $this->publishAggregateMetrics();
-                $this->handleHousekeepingTick();
-                $this->handleLongWaitTick();
                 $this->publishOtelMetrics();
 
-                if ($this->autoScaler !== null) {
+                if ($this->autoscaleEnabled()) {
                     $this->evaluateAutoscale();
                 }
 
@@ -798,7 +1111,7 @@ LUA;
      * A worker that ends within {@see FAST_DEATH_SECONDS} of its spawn, other than
      * by an orderly stop (status 0, or 12 for the memory limit) or a kill of this
      * master's watchdog, is owed instead of respawned at once: the wait starts at
-     * 1 second and doubles per fast death up to {@see RESPAWN_BACKOFF_MAX}, logged
+     * 1 second and doubles per fast death up to {@see WorkerGroup::RESPAWN_BACKOFF_MAX}, logged
      * once per step. A fleet whose workers cannot start (a stale PHP binary after
      * an upgrade, a boot exception, an unusable FLEDGE_EVENT_LOOP in .env) thus
      * forks a few times a minute instead of ten times a second. After
@@ -806,6 +1119,9 @@ LUA;
      * last status; it keeps supervising, as it does after failed forks. A job that
      * times out within the first seconds of a worker also ends it with status 1
      * and counts as a fast death: the backoff then only slows the replacement.
+     *
+     * All of this is per group: the replacement joins the group of the worker
+     * that ended, and a crash loop in one group leaves the others' respawns alone.
      *
      * The clock is injectable so it can be exercised without the monitor loop.
      */
@@ -815,15 +1131,18 @@ LUA;
         $spawnedAt = $this->workerSpawnedAt[$pid] ?? null;
         $killedByWatchdog = isset($this->stallKilledPids[$pid]);
 
+        // Read before the worker is forgotten: the replacement joins the same group.
+        $group = $this->groupOf($pid);
+
         $this->forgetWorker($pid);
 
         $ending = self::describeExit($status);
-        ($this->logger)("Worker PID {$pid} {$ending}");
+        $this->logGroup($group, "Worker PID {$pid} {$ending}");
 
         // Workers being scaled down should not be respawned.
         if (isset($this->scalingDownPids[$pid])) {
             unset($this->scalingDownPids[$pid]);
-            ($this->logger)("Scaled-down worker PID {$pid} drained and exited.");
+            $this->logGroup($group, "Scaled-down worker PID {$pid} drained and exited.");
 
             return;
         }
@@ -832,78 +1151,65 @@ LUA;
             return;
         }
 
-        $age = $spawnedAt === null ? null : $now - $spawnedAt;
+        $exit = $group->recordExit($spawnedAt, $killedByWatchdog || self::isOrderlyStop($status), $now);
 
-        if ($age === null || $age >= self::FAST_DEATH_SECONDS || $killedByWatchdog || self::isOrderlyStop($status)) {
-            if ($age !== null && $age >= self::FAST_DEATH_SECONDS && $spawnedAt >= $this->fastDeathsSince) {
-                $this->resetFastDeaths($pid);
+        if (! $exit['fastDeath']) {
+            if ($exit['resetRun']) {
+                $this->logRecovery($group, $pid);
             }
 
-            ($this->logger)('Respawning replacement worker...');
-            $this->respawnWorker();
+            $this->logGroup($group, 'Respawning replacement worker...');
+            $this->respawnWorker($group);
 
             return;
         }
 
-        if ($this->fastDeaths++ === 0) {
-            $this->fastDeathsSince = (int) $now;
-        }
-
-        $previous = $this->fastDeathBackoff;
-        $this->fastDeathBackoff = clamp($this->fastDeathBackoff * 2, 1.0, self::RESPAWN_BACKOFF_MAX);
-        $this->pendingRespawns++;
-        $this->respawnRetryAt = max($this->respawnRetryAt, $now + $this->fastDeathBackoff);
-
-        if ($this->fastDeathBackoff !== $previous) {
-            ($this->logger)(sprintf(
+        if ($exit['backoffChanged']) {
+            $this->logGroup($group, sprintf(
                 'WARN Worker PID %d %s %.1fs after its spawn; respawning in %ss (doubling per worker that dies within %ds, up to %ss).',
-                $pid, $ending, $age, $this->fastDeathBackoff, self::FAST_DEATH_SECONDS, self::RESPAWN_BACKOFF_MAX,
+                $pid, $ending, (float) $exit['age'], $exit['backoff'], WorkerGroup::FAST_DEATH_SECONDS, WorkerGroup::RESPAWN_BACKOFF_MAX,
             ));
         }
 
-        if ($this->fastDeaths === self::FAST_DEATHS_BEFORE_ERROR) {
-            ($this->errorLogger ?? $this->logger)(sprintf(
+        if ($exit['reachedErrorThreshold']) {
+            ($this->errorLogger ?? $this->logger)($this->groupMessage($group, sprintf(
                 '%d workers in a row died within %ds of their spawn; the last, PID %d, %s (%s). Workers are respawned on a backoff of up to %ss until one runs longer.',
-                $this->fastDeaths, self::FAST_DEATH_SECONDS, $pid, $ending, self::fastDeathHint($status), self::RESPAWN_BACKOFF_MAX,
-            ));
+                $group->fastDeaths, WorkerGroup::FAST_DEATH_SECONDS, $pid, $ending, self::fastDeathHint($status), WorkerGroup::RESPAWN_BACKOFF_MAX,
+            )));
         }
     }
 
     /**
-     * End a run of fast deaths once a worker spawned during it has run {@see FAST_DEATH_SECONDS}.
+     * End a group's run of fast deaths once a worker of that group spawned
+     * during it has run {@see FAST_DEATH_SECONDS}.
      *
      * Only such a worker shows the cause is gone: a worker spawned before the run
      * started proves nothing about the ones that keep dying.
      */
     private function resetFastDeathsOnSurvivor(?float $now = null): void
     {
-        if ($this->fastDeaths === 0) {
-            return;
-        }
+        foreach ($this->groups() as $group) {
+            if ($group->fastDeaths === 0) {
+                continue;
+            }
 
-        $now ??= microtime(true);
+            $spawnedAt = [];
 
-        foreach ($this->workerPids as $pid => $ignored) {
-            $spawnedAt = $this->workerSpawnedAt[$pid] ?? null;
+            foreach (array_keys($this->groupPids($group)) as $pid) {
+                $spawnedAt[$pid] = $this->workerSpawnedAt[$pid] ?? null;
+            }
 
-            if ($spawnedAt !== null && $spawnedAt >= $this->fastDeathsSince && $now - $spawnedAt >= self::FAST_DEATH_SECONDS) {
-                $this->resetFastDeaths($pid);
+            $survivor = $group->resetFastDeathsOnSurvivor($spawnedAt, $now);
 
-                return;
+            if ($survivor !== null) {
+                $this->logRecovery($group, $survivor);
             }
         }
     }
 
-    private function resetFastDeaths(int $survivor): void
+    private function logRecovery(WorkerGroup $group, int $survivor): void
     {
-        if ($this->fastDeaths === 0) {
-            return;
-        }
-
-        ($this->logger)("Worker PID {$survivor} ran ".self::FAST_DEATH_SECONDS.'s: workers start again, respawns are immediate.');
-        $this->fastDeaths = 0;
-        $this->fastDeathsSince = 0;
-        $this->fastDeathBackoff = 0.0;
+        $this->logGroup($group, "Worker PID {$survivor} ran ".WorkerGroup::FAST_DEATH_SECONDS.'s: workers start again, respawns are immediate.');
     }
 
     /** An end the worker chose: 0 for an orderly stop, 12 for the memory limit. */
@@ -1340,9 +1646,9 @@ LUA;
             return;
         }
 
-        // Both are built together in run() when autoscale is enabled; the
-        // monitor loop only calls in here once the scaler exists.
-        if ($this->autoScaler === null || $this->metricsPublisher === null) {
+        // The publisher is built in startFleet() when a group autoscales; the
+        // monitor loop only calls in here once that happened.
+        if ($this->metricsPublisher === null || ! $this->autoscaleEnabled()) {
             return;
         }
 
@@ -1351,7 +1657,7 @@ LUA;
         // so the next tick does not wait out another read timeout on a silent
         // socket; any other error keeps them, as reconnecting cannot fix it.
         try {
-            $this->autoscale($this->autoScaler, $this->metricsPublisher);
+            $this->autoscale($this->metricsPublisher);
         } catch (\Throwable $e) {
             if ($e instanceof RedisException) {
                 $this->metricsPublisher = $this->makeMetricsPublisher();
@@ -1373,45 +1679,61 @@ LUA;
         $this->autoscaleFailureLoggedAt = null;
     }
 
-    private function autoscale(AutoScaler $autoScaler, MetricsPublisher $metricsPublisher): void
+    /**
+     * One autoscale pass: one read of the worker metrics, split by group
+     * through the PID map, then each autoscaling group decides on its own,
+     * with its own bounds and cooldown. There is no cap across groups.
+     */
+    private function autoscale(MetricsPublisher $metricsPublisher): void
     {
         $rawMetrics = $this->ownWorkerMetrics($metricsPublisher->getAllWorkerMetrics());
 
         // Build the format AutoScaler expects, keyed by the worker's PID so
         // scale-down can match against our child PID set.
-        $workerMetrics = [];
+        $metricsByGroup = [];
         foreach ($rawMetrics as $workerId => $data) {
             $pid = (int) ($data['pid'] ?? (WorkerId::parse($workerId)->pid ?? 0));
 
             // A draining worker is leaving the pool: its slots say nothing
             // about the capacity that stays.
             if ($pid > 0 && ! isset($this->scalingDownPids[$pid])) {
-                $workerMetrics[$pid] = [
+                $metricsByGroup[$this->groupOf($pid)->name][$pid] = [
                     'active' => (int) ($data['active_slots'] ?? 0),
                     'total' => (int) ($data['total_slots'] ?? 0),
                 ];
             }
         }
 
-        $decision = $autoScaler->evaluate($this->fleetSize(), $workerMetrics);
+        // Read at most once per pass, and only when a group wants to grow.
+        $pause = null;
 
-        // Like Horizon, no growth into a paused fleet; scale-down stays.
-        if ($decision === ScaleDecision::ScaleUp && $this->fleetIsPaused()) {
-            return;
+        foreach ($this->groups() as $name => $group) {
+            if ($group->autoScaler === null) {
+                continue;
+            }
+
+            $workerMetrics = $metricsByGroup[$name] ?? [];
+            $decision = $group->autoScaler->evaluate($this->fleetSize($group), $workerMetrics);
+
+            // Like Horizon, no growth into a paused fleet; scale-down stays.
+            if ($decision === ScaleDecision::ScaleUp && self::groupIsPaused($group, $pause ??= $this->pauseView())) {
+                continue;
+            }
+
+            match ($decision) {
+                ScaleDecision::ScaleUp => $this->scaleUp($group),
+                ScaleDecision::ScaleDown => $this->scaleDown($workerMetrics, $group),
+                ScaleDecision::NoChange => null,
+            };
         }
-
-        match ($decision) {
-            ScaleDecision::ScaleUp => $this->scaleUp(),
-            ScaleDecision::ScaleDown => $this->scaleDown($workerMetrics),
-            ScaleDecision::NoChange => null,
-        };
     }
 
     /**
      * Filter a worker-metrics map down to this master's own children.
      *
-     * During a takeover two fleets publish side by side; autoscaling and the
-     * aggregate metrics must only ever describe our own.
+     * During a takeover two fleets publish side by side, and on a multi-host
+     * cluster every host's workers share one `worker:*` set; autoscaling and
+     * the aggregate metrics must only ever describe our own.
      *
      * @param  array<string, array<string, string>>  $workers
      * @return array<string, array<string, string>>
@@ -1420,89 +1742,162 @@ LUA;
     {
         return array_filter(
             $workers,
-            function (array $data, string $workerId): bool {
-                $pid = (int) ($data['pid'] ?? (WorkerId::parse($workerId)->pid ?? 0));
-
-                return isset($this->workerPids[$pid]);
-            },
+            fn (array $data, string $workerId): bool => $this->isOwnWorker($workerId, $data),
             ARRAY_FILTER_USE_BOTH,
         );
     }
 
     /**
-     * Workers that count toward the pool, as Horizon counts its processes: the
-     * children not being scaled down, plus respawns owed after a failed fork.
-     */
-    private function fleetSize(): int
-    {
-        return count(array_diff_key($this->workerPids, $this->scalingDownPids)) + $this->pendingRespawns;
-    }
-
-    /**
-     * Whether a `{prefix}paused` key stops this fleet's pickup: a deliberate
-     * `torque:pause`. Another master's `drain:<pid>` does not, its workers
-     * ignore that; our own drain never reaches here.
+     * Whether a worker hash belongs to one of this master's children.
      *
-     * One GET, read only on a pass that decided to scale up.
-     */
-    private function fleetIsPaused(): bool
-    {
-        $value = $this->masterRedis()->execute('GET', $this->redisPrefix().'paused');
-
-        return $value !== null && DrainPause::ownerPid(Narrow::string($value)) === null;
-    }
-
-    /**
-     * Scale up by one worker.
+     * The PID must be one of our children, which also drops a crashed child's
+     * hash that lives out its TTL. PIDs repeat across hosts (every container
+     * starts near 1), so the PID alone is not enough: a hash naming its master
+     * must name us, and a hash without that field (a worker of older code)
+     * must have been written on this node. A hash that carries no host at all
+     * is judged on the PID, as before.
      *
-     * A failed fork becomes an owed respawn: it counts toward the fleet, so the
-     * scaler does not ask again, and it is retried on the respawn backoff.
+     * @param  array<string, mixed>  $data
      */
-    private function scaleUp(): void
+    private function isOwnWorker(string $workerId, array $data): bool
     {
-        $fleet = $this->fleetSize();
-        ($this->logger)("Autoscaler: scaling up (workers: {$fleet} -> ".($fleet + 1).')');
+        $pid = self::metricsPid($workerId, $data);
 
-        $this->respawnWorker();
-        $this->autoScaler?->recordAction();
+        if (! isset($this->workerPids[$pid])) {
+            return false;
+        }
+
+        $master = trim(Narrow::string($data['master'] ?? null));
+
+        if ($master !== '') {
+            return $master === $this->masterId();
+        }
+
+        $host = trim(Narrow::string($data['host'] ?? null));
+        $parsed = WorkerId::parse($workerId);
+
+        if ($host === '' && $parsed->pid !== null) {
+            $host = $parsed->host;
+        }
+
+        return $host === '' || $host === $this->node();
     }
 
     /**
-     * Scale down by one: cancel an owed respawn, or else send SIGTERM to the
-     * least busy worker.
+     * The PID a worker hash names: its `pid` field, else the one in its id.
+     *
+     * @param  array<string, mixed>  $data
+     */
+    private static function metricsPid(string $workerId, array $data): int
+    {
+        return Narrow::int($data['pid'] ?? null, WorkerId::parse($workerId)->pid ?? 0);
+    }
+
+    /**
+     * Workers that count toward a group's pool, as Horizon counts its
+     * processes: its children not being scaled down, plus respawns it owes
+     * after a failed fork. Without a group, the sum over all groups.
+     */
+    private function fleetSize(?WorkerGroup $group = null): int
+    {
+        if ($group === null) {
+            return array_sum(array_map($this->fleetSize(...), array_values($this->groups())));
+        }
+
+        return $group->fleetSize($this->groupPids($group), $this->scalingDownPids);
+    }
+
+    /**
+     * What a pause stops for this master, read for a pass where a group
+     * decided to scale up: `fleet` for a deliberate global `torque:pause` or
+     * a pause of this node, `queues` for the queue pauses among this
+     * master's queues. A legacy `drain:<pid>` of another master does not
+     * count, its workers ignore that; our own drain never reaches here.
+     * Like {@see PauseScopes::decide()}, a global value counts only without
+     * a TTL; workers ignore one that expires.
+     *
+     * One GET, one TTL when a non-drain value is set, and one HMGET unless
+     * the fleet is paused already.
+     *
+     * @return array{fleet: bool, queues: list<string>}
+     */
+    private function pauseView(): array
+    {
+        $redis = $this->masterRedis();
+        $key = $this->redisPrefix().'paused';
+        $value = $redis->execute('GET', $key);
+
+        if ($value !== null && DrainPause::ownerPid(Narrow::string($value)) === null
+            && Narrow::int($redis->execute('TTL', $key)) === -1) {
+            return ['fleet' => true, 'queues' => []];
+        }
+
+        $view = (new PauseScopes($redis, $this->redisPrefix()))->workerView($this->node(), $this->registryQueues());
+
+        return ['fleet' => $view['nodePaused'], 'queues' => $view['pausedQueues']];
+    }
+
+    /**
+     * Whether a group may not grow: the fleet is paused, or every one of its
+     * queues is.
+     *
+     * @param  array{fleet: bool, queues: list<string>}  $pause
+     */
+    private static function groupIsPaused(WorkerGroup $group, array $pause): bool
+    {
+        return $pause['fleet'] || ($group->queues !== [] && array_diff($group->queues, $pause['queues']) === []);
+    }
+
+    /**
+     * Scale a group up by one worker. Without a group, the first.
+     *
+     * A failed fork becomes an owed respawn: it counts toward the group, so its
+     * scaler does not ask again, and it is retried on the group's backoff.
+     */
+    private function scaleUp(?WorkerGroup $group = null): void
+    {
+        $group ??= $this->firstGroup();
+        $fleet = $this->fleetSize($group);
+        $this->logGroup($group, "Autoscaler: scaling up (workers: {$fleet} -> ".($fleet + 1).')');
+
+        $this->respawnWorker($group);
+        $group->autoScaler?->recordAction();
+    }
+
+    /**
+     * Scale a group down by one: cancel a respawn it owes, or else send
+     * SIGTERM to its least busy worker. Without a group, the first.
      *
      * Owed respawns count toward {@see fleetSize()}, so terminating a live
      * worker while one is owed would shrink the workers that actually run below
      * the floor the scaler believes it keeps.
      *
-     * The targeted worker is added to {@see $scalingDownPids} so
-     * the monitor loop does not respawn it after it drains and exits.
+     * Victims come only from the group's own children. The targeted worker is
+     * added to {@see $scalingDownPids} so the monitor loop does not respawn it
+     * after it drains and exits.
      *
      * @param  array<int, array{active: int, total: int}>  $workerMetrics  Keyed by worker PID.
      */
-    private function scaleDown(array $workerMetrics): void
+    private function scaleDown(array $workerMetrics, ?WorkerGroup $group = null): void
     {
-        if ($this->pendingRespawns > 0) {
-            $fleet = $this->fleetSize();
-            $this->pendingRespawns--;
+        $group ??= $this->firstGroup();
 
-            if ($this->pendingRespawns === 0) {
-                $this->respawnBackoff = 0.0;
-            }
+        if ($group->hasPendingRespawns()) {
+            $fleet = $this->fleetSize($group);
+            $group->cancelPendingRespawn();
 
-            ($this->logger)("Autoscaler: scaling down (workers: {$fleet} -> ".($fleet - 1).'), cancelling an owed respawn');
-            $this->autoScaler?->recordAction();
+            $this->logGroup($group, "Autoscaler: scaling down (workers: {$fleet} -> ".($fleet - 1).'), cancelling an owed respawn');
+            $group->autoScaler?->recordAction();
 
             return;
         }
 
-        // Build a PID-to-active-slots map for workers we currently own; the
-        // metrics map is keyed by PID (see evaluateAutoscale). A child with
-        // no metrics row yet sorts last so a just-forked worker is never the
-        // scale-down victim.
+        // Build a PID-to-active-slots map for the group's workers; the metrics
+        // map is keyed by PID (see autoscale()). A child with no metrics row
+        // yet sorts last so a just-forked worker is never the scale-down victim.
         $pidActivity = [];
 
-        foreach (array_keys(array_diff_key($this->workerPids, $this->scalingDownPids)) as $pid) {
+        foreach (array_keys(array_diff_key($this->groupPids($group), $this->scalingDownPids)) as $pid) {
             $pidActivity[$pid] = (int) ($workerMetrics[$pid]['active'] ?? PHP_INT_MAX);
         }
 
@@ -1513,14 +1908,24 @@ LUA;
         // Pick the worker with the lowest active slot count.
         asort($pidActivity);
         $targetPid = array_key_first($pidActivity);
-        $fleet = $this->fleetSize();
+        $fleet = $this->fleetSize($group);
 
-        ($this->logger)("Autoscaler: scaling down (workers: {$fleet} -> "
+        $this->logGroup($group, "Autoscaler: scaling down (workers: {$fleet} -> "
             .($fleet - 1)."), sending SIGTERM to PID {$targetPid}");
 
         $this->scalingDownPids[$targetPid] = true;
         posix_kill($targetPid, SIGTERM);
-        $this->autoScaler?->recordAction();
+        $group->autoScaler?->recordAction();
+    }
+
+    /**
+     * Graceful shutdown, as on SIGTERM or SIGINT: stop respawning and forward
+     * SIGTERM to every worker. A remote `stop` command does exactly the same.
+     */
+    private function requestStop(): void
+    {
+        $this->shouldStop = true;
+        $this->signalChildren(SIGTERM);
     }
 
     /**
@@ -1536,8 +1941,8 @@ LUA;
     /**
      * Drive the drain state machine on each monitor tick.
      *
-     * On the first tick after a SIGUSR2, write the Redis `paused` key so
-     * workers stop picking up new jobs (they observe the key on their own
+     * On the first tick after a SIGUSR2, write this master's drain key so
+     * its workers stop picking up new jobs (they observe the key on their own
      * 2s poll) and start the pause timer. Escalation to the same SIGTERM path
      * `torque:stop` uses happens as soon as the fleet reports nothing in
      * flight, or when `reload_pause_seconds` runs out, whichever comes first;
@@ -1688,6 +2093,368 @@ LUA;
         } catch (\Throwable $e) {
             ($this->logger)("Housekeeping failed ({$e->getMessage()}); retrying in {$interval}s.");
         }
+    }
+
+    /**
+     * Keep or take the fleet-wide leader lease ({@see LeaderLease}), once per
+     * maintenance tick.
+     *
+     * A master that is draining or stopping gives the lease up instead, so a
+     * replacement (a takeover master on this node, or one on another node)
+     * takes the cluster duties over within a tick rather than after the
+     * lease expires. A Redis error is logged once per outage and reads as not
+     * leader for the tick: two masters running housekeeping at once is safe,
+     * the monitor loop dying is not.
+     *
+     * Public so leadership can be exercised without the monitor loop.
+     */
+    public function maintainLeadership(): bool
+    {
+        $wasLeader = $this->isLeader;
+
+        try {
+            $lease = new LeaderLease($this->masterRedis(), $this->redisPrefix());
+
+            if ($this->shouldStop || $this->draining || $this->drainRequested) {
+                $released = $lease->release($this->masterId());
+                $this->isLeader = false;
+
+                if ($released) {
+                    ($this->logger)('Leader lease released: this master is '.($this->shouldStop ? 'stopping' : 'draining').'.');
+                }
+            } else {
+                $this->isLeader = $lease->maintain($this->masterId());
+
+                if ($this->isLeader && ! $wasLeader) {
+                    ($this->logger)('Leader lease acquired: this master runs housekeeping and long-wait alerts for the cluster.');
+                } elseif (! $this->isLeader && $wasLeader) {
+                    ($this->logger)('Leader lease lost: another master runs housekeeping and long-wait alerts now.');
+                }
+            }
+
+            $this->clusterDutyRecovered('Leader lease');
+        } catch (\Throwable $e) {
+            $this->isLeader = false;
+            $this->clusterDutyFailed('Leader lease', $e, 'treating this master as not leader');
+        }
+
+        return $this->isLeader;
+    }
+
+    /**
+     * The duties that run once per cluster, on the leader only: Redis
+     * housekeeping (dead-letter trim, consumer sweep, redelivery prune) and
+     * the long-wait alerts, which would otherwise fire once per host.
+     *
+     * Reads the leadership {@see maintainLeadership()} decided this tick.
+     * Alert children a former leader started stay supervised by its monitor
+     * loop regardless.
+     */
+    public function handleClusterDuties(?float $now = null): void
+    {
+        if (! $this->isLeader) {
+            return;
+        }
+
+        $this->handleHousekeepingTick();
+        $this->handleLongWaitTick($now);
+    }
+
+    /**
+     * Act on the remote commands queued for this master
+     * ({@see ControlChannel}), once per maintenance tick after the lease.
+     *
+     * `stop` does what SIGTERM does; `drain` sets the same flag SIGUSR2 sets,
+     * which {@see handleDrainTick()} promotes on the next tick. Every command
+     * is logged and acked. A rejected one (malformed, unknown, expired) is
+     * logged with its reason, acked as not accepted when it carries a valid
+     * id, and dropped. The action is applied before the ack, so a failed ack
+     * never loses a command that was read.
+     *
+     * With `torque.control.enabled` off nothing is read, so commands stay in
+     * their list until it expires. A value that is no recognisable boolean
+     * counts as off. A Redis error is logged once per outage.
+     *
+     * Public, with an injectable clock (epoch seconds), so it runs without the
+     * monitor loop.
+     */
+    public function handleControlTick(?int $now = null): void
+    {
+        $control = $this->configSection('control');
+
+        if (! self::controlEnabled($control)) {
+            return;
+        }
+
+        $ttl = min(
+            ControlChannel::MAX_COMMAND_LIFETIME_SECONDS,
+            max(1, Narrow::int($control['command_ttl_seconds'] ?? null, 60)),
+        );
+
+        try {
+            $channel = new ControlChannel(
+                $this->masterRedis(),
+                $this->redisPrefix(),
+                $ttl,
+                $now === null ? null : static fn (): int => $now,
+            );
+
+            $received = $channel->receive($this->masterId());
+
+            $this->clusterDutyRecovered('Control channel');
+        } catch (\Throwable $e) {
+            $this->clusterDutyFailed('Control channel', $e, 'commands wait in Redis until it recovers');
+
+            return;
+        }
+
+        foreach ($received as $entry) {
+            $this->applyControlCommand($channel, $entry);
+        }
+    }
+
+    /**
+     * @param  array{accepted: bool, reason: ?string, id: ?string, command: ?array{id: string, action: 'stop'|'drain', issued_at: int, expires_at: int, issuer: string}}  $entry
+     */
+    private function applyControlCommand(ControlChannel $channel, array $entry): void
+    {
+        $id = $entry['id'];
+        $command = $entry['command'];
+
+        if (! $entry['accepted'] || $command === null) {
+            $about = $command === null ? '' : " {$command['action']} from {$command['issuer']}";
+
+            ($this->logger)('Control: rejected command '.($id ?? '(no valid id)').$about.' ('.($entry['reason'] ?? 'invalid').'); dropped.');
+
+            if ($id !== null) {
+                $this->ackControlCommand($channel, $id, $command['action'] ?? null, false);
+            }
+
+            return;
+        }
+
+        if ($command['action'] === ControlChannel::ACTION_STOP) {
+            $this->requestStop();
+        } else {
+            $this->drainRequested = true;
+        }
+
+        ($this->logger)("Control: {$command['action']} command {$command['id']} from {$command['issuer']} accepted.");
+
+        $this->ackControlCommand($channel, $command['id'], $command['action'], true);
+    }
+
+    private function ackControlCommand(ControlChannel $channel, string $id, ?string $action, bool $accepted): void
+    {
+        try {
+            $channel->ack($id, $this->masterId(), $action, $accepted);
+        } catch (\Throwable $e) {
+            ($this->logger)("Control: ack for command {$id} failed ({$e->getMessage()}).");
+
+            if ($e instanceof RedisTimeoutException) {
+                $this->masterRedis = null;
+            }
+        }
+    }
+
+    /**
+     * `torque.control.enabled`: on when unset, off for anything that is no
+     * recognisable boolean.
+     *
+     * @param  array<string, mixed>  $control
+     */
+    private static function controlEnabled(array $control): bool
+    {
+        if (! array_key_exists('enabled', $control) || $control['enabled'] === null) {
+            return true;
+        }
+
+        return filter_var($control['enabled'], FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? false;
+    }
+
+    /**
+     * Publish this master's registry record ({@see MasterRegistry}): at start,
+     * then every {@see REGISTRY_PUBLISH_INTERVAL} seconds and at once when its
+     * state changes. A Redis error is logged once per outage and retried on
+     * the next tick.
+     *
+     * Public, with an injectable clock (epoch seconds), so it runs without the
+     * monitor loop.
+     */
+    public function handleRegistryTick(?int $now = null): void
+    {
+        $now ??= time();
+        $state = $this->registryState();
+
+        if ($this->registryDueAt !== null && $now < $this->registryDueAt && $state === $this->publishedState) {
+            return;
+        }
+
+        $this->registryDueAt = $now + self::REGISTRY_PUBLISH_INTERVAL;
+
+        try {
+            (new MasterRegistry($this->masterRedis(), $this->redisPrefix(), static fn (): int => $now))->publish($this->masterId(), [
+                'node' => $this->node(),
+                'pid' => (int) getmypid(),
+                'started_at' => $this->startedAt ??= $now,
+                'version' => $this->version ??= UpgradeRunner::installedVersion(),
+                'supervised' => $this->supervised(),
+                'queues' => $this->registryQueues(),
+                'workers' => $this->workerCount,
+                'slots' => max(0, ...array_map(static fn (WorkerGroup $group): int => $group->slots, array_values($this->groups()))),
+                'state' => $state,
+                'groups' => $this->registryGroups(),
+            ]);
+
+            $this->publishedState = $state;
+            $this->clusterDutyRecovered('Master registry');
+        } catch (\Throwable $e) {
+            // Retried next tick rather than after the interval.
+            $this->registryDueAt = null;
+            $this->clusterDutyFailed('Master registry', $e, 'this master may be missing from torque:status');
+        }
+    }
+
+    /**
+     * The registry `state`: `starting` until the monitor loop runs, then
+     * `running`, `draining` once a drain was requested, `stopping` once a stop was.
+     */
+    private function registryState(): string
+    {
+        return match (true) {
+            $this->shouldStop => self::STATE_STOPPING,
+            $this->draining || $this->drainRequested => self::STATE_DRAINING,
+            ! $this->monitoring => self::STATE_STARTING,
+            default => self::STATE_RUNNING,
+        };
+    }
+
+    /**
+     * The queues this master's workers consume, over all groups, as
+     * {@see workerArguments()} passes them.
+     *
+     * @return list<string>
+     */
+    private function registryQueues(): array
+    {
+        return array_values(array_unique(array_merge(...array_map(
+            static fn (WorkerGroup $group): array => $group->queues,
+            array_values($this->groups()),
+        ))));
+    }
+
+    /**
+     * The registry `groups` field: per group its queues, its live workers,
+     * its configured target, its bounds (the autoscale floor and ceiling,
+     * else the target) and its slots per worker.
+     *
+     * @return array<string, array{queues: list<string>, workers: int, target: int, min: int, max: int, slots: int}>
+     */
+    private function registryGroups(): array
+    {
+        $groups = [];
+
+        foreach ($this->groups() as $name => $group) {
+            $groups[$name] = [
+                'queues' => $group->queues,
+                'workers' => count($this->groupPids($group)),
+                'target' => max(0, $group->target),
+                'min' => max(0, $group->minWorkers),
+                'max' => max(0, $group->maxWorkers),
+                'slots' => max(0, $group->slots),
+            ];
+        }
+
+        return $groups;
+    }
+
+    /**
+     * Whether a supervisor owns this master's respawn, read once from
+     * {@see SUPERVISED_ENV}. `torque:reload --node` refuses an unsupervised
+     * master, since a drained master nobody respawns leaves its node empty.
+     */
+    private function supervised(): bool
+    {
+        if ($this->supervised !== null) {
+            return $this->supervised;
+        }
+
+        $value = getenv(self::SUPERVISED_ENV);
+
+        return $this->supervised = self::supervisedFromEnvironment($value === false ? null : $value);
+    }
+
+    /**
+     * Whether a `TORQUE_SUPERVISED` value marks the master as supervised.
+     *
+     * Explicit only: the generated supervisor config sets it, a systemd unit
+     * or a container entrypoint can set it as well. Unset, empty or anything
+     * that is no recognisable boolean reads as unsupervised, the safe side:
+     * a false "unsupervised" refuses a remote reload, a false "supervised"
+     * drains a master that nothing restarts. Guessing from the parent PID, as
+     * the local `torque:reload` does for its own refusal, would read every
+     * shell as a supervisor.
+     */
+    public static function supervisedFromEnvironment(?string $value): bool
+    {
+        $value = trim($value ?? '');
+
+        if ($value === '') {
+            return false;
+        }
+
+        return filter_var($value, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? false;
+    }
+
+    /**
+     * Drop this master's registry record and give up the leader lease, on
+     * every way out of {@see start()}. Best-effort: the record expires after
+     * {@see MasterRegistry::RECORD_TTL_SECONDS} and the lease after
+     * {@see LeaderLease::TTL_SECONDS} on their own.
+     */
+    private function leaveCluster(): void
+    {
+        try {
+            $redis = $this->masterRedis();
+
+            (new MasterRegistry($redis, $this->redisPrefix()))->remove($this->masterId());
+
+            if ((new LeaderLease($redis, $this->redisPrefix()))->release($this->masterId())) {
+                ($this->logger)('Leader lease released.');
+            }
+        } catch (\Throwable) {
+            // Both expire on their own.
+        }
+
+        $this->isLeader = false;
+    }
+
+    /**
+     * Log a failing cluster duty once per outage; a read timeout drops the
+     * master's client so the next tick connects afresh.
+     */
+    private function clusterDutyFailed(string $duty, \Throwable $e, string $consequence): void
+    {
+        if ($e instanceof RedisTimeoutException) {
+            $this->masterRedis = null;
+        }
+
+        if (isset($this->failingClusterDuties[$duty])) {
+            return;
+        }
+
+        $this->failingClusterDuties[$duty] = true;
+        ($this->logger)("WARN {$duty} failed ({$e->getMessage()}); {$consequence}, retrying every tick.");
+    }
+
+    private function clusterDutyRecovered(string $duty): void
+    {
+        if (! isset($this->failingClusterDuties[$duty])) {
+            return;
+        }
+
+        unset($this->failingClusterDuties[$duty]);
+        ($this->logger)("{$duty} recovered.");
     }
 
     /**
@@ -1885,39 +2652,49 @@ LUA;
      * spawns workers that pick up nothing, which otherwise looks like a
      * silent hang in the supervisor log.
      *
-     * A drain pause whose master is gone is cleared first, so the warning is
-     * only ever about a pause that still has an owner.
+     * A legacy drain pause whose master is gone is cleared first, so the
+     * warning is only ever about a pause that may still have an owner. A
+     * pause of this node is reported as well.
      */
     private function warnIfPaused(): void
     {
-        if ($this->clearStaleDrainPause()) {
-            return;
-        }
+        $cleared = $this->clearStaleDrainPause();
 
         try {
             $redisUri = $this->redisUri();
             $prefix = $this->redisPrefix();
+            $redis = createRedisClient($redisUri);
 
-            $value = createRedisClient($redisUri)->execute('GET', $prefix.'paused');
+            $value = $cleared ? null : $redis->execute('GET', $prefix.'paused');
 
-            if ($value === null) {
-                return;
+            if ($value !== null) {
+                $ownerPid = DrainPause::ownerPid(Narrow::string($value));
+
+                $reason = $ownerPid === null
+                    ? 'deliberate `torque:pause`'
+                    : "legacy drain from master PID {$ownerPid}, still running here or on another host";
+
+                ($this->logger)('Queue is PAUSED ('.$reason.', Redis '.$prefix.'paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.');
             }
 
-            $ownerPid = DrainPause::ownerPid(Narrow::string($value));
+            $node = $this->node();
 
-            $reason = $ownerPid === null
-                ? 'deliberate `torque:pause`'
-                : "drain from master PID {$ownerPid}, which is still running";
-
-            ($this->logger)('Queue is PAUSED ('.$reason.', Redis '.$prefix.'paused is set); workers will not pick up jobs. Run `torque:pause continue` to resume.');
+            if ((new PauseScopes($redis, $prefix))->workerView($node, [])['nodePaused']) {
+                ($this->logger)("Node {$node} is PAUSED (Redis ".PauseScopes::key($prefix)." field node:{$node} is set); workers on this node will not pick up jobs. Run `torque:pause continue --node={$node}` to resume.");
+            }
         } catch (\Throwable) {
             // Boot must not depend on Redis being up; workers retry on their own.
         }
     }
 
     /**
-     * Delete a `drain:<pid>` pause key whose master is no longer running.
+     * Delete a legacy `drain:<pid>` pause key whose master is no longer running.
+     *
+     * Masters since 2.5.0 drain through their own `{prefix}drain:{masterId}`
+     * and never write this value; it comes from a master of older code during
+     * a rolling deploy. Its PID can only be checked on this machine, so it is
+     * left alone while `{prefix}metrics:live` lists any host other than this
+     * one: the PID may belong to a draining master over there.
      *
      * A drain pause belongs to exactly one master: it stops that master's own
      * fleet while in-flight jobs finish. When that master is gone (clean exit,
@@ -1937,8 +2714,7 @@ LUA;
      * leaves the key alone and logs nothing.
      *
      * Public (and with an injectable liveness probe) so the sweep can be
-     * exercised without a live master. Call it only at start: during our own
-     * drain the key legitimately carries our PID.
+     * exercised without a live master. Called at start only.
      *
      * @param  (callable(int): bool)|null  $isMasterAlive  Defaults to the real
      *                                                     process probe.
@@ -1958,7 +2734,12 @@ LUA;
 
             $selfPid = getmypid();
 
-            if ($selfPid === false || ! DrainPause::isStale($value, $selfPid, $isMasterAlive)) {
+            // Nothing to judge: skip the host read.
+            if ($selfPid === false || DrainPause::ownerPid($value) === null) {
+                return false;
+            }
+
+            if (! DrainPause::isStale($value, $selfPid, $isMasterAlive, $this->liveHosts($redis, $prefix), $this->ownHosts())) {
                 return false;
             }
 
@@ -1980,6 +2761,40 @@ LUA;
         } catch (\Throwable) {
             return false;
         }
+    }
+
+    /**
+     * The hosts `{prefix}metrics:live` lists within its window: every host
+     * whose master published an aggregate in the last
+     * {@see LIVE_HOST_WINDOW_SECONDS}.
+     *
+     * @return list<string>
+     */
+    private function liveHosts(RedisClient $redis, string $prefix): array
+    {
+        $hosts = $redis->execute(
+            'ZRANGEBYSCORE',
+            $prefix.'metrics:live',
+            (string) (time() - self::LIVE_HOST_WINDOW_SECONDS),
+            '+inf',
+        );
+
+        return array_map(Narrow::string(...), Narrow::list($hosts));
+    }
+
+    /**
+     * The names this master's aggregate may be listed under in
+     * `{prefix}metrics:live`: its node, and the machine name a master of
+     * older code on this machine publishes under.
+     *
+     * @return list<string>
+     */
+    private function ownHosts(): array
+    {
+        return array_values(array_unique([
+            MetricsPublisher::normaliseHost($this->node()),
+            MetricsPublisher::normaliseHost(MetricsPublisher::localHost()),
+        ]));
     }
 
     /**
@@ -2027,43 +2842,58 @@ LUA;
     }
 
     /**
-     * Mark workers paused via Redis so they stop picking new jobs.
+     * Mark this master's workers paused via Redis so they stop picking new jobs.
      *
      * Best-effort: if Redis is unreachable we still proceed to the timed
      * SIGTERM in {@see handleDrainTick}; workers may not see the pause flag
      * but their own SIGTERM grace lets them finish their current job.
      *
-     * The key carries an expiry (grace + 60s): a drain's pause only needs to
-     * outlive the drain window itself. Without one, the key survives the
-     * master handover -- the draining master exits, the replacement starts,
-     * and nothing ever deletes it, so every reload leaves the whole queue
-     * permanently paused until a manual `torque:pause continue`. A deliberate
-     * `torque:pause` still sets the key without a TTL and is unaffected.
+     * The pause is this master's own key, `{prefix}drain:{masterId}`, which
+     * only its workers read (see {@see PauseScopes::drainKey()}). It never
+     * touches the global `{prefix}paused`: a drain cannot overwrite or expire
+     * a deliberate `torque:pause`, two masters draining at once do not share
+     * a key, and a master on another host with the same PID is never paused.
      *
-     * The TTL is the backstop, not the guarantee: it can be hours long on
-     * installations with a big `drain_grace_seconds`, so the next master to
-     * start also clears the key when this PID is gone
-     * (see {@see clearStaleDrainPause()}).
+     * The key carries an expiry (grace + 60s), so a master killed mid-drain
+     * leaves nothing behind for long; on an orderly exit {@see endDrain()}
+     * deletes it.
      */
     private function beginDrain(): void
     {
         try {
-            $redisUri = $this->redisUri();
-            $prefix = $this->redisPrefix();
+            createRedisClient($this->redisUri())->execute(
+                'SET',
+                PauseScopes::drainKey($this->redisPrefix(), $this->masterId()),
+                (string) time(),
+                'EX',
+                (string) DrainSettings::drainPauseTtlSeconds($this->config),
+            );
 
-            // The value scopes the pause to THIS master's fleet: workers
-            // compare the embedded PID against their own parent and ignore a
-            // drain that is not theirs, so a draining old master never pauses
-            // the replacement fleet during a takeover. A deliberate
-            // `torque:pause` writes a TTL-less generic value that pauses
-            // every fleet (see WorkerProcess::shouldPauseFor()).
-            createRedisClient($redisUri)
-                ->execute('SET', $prefix.'paused', 'drain:'.getmypid(), 'EX', (string) DrainSettings::drainPauseTtlSeconds($this->config));
+            $this->drainKeyWritten = true;
         } catch (\Throwable $e) {
-            ($this->logger)("Drain: failed to set Redis paused key ({$e->getMessage()}); proceeding with timed SIGTERM.");
+            ($this->logger)("Drain: failed to set Redis drain key ({$e->getMessage()}); proceeding with timed SIGTERM.");
         }
 
         ($this->logger)('Draining: pickup paused, waiting up to '.DrainSettings::reloadPauseSeconds($this->config).'s for in-flight jobs.');
+    }
+
+    /**
+     * Delete this master's own drain key once its fleet is gone. Only that
+     * key: the global pause and every other master's drain stay as they are.
+     * Best-effort, the key's TTL is the backstop.
+     */
+    private function endDrain(): void
+    {
+        if (! $this->drainKeyWritten) {
+            return;
+        }
+
+        try {
+            createRedisClient($this->redisUri())->execute('DEL', PauseScopes::drainKey($this->redisPrefix(), $this->masterId()));
+            $this->drainKeyWritten = false;
+        } catch (\Throwable) {
+            // The key expires on its own.
+        }
     }
 
     /**
@@ -2192,11 +3022,13 @@ LUA;
     }
 
     /**
-     * Wait for at least one of this master's own workers to publish a
-     * metrics heartbeat, proving the new fleet actually boots and runs.
+     * Wait until every group with a target above 0 has at least one of this
+     * master's own workers publishing a metrics heartbeat, proving the new
+     * fleet actually boots and runs in each of them.
      *
      * Children are reaped (not respawned) while waiting; a fleet whose every
-     * worker died is reported failed immediately.
+     * worker died, or a group whose every worker died, is reported failed
+     * immediately.
      */
     private function waitForOwnFleetReady(): bool
     {
@@ -2204,6 +3036,7 @@ LUA;
         $deadline = microtime(true) + $timeout;
 
         $publisher = $this->makeMetricsPublisher();
+        $required = array_filter($this->groups(), static fn (WorkerGroup $group): bool => $group->target > 0);
 
         while (microtime(true) < $deadline && ! $this->shouldStop) {
             while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
@@ -2215,11 +3048,23 @@ LUA;
                 return false;
             }
 
+            foreach ($required as $group) {
+                if ($this->groupPids($group) === []) {
+                    return false;
+                }
+            }
+
             try {
-                foreach ($publisher->getAllWorkerMetrics() as $data) {
-                    if (isset($this->workerPids[(int) ($data['pid'] ?? 0)])) {
-                        return true;
+                $ready = [];
+
+                foreach ($publisher->getAllWorkerMetrics() as $workerId => $data) {
+                    if ($this->isOwnWorker((string) $workerId, $data)) {
+                        $ready[$this->groupOf(self::metricsPid((string) $workerId, $data))->name] = true;
                     }
+                }
+
+                if ($ready !== [] && array_diff_key($required, $ready) === []) {
+                    return true;
                 }
             } catch (\Throwable) {
                 // Redis hiccup: keep polling until the deadline.
@@ -2392,9 +3237,21 @@ LUA;
     {
         $cluster = Narrow::bool(Narrow::map($config['redis'] ?? null)['cluster'] ?? null);
         $configured = $config['queues'] ?? ['default'];
+        $configured = is_array($configured) ? $configured : [$configured];
+
+        // With worker groups, the queues of every group.
+        if (is_array($config['groups'] ?? null) && $config['groups'] !== []) {
+            $configured = [];
+
+            foreach ($config['groups'] as $group) {
+                $groupQueues = Narrow::map($group)['queues'] ?? [];
+                array_push($configured, ...(is_array($groupQueues) ? array_values($groupQueues) : [$groupQueues]));
+            }
+        }
+
         $queues = array_values(array_unique(array_map(
             static fn (mixed $queue): string => WorkerProcess::bareQueueName(Narrow::string($queue), $cluster),
-            is_array($configured) ? $configured : [$configured],
+            $configured,
         )));
 
         // Settings only: the breaker opens no connection until it is asked for state.
@@ -2470,9 +3327,10 @@ LUA;
 
             // Gauges are point-in-time, so unlike the counters they are sampled
             // on every tick including the first.
-            // Keyed by this host: every master writes only its own share, and
-            // readers add the hosts up instead of averaging them.
-            $this->metricsPublisher->recordGauges($this->gaugeSamples($aggregate), host: MetricsPublisher::localHost());
+            // Keyed by this master's node, the name its workers publish under:
+            // every master writes only its own share, and readers add the
+            // hosts up instead of averaging them.
+            $this->metricsPublisher->recordGauges($this->gaugeSamples($aggregate), host: $this->node());
             $this->metricsPublisher->recordHostGauges($this->hostGaugeSamples($workers));
 
             $this->lastAggregateJobsTotal = $jobsTotal;
@@ -2481,7 +3339,7 @@ LUA;
             $this->lastAggregatePerJob = $perJob;
             $this->lastAggregateAt = $now;
 
-            $this->metricsPublisher->publishAggregate($aggregate, MetricsPublisher::localHost());
+            $this->metricsPublisher->publishAggregate($aggregate, $this->node());
             $this->publishPendingRespawns();
         } catch (RedisTimeoutException) {
             // The next tick starts on a fresh client rather than one whose
@@ -2506,18 +3364,20 @@ LUA;
      */
     private function publishPendingRespawns(): void
     {
-        if ($this->pendingRespawns === 0 && $this->publishedPendingRespawns === 0) {
+        $pending = $this->pendingRespawns();
+
+        if ($pending === 0 && $this->publishedPendingRespawns === 0) {
             return;
         }
 
         $this->masterRedis()->execute(
             'HSET',
-            $this->redisPrefix().'metrics:live:'.MetricsPublisher::normaliseHost(MetricsPublisher::localHost()),
+            $this->redisPrefix().'metrics:live:'.MetricsPublisher::normaliseHost($this->node()),
             self::PENDING_RESPAWNS_FIELD,
-            (string) $this->pendingRespawns,
+            (string) $pending,
         );
 
-        $this->publishedPendingRespawns = $this->pendingRespawns;
+        $this->publishedPendingRespawns = $pending;
     }
 
     /**

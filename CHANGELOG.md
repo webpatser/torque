@@ -7,8 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-25
+
 ### Added
+- Multi-host support. Each host runs its own `torque:start` against one Redis under a node name: `--node`, then `TORQUE_NODE` (`node` config key), then the hostname (normalised when it is long or has characters outside `[A-Za-z0-9._-]`). Masters and workers get ids of the form `{node}-{pid}-{hex8}`.
+- `nodes` config: per node name or `fnmatch` pattern (exact name first, then the first matching pattern), with `queues`, `workers`, `slots_per_worker`, `autoscale`, `max_jobs_per_worker`, `max_worker_lifetime`, `memory_limit` and `groups`. CLI options win over the node block, the node block over the flat keys.
+- Worker groups: `nodes.{pattern}.groups` runs several queue sets under one master, each with its own workers, slots and autoscaler, respawn and backoff. `--queues` replaces the groups with one group named `default`; `--workers` or `--concurrency` without `--queues` is refused when several groups are configured. `torque:status`, the dashboard and the master's log show groups.
+- `torque:pause --node=` and `--queue=` (repeatable, comma lists allowed) pause one node or one queue; `continue --all` lifts the global, node and queue pauses and closes the breakers.
+- Remote control through Redis: `torque:stop --node=` / `--all` (with `--timeout`, `--force` to skip the `--all` confirmation) and `torque:reload --node=` / `--all`. A remote reload only drains and is refused for an unsupervised master. `TORQUE_SUPERVISED` marks a supervised master, and `torque:supervisor` writes it into the generated config.
+- `control.enabled` (`TORQUE_REMOTE_CONTROL`) and `control.command_ttl_seconds` config keys.
+- `torque:start --node=` and `torque:supervisor --node=`.
+- A master registry and a cluster leader lease. `torque:status` lists the masters (node, PID, state, version, supervised, leader) and the pause scopes, with `--node=` to filter; `torque:monitor` shows the node count and whether this node is paused.
+- The dashboard's workers page shows each node's paused or draining state, version and supervised flag (read-only), and groups workers by node and group.
+- Upgrade steps claim `{prefix}upgrade:lock`, so masters starting together on several hosts run them once.
 - Optional OpenTelemetry metrics through `webpatser/fledge-apm`: `metrics.otel` config key (`TORQUE_OTEL_METRICS`, default false). Each worker reports `torque.worker.slots.active`, `torque.worker.slots.limit` (`{slot}`) and `torque.worker.slots.usage` (`1`, 0 to 1) as observable gauges, read from the snapshot its publish timer already builds; the master reports `torque.master.workers` (`{worker}`) and `torque.queue.circuit.open` (`{circuit}`, 1 or 0 per queue with a breaker, read from Redis every 5 seconds) as observable gauges and `torque.queue.long_waits` (`{alert}`) as a counter of long-wait alerts started, not distinct long waits: the 300 second retry of a failed alert and the 900 second repeat of a continuing wait each count again. Attributes are `laravel.queue.connection` and, per queue, `messaging.destination.name`. Torque depends only on the `MeterProviderInterface` fledge-apm binds while its metrics are on (`APM_METRICS_ENABLED=true`); without that binding or without `open-telemetry/api` nothing is built. Workers call fledge-apm's `Metrics::markLongRunning('torque')` from inside their event loop and export on fledge-apm's timer. The master marks itself from outside the event loop and exports from its maintenance tick through fledge-apm's `Metrics::collectDue()`: synchronously, at most once per interval, bounded by the OTLP timeouts and discounted by the stall watchdog. With a fledge-apm that lacks `collectDue()` the master's instruments export only at shutdown. Across a fleet, average `torque.worker.slots.usage` (or divide summed active by summed limit) rather than summing it. `open-telemetry/api` and `webpatser/fledge-apm` are in `suggest`; `open-telemetry/api` and `open-telemetry/sdk` are dev dependencies for the tests.
+
+### Changed
+- Dead-letter trimming, the consumer sweep, the redelivery prune and long-wait alerts run once per cluster, on the master holding the leader lease, instead of once per host.
+- A drain pause is a per-master key (`{prefix}drain:{masterId}`) instead of `drain:<pid>` in the shared `{prefix}paused`; the legacy value is still honoured during a rolling deploy.
+- The per-host metrics row is keyed by the node name, which equals the hostname until a node name is set. Renaming a node starts a new history row.
+- Workers apply the node block's `max_jobs_per_worker`, `max_worker_lifetime` and `memory_limit`.
+
+### Fixed
+- A worker of another host with the same PID was counted as a master's own (for example in containers). It skewed autoscaling, the fleet-idle check, readiness and the aggregate metrics; workers are now matched by master id.
+- A drain pause was one shared key. A master starting on one host could delete a live drain of another, a worker on another host could obey a drain that was not its master's, two reloads at once lost a pause, and a reload during a deliberate `torque:pause` replaced the pause with an expiring one. A drain now has its own key per master and never overwrites the global pause.
+- Long-wait alerts fired once per host for the same episode.
 
 ## [2.4.0] - 2026-11-22
 
@@ -912,7 +935,8 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/webpatser/torque/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/webpatser/torque/compare/v2.3.2...v2.4.0
 [2.3.2]: https://github.com/webpatser/torque/compare/v2.3.1...v2.3.2
 [2.3.1]: https://github.com/webpatser/torque/compare/v2.3.0...v2.3.1

@@ -5,16 +5,25 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Console;
 
 use Illuminate\Console\Command;
+use Webpatser\Torque\Control\ControlChannel;
+use Webpatser\Torque\Control\MasterRegistry;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Support\DrainSettings;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\ProcessInspector;
+
+use function Fledge\Async\Redis\createRedisClient;
 
 /**
  * Stop the running Torque master process.
  *
  * Reads the master PID from the PID file and sends SIGTERM (or SIGKILL with --force).
  * Waits for the process to exit before removing the PID file.
+ *
+ * With --node or --all the fixed `stop` action goes to remote masters through
+ * the control channel instead; nothing is signalled locally and a remote
+ * master is never sent SIGKILL.
  *
  * NOTE: MasterProcess must write `storage_path('torque.pid')` on startup for this
  * command to work. That change is tracked separately.
@@ -23,8 +32,10 @@ final class TorqueStopCommand extends Command
 {
     /** @var string */
     protected $signature = 'torque:stop
-        {--force : Send SIGKILL instead of SIGTERM}
-        {--timeout= : Seconds to wait for a graceful shutdown before SIGKILL (default: the drain worst case, reload_pause_seconds + drain_grace_seconds + slack)}';
+        {--node=* : Stop the live masters on these nodes through the control channel (repeatable, comma lists allowed)}
+        {--all : Stop every live master in the fleet through the control channel (asks for confirmation)}
+        {--force : Local: send SIGKILL instead of SIGTERM. With --all: skip the confirmation. Refused with --node}
+        {--timeout= : Seconds to wait for a graceful shutdown (local: before SIGKILL; remote: for each master record to disappear). Default: the drain worst case, reload_pause_seconds + drain_grace_seconds + slack}';
 
     /** @var string */
     protected $description = 'Stop the Torque queue worker master process';
@@ -60,7 +71,228 @@ final class TorqueStopCommand extends Command
      */
     public static ?\Closure $workerPidLister = null;
 
+    /**
+     * Test seam: replaces the usleep() between polls while waiting on remote
+     * masters, so a test can play the master's part between two polls.
+     *
+     * @internal
+     *
+     * @var (\Closure(int): void)|null
+     */
+    public static ?\Closure $remoteSleeper = null;
+
+    /**
+     * Polling interval in microseconds while waiting on remote masters.
+     */
+    private const int REMOTE_POLL_INTERVAL = 250_000;
+
     public function handle(): int
+    {
+        $nodes = $this->listOption('node');
+        $all = (bool) $this->option('all');
+
+        if ($nodes !== [] || $all) {
+            return $this->stopRemote($nodes, $all);
+        }
+
+        return $this->stopLocal();
+    }
+
+    /**
+     * Stop remote masters through the control channel: send the fixed
+     * `stop` action to every live master on the named nodes (or the whole
+     * fleet with --all) and wait for each master record to disappear.
+     * There is no remote SIGKILL.
+     *
+     * @param  list<string>  $nodes
+     */
+    private function stopRemote(array $nodes, bool $all): int
+    {
+        if ($all && $nodes !== []) {
+            $this->components->error('--all cannot be combined with --node.');
+
+            return self::FAILURE;
+        }
+
+        if ($nodes !== [] && $this->option('force')) {
+            $this->components->error(
+                '--force cannot be combined with --node: a remote master is never sent SIGKILL. '
+                .'Run torque:stop --force on that node itself.',
+            );
+
+            return self::FAILURE;
+        }
+
+        $config = Narrow::map(config('torque'));
+        $control = Narrow::map($config['control'] ?? null);
+
+        if (! Narrow::bool($control['enabled'] ?? null, true)) {
+            $this->components->error(
+                'Remote control is disabled (torque.control.enabled is false). Nothing was sent; run torque:stop on the node itself.',
+            );
+
+            return self::FAILURE;
+        }
+
+        foreach ($nodes as $node) {
+            try {
+                NodeName::validate($node);
+            } catch (\InvalidArgumentException $e) {
+                $this->components->error('Nothing was sent: '.$e->getMessage());
+
+                return self::FAILURE;
+            }
+        }
+
+        $redisConfig = Narrow::map($config['redis'] ?? null);
+        $redis = createRedisClient(Narrow::string($redisConfig['uri'] ?? null, 'redis://127.0.0.1:6379'));
+        $prefix = Narrow::string($redisConfig['prefix'] ?? null, 'torque:');
+
+        try {
+            $channel = new ControlChannel($redis, $prefix, Narrow::int($control['command_ttl_seconds'] ?? null, 60));
+        } catch (\InvalidArgumentException $e) {
+            $this->components->error('Nothing was sent: '.$e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $registry = new MasterRegistry($redis, $prefix);
+        $masters = $registry->all();
+        $failed = false;
+
+        if ($all) {
+            if ($masters === []) {
+                $this->components->error('No live Torque master found in the fleet. Nothing was sent.');
+
+                return self::FAILURE;
+            }
+
+            $targets = $masters;
+            $nodeList = implode(', ', array_values(array_unique(array_column($masters, 'node'))));
+            $question = 'Stop all '.count($masters)." live Torque master(s) on nodes {$nodeList}?";
+
+            if (! $this->option('force') && ! $this->confirm($question, false)) {
+                $this->components->warn('Aborted. Nothing was sent.');
+
+                return self::FAILURE;
+            }
+        } else {
+            $targets = [];
+
+            foreach ($nodes as $node) {
+                $onNode = array_values(array_filter($masters, static fn (array $master): bool => $master['node'] === $node));
+
+                if ($onNode === []) {
+                    $this->components->error("No live Torque master on node [{$node}].");
+                    $failed = true;
+
+                    continue;
+                }
+
+                array_push($targets, ...$onNode);
+            }
+        }
+
+        $issuer = 'cli@'.NodeName::current();
+
+        /** @var array<string, string> $sent master id to command id */
+        $sent = [];
+
+        foreach ($targets as $master) {
+            $command = $channel->send($master['master_id'], ControlChannel::ACTION_STOP, $issuer);
+            $sent[$master['master_id']] = $command['id'];
+            $this->components->info("Sent stop to master {$master['master_id']} on node [{$master['node']}] (PID {$master['pid']}).");
+        }
+
+        if ($sent === []) {
+            return self::FAILURE;
+        }
+
+        $timeout = $this->gracefulTimeout();
+
+        if (! $this->awaitRemoteStop($registry, $channel, $sent, $timeout)) {
+            $failed = true;
+        }
+
+        return $failed ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * Wait until every master record is gone, reporting each ack as it
+     * arrives. Returns false when a master rejected the command or did not
+     * stop within the timeout.
+     *
+     * @param  array<string, string>  $pending  master id to command id
+     */
+    private function awaitRemoteStop(MasterRegistry $registry, ControlChannel $channel, array $pending, int $timeout): bool
+    {
+        $ok = true;
+        $acked = [];
+        $deadline = microtime(true) + $timeout;
+
+        while (true) {
+            foreach ($pending as $masterId => $commandId) {
+                $ack = isset($acked[$masterId]) ? null : $channel->readAck($commandId);
+
+                if ($ack !== null) {
+                    $acked[$masterId] = true;
+
+                    if (! $ack['accepted'] || $ack['master'] !== $masterId) {
+                        $this->components->error("Master {$masterId} rejected the stop command.");
+                        $ok = false;
+                        unset($pending[$masterId]);
+
+                        continue;
+                    }
+
+                    $this->components->info("Master {$masterId} acknowledged the stop command.");
+                }
+
+                if ($registry->find($masterId) === null) {
+                    $this->components->info("Master {$masterId} stopped.");
+                    unset($pending[$masterId]);
+                }
+            }
+
+            if ($pending === [] || microtime(true) >= $deadline) {
+                break;
+            }
+
+            self::$remoteSleeper !== null
+                ? (self::$remoteSleeper)(self::REMOTE_POLL_INTERVAL)
+                : usleep(self::REMOTE_POLL_INTERVAL);
+        }
+
+        foreach (array_keys($pending) as $masterId) {
+            $this->components->error(isset($acked[$masterId])
+                ? "Master {$masterId} did not stop within {$timeout}s (acknowledged, still draining)."
+                : "Master {$masterId} timed out: no acknowledgement and still running after {$timeout}s.");
+            $ok = false;
+        }
+
+        return $ok;
+    }
+
+    /**
+     * A repeatable option with comma lists flattened, trimmed and deduplicated.
+     * Empty entries are kept so validation refuses them.
+     *
+     * @return list<string>
+     */
+    private function listOption(string $name): array
+    {
+        $values = [];
+
+        foreach ((array) $this->option($name) as $raw) {
+            foreach (explode(',', Narrow::string($raw, '')) as $value) {
+                $values[] = trim($value);
+            }
+        }
+
+        return array_values(array_unique($values));
+    }
+
+    private function stopLocal(): int
     {
         $pidFile = MasterProcess::pidFilePath();
         $pid = null;

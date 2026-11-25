@@ -185,6 +185,107 @@ it('renders counts as a readable line', function () {
 });
 
 /*
+ * The cluster-wide claim: of several masters starting at once, only the one
+ * holding `{prefix}upgrade:lock` runs the steps and records the version.
+ */
+
+it('runs the steps under the claim, records the version and releases the claim', function () {
+    $lockKey = $this->prefix.'upgrade:lock';
+    $during = [];
+
+    $result = ($this->runner)('2.0.0', [
+        '2.0.0' => function () use (&$during, $lockKey): array {
+            $during = [
+                'value' => $this->redis->execute('GET', $lockKey),
+                'ttl' => (int) $this->redis->execute('TTL', $lockKey),
+            ];
+
+            return ['job_streams' => 1];
+        },
+    ])->run();
+
+    expect($result['ran'])->toBeTrue()
+        ->and($result['deferred'])->toBeFalse()
+        ->and($during['value'])->toBeString()->not->toBe('')
+        ->and($during['ttl'])->toBeGreaterThan(0)->toBeLessThanOrEqual(300)
+        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('2.0.0')
+        ->and((int) $this->redis->execute('EXISTS', $lockKey))->toBe(0);
+});
+
+it('runs nothing and records nothing while another master holds the claim', function () {
+    $lockKey = $this->prefix.'upgrade:lock';
+    $this->redis->execute('SET', $this->versionKey, '1.4.0');
+    $this->redis->execute('SET', $lockKey, 'other-master', 'EX', '300');
+
+    $result = ($this->runner)('2.0.0')->run();
+
+    expect($result['ran'])->toBeFalse()
+        ->and($result['deferred'])->toBeTrue()
+        ->and($result['from'])->toBe('1.4.0')
+        ->and($result['to'])->toBe('2.0.0')
+        ->and($result['counts'])->toBe([])
+        ->and($this->ran)->toBe([])
+        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.4.0')
+        ->and((string) $this->redis->execute('GET', $lockKey))->toBe('other-master')
+        ->and(implode("\n", $this->logged))->toContain('Another master is upgrading Torque data to 2.0.0');
+});
+
+it('releases the claim and records no version when a step fails', function () {
+    $lockKey = $this->prefix.'upgrade:lock';
+    $this->redis->execute('SET', $this->versionKey, '1.4.0');
+
+    $runner = ($this->runner)('2.0.0', [
+        '2.0.0' => function (): array {
+            throw new RuntimeException('step broke');
+        },
+    ]);
+
+    expect(fn () => $runner->run())->toThrow(RuntimeException::class, 'step broke')
+        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('1.4.0')
+        ->and((int) $this->redis->execute('EXISTS', $lockKey))->toBe(0);
+
+    // The next start retries and records.
+    expect(($this->runner)('2.0.0')->run()['ran'])->toBeTrue()
+        ->and((string) $this->redis->execute('GET', $this->versionKey))->toBe('2.0.0');
+});
+
+it('never deletes a claim another master took after its own expired', function () {
+    $lockKey = $this->prefix.'upgrade:lock';
+
+    $result = ($this->runner)('2.0.0', [
+        '2.0.0' => function () use ($lockKey): array {
+            // This caller's claim ran out and another master took it.
+            $this->redis->execute('SET', $lockKey, 'other-master', 'EX', '300');
+
+            return [];
+        },
+    ])->run();
+
+    expect($result['ran'])->toBeTrue()
+        ->and((string) $this->redis->execute('GET', $lockKey))->toBe('other-master');
+});
+
+it('takes no claim when there is nothing to upgrade', function (string $stored) {
+    $lockKey = $this->prefix.'upgrade:lock';
+    $this->redis->execute('SET', $this->versionKey, $stored);
+
+    // A held claim would defer any caller that tried to take it.
+    $this->redis->execute('SET', $lockKey, 'other-master', 'EX', '300');
+
+    $result = ($this->runner)('2.0.0')->run();
+
+    expect($result['ran'])->toBeFalse()
+        ->and($result['deferred'])->toBeFalse()
+        ->and($this->ran)->toBe([])
+        ->and(implode("\n", $this->logged))->not->toContain('Another master')
+        ->and((string) $this->redis->execute('GET', $lockKey))->toBe('other-master');
+})->with([
+    'same version' => '2.0.0',
+    'newer stored version' => '2.1.0',
+    'below the minimum' => '1.3.9',
+]);
+
+/*
  * The default step map is empty: every start only records the version.
  */
 

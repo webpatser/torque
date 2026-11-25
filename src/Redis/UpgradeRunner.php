@@ -51,6 +51,19 @@ final class UpgradeRunner
     /** The oldest stored release this version can upgrade from. */
     public const string MINIMUM_STORED_VERSION = '1.4.0';
 
+    /** Suffix of the key holding the cluster-wide upgrade claim. */
+    public const string LOCK_KEY_SUFFIX = 'upgrade:lock';
+
+    /** How long a claim lives when its holder never releases it. */
+    public const int LOCK_TTL_SECONDS = 300;
+
+    private const string LUA_DELETE_IF_EQUAL = <<<'LUA'
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+LUA;
+
     private ?RedisClient $redis = null;
 
     private readonly string $currentVersion;
@@ -217,34 +230,119 @@ final class UpgradeRunner
      * a path install that Composer calls `1.0.0` would make every later start
      * refuse, and a stored `dev` would hide the last release that ran.
      *
-     * @return array{ran: bool, from: string|null, to: string, counts: array<string, int>}
+     * Several masters can start at once against one Redis, so the steps run
+     * under a cluster-wide claim: `{prefix}upgrade:lock`, taken with
+     * `SET NX EX 300` and a value unique to this call, released by
+     * compare-and-delete so a claim that expired and was taken by another
+     * master is never removed. No claim is taken when there is nothing to do.
+     * After winning, the stored version is read again: a master that won only
+     * after another one finished the same upgrade runs nothing.
+     *
+     * The master that loses the claim runs nothing, records nothing and returns
+     * `ran: false, deferred: true`. Its start simply continues: the winner
+     * finishes the upgrade, and steps are expected to be idempotent, since a
+     * step outliving the 300 second claim, or a crash mid-way, lets another
+     * master run it again. A failing step releases the claim, records no
+     * version and rethrows, so the next start retries.
+     *
+     * @return array{ran: bool, deferred: bool, from: string|null, to: string, counts: array<string, int>}
      */
     public function run(): array
     {
         $current = $this->currentVersion;
         $stored = $this->storedVersion();
-        $skipped = ['ran' => false, 'from' => $stored, 'to' => $current, 'counts' => []];
+        $skipped = ['ran' => false, 'deferred' => false, 'from' => $stored, 'to' => $current, 'counts' => []];
 
-        if (self::isBelowMinimum($stored)) {
-            $minimum = self::MINIMUM_STORED_VERSION;
-
-            ($this->logger)("Torque data in Redis was last upgraded by {$stored}, below {$minimum}: not recording this version, and the next start refuses. ".$this->upgradeAdvice());
-
+        if (! $this->owesUpgrade($stored, $current, log: true)) {
             return $skipped;
+        }
+
+        $token = bin2hex(random_bytes(16));
+
+        if (! $this->claim($token)) {
+            ($this->logger)('Another master is upgrading Torque data to '.$current.'; continuing without running the upgrade steps here.');
+
+            return ['deferred' => true] + $skipped;
+        }
+
+        try {
+            $stored = $this->storedVersion();
+
+            if (! $this->owesUpgrade($stored, $current, log: false)) {
+                return ['from' => $stored] + $skipped;
+            }
+
+            return $this->upgrade($stored, $current);
+        } finally {
+            $this->releaseClaim($token);
+        }
+    }
+
+    /**
+     * Whether a start owes the upgrade steps, logging why not when asked.
+     */
+    private function owesUpgrade(?string $stored, string $current, bool $log): bool
+    {
+        if (self::isBelowMinimum($stored)) {
+            if ($log) {
+                $minimum = self::MINIMUM_STORED_VERSION;
+
+                ($this->logger)("Torque data in Redis was last upgraded by {$stored}, below {$minimum}: not recording this version, and the next start refuses. ".$this->upgradeAdvice());
+            }
+
+            return false;
         }
 
         if ($current !== self::DEV_VERSION && $stored !== null && $stored !== self::DEV_VERSION) {
             if (version_compare($stored, $current, '>')) {
-                ($this->logger)("Torque data version {$stored} is newer than the installed {$current}; leaving it alone.");
+                if ($log) {
+                    ($this->logger)("Torque data version {$stored} is newer than the installed {$current}; leaving it alone.");
+                }
 
-                return $skipped;
+                return false;
             }
 
             if (version_compare($stored, $current, '=')) {
-                return $skipped;
+                return false;
             }
         }
 
+        return true;
+    }
+
+    /**
+     * Take the cluster-wide upgrade claim. False when another caller holds it.
+     */
+    private function claim(string $token): bool
+    {
+        return $this->redis()->execute('SET', $this->lockKey(), $token, 'NX', 'EX', (string) self::LOCK_TTL_SECONDS) !== null;
+    }
+
+    /**
+     * Drop the claim only while it still holds this caller's token. A failed
+     * release is left to the TTL so it never hides a step's own exception.
+     */
+    private function releaseClaim(string $token): void
+    {
+        try {
+            $this->redis()->execute('EVAL', self::LUA_DELETE_IF_EQUAL, '1', $this->lockKey(), $token);
+        } catch (\Throwable) {
+            // The claim expires on its own.
+        }
+    }
+
+    private function lockKey(): string
+    {
+        return $this->prefix.self::LOCK_KEY_SUFFIX;
+    }
+
+    /**
+     * Run the applicable steps and record the version, under the claim.
+     *
+     * @return array{ran: bool, deferred: bool, from: string|null, to: string, counts: array<string, int>}
+     */
+    private function upgrade(?string $stored, string $current): array
+    {
         if ($current === self::DEV_VERSION) {
             ($this->logger)('Torque is installed without a release version (its own checkout, a path repository, a branch or a version Composer could not determine): running the upgrade steps, the data version stays '.($stored ?? 'unrecorded').'.');
         } else {
@@ -273,7 +371,7 @@ final class UpgradeRunner
             ($this->logger)("Torque data is up to date; recorded version {$current}.");
         }
 
-        return ['ran' => true, 'from' => $stored, 'to' => $current, 'counts' => $counts];
+        return ['ran' => true, 'deferred' => false, 'from' => $stored, 'to' => $current, 'counts' => $counts];
     }
 
     /**

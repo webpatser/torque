@@ -7,12 +7,16 @@ namespace Webpatser\Torque\Console;
 use Fledge\Async\Redis\RedisClient;
 use Fledge\Async\Redis\RedisException;
 use Illuminate\Console\Command;
+use Webpatser\Torque\Control\LeaderLease;
+use Webpatser\Torque\Control\MasterRegistry;
+use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Job\CircuitBreaker;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\DrainPause;
 use Webpatser\Torque\Process\MasterProcess;
 use Webpatser\Torque\Redis\UpgradeRunner;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 use Webpatser\Torque\Support\ProcessInspector;
 use Webpatser\Torque\Support\StreamQueueResolver;
 use Webpatser\Torque\Support\WorkerId;
@@ -28,13 +32,27 @@ use function Fledge\Async\Redis\createRedisClient;
 final class TorqueStatusCommand extends Command
 {
     /** @var string */
-    protected $signature = 'torque:status';
+    protected $signature = 'torque:status
+        {--node= : Only show the master and workers of this node}';
 
     /** @var string */
     protected $description = 'Display the status of the Torque queue worker';
 
     public function handle(): int
     {
+        $node = null;
+        $nodeOption = $this->option('node');
+
+        if (is_string($nodeOption) && $nodeOption !== '') {
+            try {
+                $node = NodeName::validate($nodeOption);
+            } catch (\InvalidArgumentException $e) {
+                $this->components->error($e->getMessage());
+
+                return self::FAILURE;
+            }
+        }
+
         $config = Narrow::map(config('torque'));
         $redisConfig = Narrow::map($config['redis'] ?? null);
 
@@ -48,14 +66,149 @@ final class TorqueStatusCommand extends Command
         $redis = createRedisClient($redisUri);
 
         $this->renderMasterStatus();
+        $this->renderMastersTable($redis, $prefix, $node);
         $this->renderOwedRespawns($redis, $prefix);
         $this->renderPauseStatus($redis, $prefix);
+        $this->renderPauseScopes($redis, $prefix);
         $this->renderDataVersion($redis, $prefix);
         $this->renderOverallMetrics($redis, $prefix, $config);
         $this->renderCircuitBreakers($redis, $config);
-        $this->renderWorkerTable($redis, $prefix);
+        $this->renderWorkerTable($redis, $prefix, $node);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * List the live masters from the registry: node, PID, state, version,
+     * whether a supervisor restarts it, and which one holds the leader lease.
+     *
+     * Nothing is printed when no master has published a record (older
+     * masters, or none running), so the previous output is unchanged.
+     */
+    private function renderMastersTable(RedisClient $redis, string $prefix, ?string $node): void
+    {
+        try {
+            $records = new MasterRegistry($redis, $prefix)->all();
+            $leader = new LeaderLease($redis, $prefix)->leader();
+        } catch (\Throwable) {
+            return;
+        }
+
+        if ($records === []) {
+            return;
+        }
+
+        if ($node !== null) {
+            $records = array_values(array_filter(
+                $records,
+                static fn (array $record): bool => $record['node'] === $node,
+            ));
+
+            if ($records === []) {
+                $this->components->warn("No masters registered for node {$node}.");
+                $this->newLine();
+
+                return;
+            }
+        }
+
+        $rows = array_map(static fn (array $record): array => [
+            $record['node'],
+            (string) $record['pid'],
+            $record['state'],
+            $record['version'],
+            $record['supervised'] ? 'yes' : 'no',
+            $leader !== null && $record['master_id'] === $leader ? '*' : '',
+        ], $records);
+
+        $this->table(['Node', 'PID', 'State', 'Version', 'Supervised', 'Leader'], $rows);
+        $this->newLine();
+
+        $this->renderGroupTables($records);
+    }
+
+    /**
+     * Print one sub-table per master that runs more than the implicit
+     * `default` group. A master with only `default` (or no `groups` field)
+     * prints nothing, so single-group output is unchanged.
+     *
+     * @param  list<array<string, mixed>>  $records
+     */
+    private function renderGroupTables(array $records): void
+    {
+        foreach ($records as $record) {
+            $groups = $record['groups'] ?? [];
+
+            if (! is_array($groups) || $groups === []) {
+                continue;
+            }
+
+            if (count($groups) === 1 && array_key_exists('default', $groups)) {
+                continue;
+            }
+
+            $rows = [];
+
+            foreach ($groups as $name => $group) {
+                if (! is_array($group)) {
+                    continue;
+                }
+
+                $rows[] = [
+                    (string) $name,
+                    implode(', ', array_map(static fn (mixed $queue): string => Narrow::string($queue), Narrow::list($group['queues'] ?? null))),
+                    Narrow::string($group['workers'] ?? null, '0'),
+                    Narrow::string($group['target'] ?? null, '0'),
+                    Narrow::string($group['min'] ?? null, '0'),
+                    Narrow::string($group['max'] ?? null, '0'),
+                    Narrow::string($group['slots'] ?? null, '0'),
+                ];
+            }
+
+            if ($rows === []) {
+                continue;
+            }
+
+            $this->components->twoColumnDetail(
+                '<fg=cyan;options=bold>Groups</>',
+                Narrow::string($record['node'] ?? null).' <fg=gray>(PID '.Narrow::string($record['pid'] ?? null).')</>',
+            );
+            $this->table(['Group', 'Queues', 'Workers', 'Target', 'Min', 'Max', 'Slots'], $rows);
+            $this->newLine();
+        }
+    }
+
+    /**
+     * Show the node and queue pauses set with `torque:pause --node/--queue`,
+     * next to the global pause. Nothing is printed while none are set.
+     */
+    private function renderPauseScopes(RedisClient $redis, string $prefix): void
+    {
+        try {
+            $scopes = new PauseScopes($redis, $prefix)->all();
+        } catch (\Throwable) {
+            return;
+        }
+
+        if ($scopes['nodes'] === [] && $scopes['queues'] === []) {
+            return;
+        }
+
+        if ($scopes['nodes'] !== []) {
+            $this->components->twoColumnDetail(
+                '<fg=yellow;options=bold>Nodes PAUSED</>',
+                implode(', ', array_map('strval', array_keys($scopes['nodes']))),
+            );
+        }
+
+        if ($scopes['queues'] !== []) {
+            $this->components->twoColumnDetail(
+                '<fg=yellow;options=bold>Queues PAUSED</>',
+                implode(', ', array_map('strval', array_keys($scopes['queues']))),
+            );
+        }
+
+        $this->newLine();
     }
 
     /**
@@ -313,9 +466,19 @@ final class TorqueStatusCommand extends Command
      * Expected hash fields per worker: pid, active_slots, total_slots,
      * jobs_processed, avg_latency, last_heartbeat.
      */
-    private function renderWorkerTable(RedisClient $redis, string $prefix): void
+    private function renderWorkerTable(RedisClient $redis, string $prefix, ?string $node): void
     {
-        $workerKeys = $this->scanKeys($redis, $prefix.'worker:*');
+        $keyPrefix = $prefix.'worker:';
+        $workerKeys = $this->scanKeys($redis, $keyPrefix.'*');
+
+        if ($node !== null) {
+            $workerKeys = array_values(array_filter(
+                $workerKeys,
+                static fn (string $key): bool => WorkerId::parse(
+                    str_starts_with($key, $keyPrefix) ? substr($key, strlen($keyPrefix)) : $key,
+                )->host === $node,
+            ));
+        }
 
         if ($workerKeys === []) {
             $this->components->warn('No worker metrics found in Redis.');

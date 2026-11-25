@@ -6,6 +6,7 @@ use Webpatser\Torque\Console\TorqueWorkerCommand;
 use Webpatser\Torque\Manager\AutoScaler;
 use Webpatser\Torque\Metrics\MetricsPublisher;
 use Webpatser\Torque\Process\MasterProcess;
+use Webpatser\Torque\Process\WorkerGroup;
 
 it('pidFilePath returns storage path', function () {
     $path = MasterProcess::pidFilePath();
@@ -236,6 +237,23 @@ it('constructor accepts config and logger', function () {
 // posix_kill from the code under test can only ever return ESRCH.
 const FAKE_CHILD_PID = 2147483000;
 
+/** The only group of a master configured without groups, which holds the respawn state. */
+function masterDefaultGroup(MasterProcess $master): WorkerGroup
+{
+    return (new ReflectionMethod($master, 'groups'))->invoke($master)['default'];
+}
+
+/** Give the master's only group this autoscaler, as startFleet() would from `autoscale.enabled`. */
+function masterUseAutoScaler(MasterProcess $master, AutoScaler $scaler): WorkerGroup
+{
+    $group = masterDefaultGroup($master);
+    $scaled = new WorkerGroup($group->name, $group->queues, $group->target, $group->slots, $scaler);
+
+    (new ReflectionProperty($master, 'groups'))->setValue($master, ['default' => $scaled]);
+
+    return $scaled;
+}
+
 it('keeps supervising when a respawn fork fails and retries it after a backoff', function () {
     $logs = [];
     $master = new MasterProcess(config: ['workers' => 1], logger: function (string $m) use (&$logs) {
@@ -243,21 +261,21 @@ it('keeps supervising when a respawn fork fails and retries it after a backoff',
     });
 
     $fork = new ReflectionProperty($master, 'fork');
-    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $group = masterDefaultGroup($master);
     $retry = new ReflectionMethod($master, 'retryPendingRespawns');
 
     // The OS refuses the fork (EAGAIN, ENOMEM): no throw out of the monitor loop.
     $fork->setValue($master, fn (): int => -1);
     (new ReflectionMethod($master, 'respawnWorker'))->invoke($master);
 
-    expect($pending->getValue($master))->toBe(1)
+    expect($group->pendingRespawns)->toBe(1)
         ->and($master->workerPids)->toBe([])
         ->and(implode("\n", $logs))->toContain('fork failed');
 
     // Still failing at the retry: it stays owed.
     $now = microtime(true);
     $retry->invoke($master, $now + 3600);
-    expect($pending->getValue($master))->toBe(1);
+    expect($group->pendingRespawns)->toBe(1);
 
     // Fork works again, but the backoff of that last failure has not passed.
     $fork->setValue($master, fn (): int => FAKE_CHILD_PID);
@@ -265,7 +283,7 @@ it('keeps supervising when a respawn fork fails and retries it after a backoff',
     expect($master->workerPids)->toBe([]);
 
     $retry->invoke($master, $now + 7200);
-    expect($pending->getValue($master))->toBe(0)
+    expect($group->pendingRespawns)->toBe(0)
         ->and($master->workerPids)->toBe([FAKE_CHILD_PID => true])
         ->and($master->workerCount)->toBe(1);
 });
@@ -294,8 +312,7 @@ it('respawns a worker that died young on a doubling backoff and logs an error af
     });
     $exit = new ReflectionMethod($master, 'handleWorkerExit');
     $retry = new ReflectionMethod($master, 'retryPendingRespawns');
-    $pending = new ReflectionProperty($master, 'pendingRespawns');
-    $retryAt = new ReflectionProperty($master, 'respawnRetryAt');
+    $group = masterDefaultGroup($master);
     $spawnedAt = new ReflectionProperty($master, 'workerSpawnedAt');
     $pids = new ReflectionProperty($master, 'workerPids');
 
@@ -307,16 +324,16 @@ it('respawns a worker that died young on a doubling backoff and logs an error af
     $exit->invoke($master, 1001, SIGKILL, $now);
 
     expect($forks)->toBe(0)
-        ->and($pending->getValue($master))->toBe(1)
-        ->and($retryAt->getValue($master))->toBe($now + 1.0)
+        ->and($group->pendingRespawns)->toBe(1)
+        ->and($group->respawnRetryAt)->toBe($now + 1.0)
         ->and(implode("\n", $logs))->toContain('Worker PID 1001 killed by signal 9 (SIGKILL)')
         ->toContain('respawning in 1s');
 
     // A boot exception: the wait doubles.
     $exit->invoke($master, 1002, torque_exit_status(1), $now);
 
-    expect($pending->getValue($master))->toBe(2)
-        ->and($retryAt->getValue($master))->toBe($now + 2.0)
+    expect($group->pendingRespawns)->toBe(2)
+        ->and($group->respawnRetryAt)->toBe($now + 2.0)
         ->and($errors)->toBe([]);
 
     // Not before the wait has passed.
@@ -326,13 +343,13 @@ it('respawns a worker that died young on a doubling backoff and logs an error af
     $retry->invoke($master, $now + 2.0);
     $retry->invoke($master, $now + 2.1);
     expect($forks)->toBe(2)
-        ->and($pending->getValue($master))->toBe(0);
+        ->and($group->pendingRespawns)->toBe(0);
 
     // The third in a row: the error names the status and what it usually means.
     $spawnedAt->setValue($master, [FAKE_CHILD_PID => (int) $now + 2, FAKE_CHILD_PID + 1 => (int) $now + 2]);
     $exit->invoke($master, FAKE_CHILD_PID, torque_exit_status(TorqueWorkerCommand::EXIT_CONFIG), $now + 3);
 
-    expect($retryAt->getValue($master))->toBe($now + 3 + 4.0)
+    expect($group->respawnRetryAt)->toBe($now + 3 + 4.0)
         ->and($errors)->toHaveCount(1)
         ->and($errors[0])->toContain('3 workers in a row died within 10s')
         ->toContain('exited (code 78)')
@@ -341,8 +358,8 @@ it('respawns a worker that died young on a doubling backoff and logs an error af
     // A worker spawned during the run that lives 10 seconds ends it.
     (new ReflectionMethod($master, 'resetFastDeathsOnSurvivor'))->invoke($master, $now + 2 + MasterProcess::FAST_DEATH_SECONDS);
 
-    expect((new ReflectionProperty($master, 'fastDeaths'))->getValue($master))->toBe(0)
-        ->and((new ReflectionProperty($master, 'fastDeathBackoff'))->getValue($master))->toBe(0.0)
+    expect($group->fastDeaths)->toBe(0)
+        ->and($group->fastDeathBackoff)->toBe(0.0)
         ->and(end($logs))->toContain('respawns are immediate');
 });
 
@@ -364,8 +381,8 @@ it('respawns at once after an orderly stop, a memory limit or a watchdog kill, h
     (new ReflectionMethod($master, 'handleWorkerExit'))->invoke($master, 1001, $status, $now + 1);
 
     expect($forks)->toBe(1)
-        ->and((new ReflectionProperty($master, 'pendingRespawns'))->getValue($master))->toBe(0)
-        ->and((new ReflectionProperty($master, 'fastDeaths'))->getValue($master))->toBe(0);
+        ->and(masterDefaultGroup($master)->pendingRespawns)->toBe(0)
+        ->and(masterDefaultGroup($master)->fastDeaths)->toBe(0);
 })->with([
     'exit 0' => [torque_exit_status(0), false],
     'memory limit' => [torque_exit_status(12), false],
@@ -384,19 +401,21 @@ it('does not let a worker from before a run of fast deaths end it', function () 
     (new ReflectionMethod($master, 'handleWorkerExit'))->invoke($master, 1002, torque_exit_status(1), $now);
     (new ReflectionMethod($master, 'resetFastDeathsOnSurvivor'))->invoke($master, $now + 60);
 
-    expect((new ReflectionProperty($master, 'fastDeaths'))->getValue($master))->toBe(1);
+    expect(masterDefaultGroup($master)->fastDeaths)->toBe(1);
 });
 
 it('drops owed respawns once the master is stopping', function () {
     $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
+    $group = masterDefaultGroup($master);
 
     (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
-    (new ReflectionProperty($master, 'pendingRespawns'))->setValue($master, 2);
+    $group->oweRespawn();
+    $group->oweRespawn();
     (new ReflectionProperty($master, 'shouldStop'))->setValue($master, true);
 
     (new ReflectionMethod($master, 'retryPendingRespawns'))->invoke($master, microtime(true) + 3600);
 
-    expect((new ReflectionProperty($master, 'pendingRespawns'))->getValue($master))->toBe(0)
+    expect($group->pendingRespawns)->toBe(0)
         ->and($master->workerPids)->toBe([]);
 });
 
@@ -405,7 +424,7 @@ it('puts a failed scale-up fork on the owed-respawn backoff', function () {
     $scaler = new AutoScaler(redisUri: 'redis://127.0.0.1:6379', minWorkers: 2, cooldownSeconds: 0);
     $forks = 0;
 
-    (new ReflectionProperty($master, 'autoScaler'))->setValue($master, $scaler);
+    $group = masterUseAutoScaler($master, $scaler);
     (new ReflectionProperty($master, 'fork'))->setValue($master, function () use (&$forks): int {
         $forks++;
 
@@ -417,9 +436,9 @@ it('puts a failed scale-up fork on the owed-respawn backoff', function () {
     // The worker is owed, so it counts toward the fleet and the scaler does
     // not ask again; the retry waits out the backoff instead of forking each tick.
     expect($forks)->toBe(1)
-        ->and((new ReflectionProperty($master, 'pendingRespawns'))->getValue($master))->toBe(1)
+        ->and($group->pendingRespawns)->toBe(1)
         ->and((new ReflectionMethod($master, 'fleetSize'))->invoke($master))->toBe(1)
-        ->and((new ReflectionProperty($master, 'respawnRetryAt'))->getValue($master))->toBeGreaterThan(microtime(true));
+        ->and($group->respawnRetryAt)->toBeGreaterThan(microtime(true));
 
     (new ReflectionMethod($master, 'retryPendingRespawns'))->invoke($master, microtime(true));
 
@@ -429,18 +448,18 @@ it('puts a failed scale-up fork on the owed-respawn backoff', function () {
 it('owes no respawn into a fleet that is draining', function () {
     $master = new MasterProcess(config: ['workers' => 1], logger: fn (string $m) => null);
     $retry = new ReflectionMethod($master, 'retryPendingRespawns');
-    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $group = masterDefaultGroup($master);
 
     (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
+    $group->oweRespawn();
 
     foreach (['drainRequested', 'draining'] as $flag) {
-        $pending->setValue($master, 1);
         (new ReflectionProperty($master, $flag))->setValue($master, true);
 
         $retry->invoke($master, microtime(true) + 3600);
 
         expect($master->workerPids)->toBe([])
-            ->and($pending->getValue($master))->toBe(1);
+            ->and($group->pendingRespawns)->toBe(1);
 
         (new ReflectionProperty($master, $flag))->setValue($master, false);
     }
@@ -479,7 +498,7 @@ it('survives a silent Redis in the autoscale and drain reads and starts the next
 
         $publisher = new ReflectionProperty($master, 'metricsPublisher');
         $publisher->setValue($master, (new ReflectionMethod($master, 'makeMetricsPublisher'))->invoke($master));
-        (new ReflectionProperty($master, 'autoScaler'))->setValue($master, new AutoScaler(redisUri: 'unused', cooldownSeconds: 0));
+        masterUseAutoScaler($master, new AutoScaler(redisUri: 'unused', cooldownSeconds: 0));
         (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
 
         $before = $publisher->getValue($master);
@@ -507,7 +526,7 @@ it('does not scale up while the fleet is paused', function () {
     );
 
     (new ReflectionProperty($master, 'metricsPublisher'))->setValue($master, (new ReflectionMethod($master, 'makeMetricsPublisher'))->invoke($master));
-    (new ReflectionProperty($master, 'autoScaler'))->setValue($master, new AutoScaler(redisUri: 'unused', minWorkers: 2, cooldownSeconds: 0));
+    masterUseAutoScaler($master, new AutoScaler(redisUri: 'unused', minWorkers: 2, cooldownSeconds: 0));
     (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => FAKE_CHILD_PID);
     $evaluate = new ReflectionMethod($master, 'evaluateAutoscale');
 
@@ -544,7 +563,7 @@ function autoscalingMaster(array $activeByPid, int $minWorkers, int $maxWorkers,
     );
 
     (new ReflectionProperty($master, 'metricsPublisher'))->setValue($master, (new ReflectionMethod($master, 'makeMetricsPublisher'))->invoke($master));
-    (new ReflectionProperty($master, 'autoScaler'))->setValue($master, new AutoScaler(
+    masterUseAutoScaler($master, new AutoScaler(
         redisUri: 'unused',
         minWorkers: $minWorkers,
         maxWorkers: $maxWorkers,
@@ -570,27 +589,28 @@ function forgetAutoscalingMaster(string $prefix, array $pids): void
 it('cancels owed respawns before it terminates a live worker on scale-down', function () {
     $pids = [FAKE_CHILD_PID, FAKE_CHILD_PID + 1, FAKE_CHILD_PID + 2, FAKE_CHILD_PID + 3];
     [$master, $prefix] = autoscalingMaster(array_fill_keys($pids, 0), minWorkers: 2, maxWorkers: 8, logger: fn (string $m) => null);
-    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $group = masterDefaultGroup($master);
     $scalingDown = new ReflectionProperty($master, 'scalingDownPids');
     $evaluate = new ReflectionMethod($master, 'evaluateAutoscale');
 
     try {
         // 4 live and 2 owed after ENOMEM, then the load drops.
-        $pending->setValue($master, 2);
+        $group->oweRespawn();
+        $group->oweRespawn();
 
         $evaluate->invoke($master);
         $evaluate->invoke($master);
 
-        expect($pending->getValue($master))->toBe(0)
+        expect($group->pendingRespawns)->toBe(0)
             ->and($scalingDown->getValue($master))->toBe([])
             ->and(count($master->workerPids))->toBe(4)
-            ->and((new ReflectionProperty($master, 'respawnBackoff'))->getValue($master))->toBe(0.0);
+            ->and($group->respawnBackoff)->toBe(0.0);
 
         // Nothing owed any more: the quietest live worker goes, as before.
         $evaluate->invoke($master);
 
         expect(count($scalingDown->getValue($master)))->toBe(1)
-            ->and($pending->getValue($master))->toBe(0);
+            ->and($group->pendingRespawns)->toBe(0);
     } finally {
         forgetAutoscalingMaster($prefix, $pids);
     }
@@ -599,15 +619,16 @@ it('cancels owed respawns before it terminates a live worker on scale-down', fun
 it('does not scale up past the cap while respawns are owed', function () {
     $pids = [FAKE_CHILD_PID, FAKE_CHILD_PID + 1];
     [$master, $prefix] = autoscalingMaster(array_fill_keys($pids, 50), minWorkers: 1, maxWorkers: 4, logger: fn (string $m) => null);
-    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $group = masterDefaultGroup($master);
 
     try {
         // 2 live and 2 owed under full load: the owed ones already fill the cap.
-        $pending->setValue($master, 2);
+        $group->oweRespawn();
+        $group->oweRespawn();
 
         (new ReflectionMethod($master, 'evaluateAutoscale'))->invoke($master);
 
-        expect($pending->getValue($master))->toBe(2)
+        expect($group->pendingRespawns)->toBe(2)
             ->and(count($master->workerPids))->toBe(2);
     } finally {
         forgetAutoscalingMaster($prefix, $pids);
@@ -653,7 +674,7 @@ it('removes the PID file when the monitor loop ends by exception', function () {
 
     (new ReflectionMethod($master, 'writePidFile'))->invoke($master);
     (new ReflectionProperty($master, 'fork'))->setValue($master, fn (): int => -1);
-    (new ReflectionProperty($master, 'pendingRespawns'))->setValue($master, 1);
+    masterDefaultGroup($master)->oweRespawn();
 
     $async = pcntl_async_signals();
 
@@ -679,18 +700,19 @@ it('publishes owed respawns into its own host hash and clears them once', functi
         config: ['workers' => 1, 'redis' => ['uri' => torqueRedisUri(), 'prefix' => $prefix]],
         logger: fn (string $m) => null,
     );
-    $pending = new ReflectionProperty($master, 'pendingRespawns');
+    $group = masterDefaultGroup($master);
     $publish = new ReflectionMethod($master, 'publishPendingRespawns');
 
     try {
         $publish->invoke($master);
         expect($redis->execute('EXISTS', $key))->toBe(0);
 
-        $pending->setValue($master, 2);
+        $group->oweRespawn();
+        $group->oweRespawn();
         $publish->invoke($master);
         expect($redis->execute('HGET', $key, MasterProcess::PENDING_RESPAWNS_FIELD))->toBe('2');
 
-        $pending->setValue($master, 0);
+        $group->dropPendingRespawns();
         $publish->invoke($master);
         expect($redis->execute('HGET', $key, MasterProcess::PENDING_RESPAWNS_FIELD))->toBe('0');
 

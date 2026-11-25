@@ -196,6 +196,58 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Node name
+    |--------------------------------------------------------------------------
+    | The name this machine runs under in the fleet: master and worker ids,
+    | per-host metrics, node pauses and remote control. `torque:start --node`
+    | wins over this, and null falls back to the hostname. Letters, digits,
+    | dots, underscores and dashes, at most 48; torque:start refuses anything
+    | else. Renaming a node starts a new per-host metrics history.
+    */
+    'node' => env('TORQUE_NODE'),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Per-node settings
+    |--------------------------------------------------------------------------
+    | Keyed by node name or fnmatch pattern. An exact name wins, otherwise the
+    | first matching pattern in declaration order; CLI options win over both.
+    | A block may set `queues` (keys of `streams`), `workers`,
+    | `slots_per_worker`, `autoscale` (merged over the one below),
+    | `max_jobs_per_worker`, `max_worker_lifetime`, `memory_limit` and
+    | `groups`. Anything else is refused at start.
+    |
+    | `groups` splits a node into worker groups, each with its own `queues`
+    | (required), `workers`, `slots_per_worker` and `autoscale`; the block's
+    | own keys are the defaults. A node without groups is one group named
+    | `default`. A single host uses the pattern '*'.
+    |
+    | 'nodes' => [
+    |     'web-*' => ['queues' => ['default', 'emails'], 'workers' => 2],
+    |     'batch-*' => ['slots_per_worker' => 20, 'groups' => [
+    |         'imports' => ['queues' => ['imports'], 'workers' => 2],
+    |         'mail' => ['queues' => ['emails', 'default'], 'slots_per_worker' => 100],
+    |     ]],
+    | ],
+    */
+    'nodes' => [],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Remote control
+    |--------------------------------------------------------------------------
+    | `torque:stop --node` and `torque:reload --node` reach other masters
+    | through Redis. enabled (TORQUE_REMOTE_CONTROL) false makes this master
+    | ignore those commands; command_ttl_seconds is how long a command stays
+    | valid before a master drops it unread.
+    */
+    'control' => [
+        'enabled' => (bool) env('TORQUE_REMOTE_CONTROL', true),
+        'command_ttl_seconds' => 60,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Redis connection
     |--------------------------------------------------------------------------
     | uri     : Redis or Valkey connection string.

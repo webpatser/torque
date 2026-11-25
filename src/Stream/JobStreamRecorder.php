@@ -11,6 +11,7 @@ use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Webpatser\Torque\Contracts\Silenced;
 use Webpatser\Torque\Support\Narrow;
+use Webpatser\Torque\Support\NodeName;
 
 use function Fledge\Async\async;
 use function Fledge\Async\Future\await;
@@ -154,7 +155,7 @@ LUA;
             // "(unknown)".
             'displayName' => $event->job->resolveName(),
             'attempt' => (string) $event->job->attempts(),
-            'worker' => gethostname().'-'.getmypid(),
+            'worker' => NodeName::current().'-'.getmypid(),
         ]));
     }
 
