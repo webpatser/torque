@@ -84,7 +84,9 @@ afterEach(function () use ($testPrefix) {
  */
 function startWorker(string $redisUri, string $prefix): mixed
 {
-    $artisan = base_path('vendor/bin/testbench');
+    // The package's own vendor, not base_path(): the Testbench skeleton's vendor
+    // symlink only exists while some testbench CLI process keeps it alive.
+    $artisan = dirname(__DIR__, 2).'/vendor/bin/testbench';
 
     // Override torque config via environment variables.
     $env = [
@@ -164,7 +166,7 @@ it('picks up an immediate job dispatched while the worker is running', function 
         // Verify worker is running.
         $status = proc_get_status($this->workerProcess);
         if (! $status['running']) {
-            $this->markTestSkipped('Worker process failed to start');
+            $this->fail('Worker process exited during startup (exit code '.$status['exitcode'].')');
         }
 
         // Dispatch an immediate job by writing directly to the stream.
@@ -210,7 +212,7 @@ it('picks up a delayed job after migration', function () {
 
         $status = proc_get_status($this->workerProcess);
         if (! $status['running']) {
-            $this->markTestSkipped('Worker process failed to start');
+            $this->fail('Worker process exited during startup (exit code '.$status['exitcode'].')');
         }
 
         // Add a matured delayed job (score in the past so migration picks it up).
