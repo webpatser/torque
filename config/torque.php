@@ -372,7 +372,7 @@ return [
     | they are still shared and reset as before. The env var takes a
     | comma-separated list.
     */
-    'shared_scoped_bindings' => array_values(array_filter(array_map('trim', explode(',', (string) env('TORQUE_SHARED_SCOPED_BINDINGS', ''))))),
+    'shared_scoped_bindings' => array_values(array_filter(array_map(trim(...), explode(',', (string) env('TORQUE_SHARED_SCOPED_BINDINGS', ''))))),
 
     /*
     |--------------------------------------------------------------------------

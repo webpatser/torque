@@ -93,7 +93,7 @@ final class JobTagExtractor
     {
         $tags = $payload[self::PAYLOAD_KEY] ?? [];
 
-        return is_array($tags) ? array_values(array_filter($tags, 'is_string')) : [];
+        return is_array($tags) ? array_values(array_filter($tags, is_string(...))) : [];
     }
 
     /**

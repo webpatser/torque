@@ -143,7 +143,7 @@ final class TorqueStartCommand extends Command
 
         // Resolve queue names: CLI option > node block > config stream keys > fallback.
         if ($this->option('queues') !== null) {
-            $config['queues'] = array_map('trim', explode(',', $this->option('queues')));
+            $config['queues'] = array_map(trim(...), explode(',', $this->option('queues')));
 
             foreach ($config['queues'] as $queue) {
                 if (! preg_match('/^[a-zA-Z0-9_\-.:]+$/D', $queue)) {
@@ -191,7 +191,7 @@ final class TorqueStartCommand extends Command
         $workerOutput = [];
         exec('pgrep -f '.escapeshellarg('[a]rtisan torque:worker'), $workerOutput);
         $orphanWorkers = array_filter(
-            array_map('intval', $workerOutput),
+            array_map(intval(...), $workerOutput),
             function (int $pid): bool {
                 if ($pid <= 0 || $pid === getmypid()) {
                     return false;

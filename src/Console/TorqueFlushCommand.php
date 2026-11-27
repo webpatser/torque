@@ -97,7 +97,7 @@ final class TorqueFlushCommand extends Command
         // Braces are allowed for an explicitly hash-tagged name (`{emails}`).
         if ($this->option('queues') !== null) {
             $queues = array_values(array_filter(
-                array_map('trim', explode(',', Narrow::string($this->option('queues')))),
+                array_map(trim(...), explode(',', Narrow::string($this->option('queues')))),
                 static fn (string $queue): bool => $queue !== '',
             ));
 
@@ -115,7 +115,7 @@ final class TorqueFlushCommand extends Command
                 }
             }
         } elseif (isset($config['streams']) && is_array($config['streams'])) {
-            $queues = array_map('strval', array_keys($config['streams']));
+            $queues = array_map(strval(...), array_keys($config['streams']));
         } else {
             $queues = ['default'];
         }

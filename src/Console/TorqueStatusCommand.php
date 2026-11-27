@@ -197,14 +197,14 @@ final class TorqueStatusCommand extends Command
         if ($scopes['nodes'] !== []) {
             $this->components->twoColumnDetail(
                 '<fg=yellow;options=bold>Nodes PAUSED</>',
-                implode(', ', array_map('strval', array_keys($scopes['nodes']))),
+                implode(', ', array_map(strval(...), array_keys($scopes['nodes']))),
             );
         }
 
         if ($scopes['queues'] !== []) {
             $this->components->twoColumnDetail(
                 '<fg=yellow;options=bold>Queues PAUSED</>',
-                implode(', ', array_map('strval', array_keys($scopes['queues']))),
+                implode(', ', array_map(strval(...), array_keys($scopes['queues']))),
             );
         }
 

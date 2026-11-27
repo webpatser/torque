@@ -67,7 +67,7 @@ final class JobsData
             $raw = $data['tags'] ?? null;
 
             if (is_string($raw) && is_array($tags = json_decode($raw, true))) {
-                return array_values(array_filter($tags, 'is_string'));
+                return array_values(array_filter($tags, is_string(...)));
             }
         }
 

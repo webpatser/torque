@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-11-27
+
+### Changed
+- String-literal function callables (`array_map('trim', ...)`, `array_filter($x, 'is_string')`) are first-class callables (`trim(...)`), which PHP 8.6 compiles to a plain loop. No behaviour change.
+
 ## [2.6.0] - 2026-11-27
 
 ### Changed
@@ -948,7 +953,7 @@ Initial release.
 - PID file hardening: symlink detection, atomic write (tmp + rename)
 - Gate authorization on all destructive dashboard actions (retry, purge, retryAll)
 
-[Unreleased]: https://github.com/webpatser/torque/compare/v2.5.1...HEAD
+[Unreleased]: https://github.com/webpatser/torque/compare/v2.6.1...HEAD
 [2.5.1]: https://github.com/webpatser/torque/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/webpatser/torque/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/webpatser/torque/compare/v2.3.2...v2.4.0

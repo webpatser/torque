@@ -96,7 +96,7 @@ final class TorqueWorkerCommand extends Command
         $config['group'] = self::groupName(Narrow::nullableString($this->option('group')));
 
         if ($this->option('queues') !== null) {
-            $config['queues'] = array_map('trim', explode(',', $this->option('queues')));
+            $config['queues'] = array_map(trim(...), explode(',', $this->option('queues')));
         }
 
         if ($this->option('concurrency') !== null) {
