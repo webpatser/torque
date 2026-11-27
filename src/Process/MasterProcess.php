@@ -340,7 +340,7 @@ LUA;
         private readonly ?Closure $errorLogger = null,
     ) {
         $this->artisanPath = base_path('artisan');
-        $this->fork = static fn (): int => pcntl_fork();
+        $this->fork = pcntl_fork(...);
     }
 
     /**

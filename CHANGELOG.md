@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-27
+
+### Changed
+- The long-wait alert command waits for a step's result with PHP 8.6 `Io\Poll` (poll(2) backend) instead of `stream_select()`; a stream that cannot be polled, or a failing wait, falls back to a 10 ms read loop until the deadline.
+- PHP 8.6 idioms, no behaviour change: `clamp()` for the retry delay that stays short of a job's deadline; the jobs screen sorts on the native `SortDirection` enum internally (`JobMetricsData::get()` also accepts the enum, the legacy `'asc'`/`'desc'` string still works, and the Livewire `direction` property stays a string); partial function application and first-class callables replace forwarding closures in `StreamQueue`, `MasterProcess`, `WorkerProcess` and `OverviewData`.
+- `JobStream::tail()` takes its timeout as a PHP 8.6 `Time\Duration` as well as float seconds (`Duration|float`; a float behaves as before). The worker's fixed heartbeat and stalled-job timers are built as a `Duration`. Requires `webpatser/fledge-loop` ^0.1.1.
+
 ## [2.5.1] - 2026-11-25
 
 ### Fixed

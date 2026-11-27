@@ -122,7 +122,7 @@ final class OverviewData
         }
 
         $live = array_map(
-            static fn (array $job): array => JobPresenter::fromRecent($job),
+            JobPresenter::fromRecent(...),
             $this->jobStream->recentJobs('active', 6),
         );
 

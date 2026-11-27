@@ -7,6 +7,7 @@ namespace Webpatser\Torque\Dashboard\Livewire;
 use Illuminate\Contracts\View\View;
 use Livewire\Attributes\Layout;
 use Livewire\Component;
+use SortDirection;
 use Webpatser\Torque\Dashboard\Data\JobMetricsData;
 use Webpatser\Torque\Dashboard\Livewire\Concerns\WithDashboardChrome;
 
@@ -53,7 +54,12 @@ final class Jobs extends Component
         $window = $this->range();
 
         $data = rescue(
-            fn (): array => app(JobMetricsData::class)->get($window->key, $this->sort, $this->direction),
+            fn (): array => app(JobMetricsData::class)->get(
+                $window->key,
+                $this->sort,
+                // The public property stays a string: Livewire round-trips it through the browser.
+                $this->direction === 'asc' ? SortDirection::Ascending : SortDirection::Descending,
+            ),
             ['jobs' => [], 'totals' => ['classes' => 0, 'processed' => 0, 'failed' => 0, 'slowest' => 0.0]],
             false,
         );

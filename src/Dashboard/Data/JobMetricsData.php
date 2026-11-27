@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Webpatser\Torque\Dashboard\Data;
 
+use SortDirection;
 use Webpatser\Torque\Dashboard\Http\JobPresenter;
 use Webpatser\Torque\Dashboard\Support\Range;
 use Webpatser\Torque\Metrics\MetricsPublisher;
@@ -32,10 +33,16 @@ final class JobMetricsData
     public function __construct(private readonly MetricsPublisher $metrics) {}
 
     /**
+     * A string direction is the legacy form: 'asc' sorts ascending, anything else descending.
+     *
      * @return array{jobs: list<array<string, mixed>>, totals: array<string, mixed>}
      */
-    public function get(string $range = '1h', string $sort = 'throughput', string $direction = 'desc'): array
+    public function get(string $range = '1h', string $sort = 'throughput', SortDirection|string $direction = SortDirection::Descending): array
     {
+        if (is_string($direction)) {
+            $direction = $direction === 'asc' ? SortDirection::Ascending : SortDirection::Descending;
+        }
+
         $window = Range::make($range);
         $isMinuteTier = $window->tier === MetricsPublisher::TIER_MINUTE;
         $active = [];
@@ -118,10 +125,10 @@ final class JobMetricsData
      * @param  list<array<string, mixed>>  $jobs
      * @return list<array<string, mixed>>
      */
-    private static function sortRows(array $jobs, string $sort, string $direction): array
+    private static function sortRows(array $jobs, string $sort, SortDirection $direction): array
     {
         $field = self::SORTS[$sort] ?? self::SORTS['throughput'];
-        $ascending = $direction === 'asc';
+        $ascending = $direction === SortDirection::Ascending;
 
         usort($jobs, static function (array $a, array $b) use ($field, $ascending): int {
             $comparison = $field === 'class'

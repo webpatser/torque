@@ -11,7 +11,7 @@
         "illuminate/support": "^13.34",
         "livewire/livewire": "^4.0",
         "webpatser/fledge-fiber": "^13.43.0.3",
-        "webpatser/fledge-loop": "^0.1"
+        "webpatser/fledge-loop": "^0.1.1"
     },
     "conflict": {
         "laravel/slack-notification-channel": "<3.6"

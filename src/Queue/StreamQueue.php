@@ -463,7 +463,7 @@ LUA;
             // here too; only enqueueUsing()'s PHPDoc still says string|null.
             $queue, // @phpstan-ignore argument.type
             null,
-            fn (string $payload, \UnitEnum|string|null $queue) => $this->pushPayload($payload, $queue, $created),
+            $this->pushPayload(?, ?, $created),
         ));
     }
 
@@ -841,7 +841,7 @@ LUA;
     public function allPendingJobs(): Collection
     {
         return $this->allQueueNames()->flatMap(
-            fn (string $name) => $this->pendingJobsForQueue($name),
+            $this->pendingJobsForQueue(...),
         );
     }
 
@@ -860,7 +860,7 @@ LUA;
     public function allReservedJobs(): Collection
     {
         return $this->allQueueNames()->flatMap(
-            fn (string $name) => $this->reservedJobsForQueue($name),
+            $this->reservedJobsForQueue(...),
         );
     }
 
@@ -875,7 +875,7 @@ LUA;
     public function allDelayedJobs(): Collection
     {
         return $this->allQueueNames()->flatMap(
-            fn (string $name) => $this->delayedJobsForQueue($name),
+            $this->delayedJobsForQueue(...),
         );
     }
 
@@ -894,7 +894,7 @@ LUA;
     private function allQueueNames(): Collection
     {
         return (new Collection($this->scanPrefixedKeys()))
-            ->map(fn (string $key) => Str::after($key, $this->prefix))
+            ->map(Str::after(?, $this->prefix))
             ->map(fn (string $name) => str_contains($name, ':') ? Str::before($name, ':') : $name)
             ->reject(fn (string $name) => $name === '' || in_array($name, self::RESERVED_NAMESPACES, true))
             ->map(fn (string $name) => $this->cluster ? trim($name, '{}') : $name)
@@ -1042,7 +1042,8 @@ LUA;
         $payloads = array_map(Narrow::string(...), Narrow::list($this->redis->execute('ZRANGE', $delayedKey, '0', '-1')));
 
         return (new Collection($payloads))
-            ->map(fn (string $payload) => InspectedJob::fromPayload($payload));
+            // A placeholder, not (...): map() passes the key, which would land in $attempts.
+            ->map(InspectedJob::fromPayload(?));
     }
 
     /**

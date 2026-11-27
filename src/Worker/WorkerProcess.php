@@ -41,6 +41,7 @@ use Illuminate\Queue\TimeoutExceededException;
 use Illuminate\Queue\Worker;
 use Illuminate\Queue\WorkerOptions;
 use Illuminate\Queue\WorkerStopReason;
+use Time\Duration;
 use Webpatser\Torque\Control\MasterRegistry;
 use Webpatser\Torque\Control\PauseScopes;
 use Webpatser\Torque\Events\JobPermanentlyFailed;
@@ -440,7 +441,7 @@ LUA;
         // One name per queue from here on, whichever way the config wrote it:
         // the hash tag belongs to the Redis key, which $buildStreamKey adds back.
         $queues = array_values(array_unique(array_map(
-            static fn (string $queue): string => self::bareQueueName($queue, $cluster),
+            self::bareQueueName(?, $cluster),
             $queues,
         )));
         $streams = self::bareStreamConfigs($streams, $cluster);
@@ -788,7 +789,7 @@ LUA;
             });
 
             $this->writeHeartbeat($heartbeatFile);
-            Loop::repeat(1.0, fn () => $this->writeHeartbeat($heartbeatFile));
+            Loop::repeat(Duration::fromSeconds(1), fn () => $this->writeHeartbeat($heartbeatFile));
         }
 
         // Spawn N reader Fibers (one per concurrency slot).
@@ -1362,7 +1363,7 @@ LUA;
         // Fires every 30s; threshold defaults to 300s. Catches hung user jobs
         // (e.g. external HTTP calls without a timeout) before they block the
         // worker through its full lifetime.
-        Loop::repeat(30.0, function () use (&$slotStarts, $stallThreshold) {
+        Loop::repeat(Duration::fromSeconds(30), function () use (&$slotStarts, $stallThreshold) {
             $now = time();
             foreach ($slotStarts as $idx => $started) {
                 $age = $now - $started;
@@ -3718,7 +3719,8 @@ LUA;
         $delay = min(2 ** min($attempts, 30), self::MAX_EXPONENTIAL_BACKOFF);
         $deadline = $this->retryDeadline($job);
 
-        return $deadline === null ? $delay : min($delay, max(0, $deadline - time() - self::RETRY_DEADLINE_MARGIN));
+        // $delay is always positive, so the bounds are ordered.
+        return $deadline === null ? $delay : clamp($deadline - time() - self::RETRY_DEADLINE_MARGIN, 0, $delay);
     }
 
     /**

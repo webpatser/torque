@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Time\Duration;
 use Webpatser\Torque\Stream\JobStream;
 use Webpatser\Torque\Stream\JobStreamRecorder;
 
@@ -122,3 +123,47 @@ it('tails events and stops on terminal event', function () {
 
     expect($collected)->toBe(['queued', 'started', 'completed']);
 });
+
+it('tails with a Duration timeout like the same float', function () {
+    $recorder = new JobStreamRecorder(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: 'torque-test:',
+    );
+
+    $recorder->record($this->uuid, 'queued', ['queue' => 'default']);
+    $recorder->record($this->uuid, 'completed', [], terminal: true);
+
+    $stream = new JobStream(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: 'torque-test:',
+    );
+
+    $collected = array_column(iterator_to_array($stream->tail($this->uuid, timeout: Duration::fromSeconds(5)), false), 'type');
+
+    expect($collected)->toBe(['queued', 'completed']);
+});
+
+it('stops a tail at once for an expired timeout, Duration or float', function (Duration|float $timeout) {
+    $recorder = new JobStreamRecorder(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: 'torque-test:',
+    );
+
+    $recorder->record($this->uuid, 'queued', []);
+
+    $stream = new JobStream(
+        redisUri: 'redis://127.0.0.1:6379/15',
+        prefix: 'torque-test:',
+    );
+
+    $startedAt = hrtime(true);
+    $collected = iterator_to_array($stream->tail($this->uuid, timeout: $timeout), false);
+
+    expect($collected)->toBe([])
+        ->and((hrtime(true) - $startedAt) / 1e9)->toBeLessThan(0.5);
+})->with([
+    'zero Duration' => fn (): Duration => Duration::fromSeconds(0),
+    'negated Duration' => fn (): Duration => Duration::fromSeconds(1)->negate(),
+    'zero float' => 0.0,
+    'negative float' => -1.0,
+]);

@@ -11,7 +11,14 @@ use Illuminate\Notifications\ChannelManager;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Notification;
 use InvalidArgumentException;
+use Io\Poll\Backend;
+use Io\Poll\Context;
+use Io\Poll\Event;
+use Io\Poll\FailedPollWaitException;
+use Io\Poll\PollException;
+use StreamPollHandle;
 use Throwable;
+use Time\Duration;
 use Webpatser\Torque\Events\LongWaitDetected;
 use Webpatser\Torque\Notifications\LongWaitNotification;
 use Webpatser\Torque\Support\EventLoopDriver;
@@ -40,6 +47,9 @@ final class TorqueLongWaitAlertCommand extends Command
 
     /** Goes before the exception message, so no message can read as {@see STEP_OK}. */
     private const string STEP_FAILED = 'failed:';
+
+    /** Seconds between reads of a step's socket when it cannot be polled. */
+    private const float FALLBACK_INTERVAL = 0.01;
 
     /**
      * What a step's fork took over from this process and must never close: kept
@@ -293,14 +303,11 @@ final class TorqueLongWaitAlertCommand extends Command
     {
         stream_set_blocking($socket, false);
 
+        $context = self::readableContext($socket);
         $buffer = '';
 
         while (($left = $deadline - microtime(true)) > 0) {
-            $read = [$socket];
-            $write = $except = null;
-
-            // False means a signal interrupted the wait: just go around again.
-            if (! @stream_select($read, $write, $except, (int) $left, (int) (fmod($left, 1.0) * 1_000_000))) {
+            if (! self::awaitReadable($context, $left)) {
                 continue;
             }
 
@@ -314,6 +321,58 @@ final class TorqueLongWaitAlertCommand extends Command
         }
 
         return $buffer === '' ? null : $buffer;
+    }
+
+    /**
+     * A poll(2) context watching the socket for reading, null when it cannot be watched.
+     *
+     * Poll rather than the platform default: no kernel object to leak into the
+     * next step's fork. A stream with no pollable descriptor makes add() warn and
+     * throw; the read loop then checks it on an interval instead.
+     *
+     * @param  resource  $socket
+     */
+    private static function readableContext($socket): ?Context
+    {
+        try {
+            $context = new Context(Backend::Poll);
+            @$context->add(new StreamPollHandle($socket), [Event::Read]);
+
+            return $context;
+        } catch (PollException) {
+            // InvalidHandleException, or a context the system would not create.
+            return null;
+        }
+    }
+
+    /**
+     * Wait at most this many seconds for the socket to turn readable.
+     *
+     * HangUp and Error count as readable without being asked for, as they did with
+     * the select(2) wait this replaced: the read that follows sees the end of file. A signal (EINTR)
+     * ends the wait early, and the caller goes around again for what is left. Any
+     * other wait failure, or no context at all, falls back to trying the read every
+     * {@see self::FALLBACK_INTERVAL} seconds until the deadline.
+     *
+     * @return bool True when the caller should try a read.
+     */
+    private static function awaitReadable(?Context &$context, float $seconds): bool
+    {
+        if ($context === null) {
+            usleep((int) ceil(min($seconds, self::FALLBACK_INTERVAL) * 1_000_000));
+
+            return true;
+        }
+
+        try {
+            return $context->wait(Duration::fromNanoseconds((int) ceil($seconds * 1e9)), 1) !== [];
+        } catch (FailedPollWaitException $e) {
+            if ($e->getCode() !== FailedPollWaitException::ERROR_INTERRUPTED) {
+                $context = null;
+            }
+
+            return false;
+        }
     }
 
     /**

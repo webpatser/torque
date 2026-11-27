@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Webpatser\Torque\Stream;
 
 use Fledge\Async\Redis\RedisClient;
+use Fledge\Loop\Durations;
+use Time\Duration;
 use Webpatser\Torque\Support\Narrow;
 
 use function Fledge\Async\Redis\createRedisClient;
@@ -48,10 +50,13 @@ final class JobStream
      *
      * Blocks until the job reaches a terminal state or the timeout expires.
      *
+     * @param  Duration|float  $timeout  Time to keep tailing, as a `Duration` or in seconds. Each read blocks
+     *                                   for up to one second, so the last read may end up to a second past it.
      * @return \Generator<int, array{id: string, type: string, data: array<string, string>}>
      */
-    public function tail(string $uuid, float $timeout = 30.0): \Generator
+    public function tail(string $uuid, Duration|float $timeout = 30.0): \Generator
     {
+        $timeout = Durations::toSeconds($timeout);
         $redis = $this->getRedis();
         $key = $this->prefix.'job:'.$uuid;
         $lastId = '0-0';
